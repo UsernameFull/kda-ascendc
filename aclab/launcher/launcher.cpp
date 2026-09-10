@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <fstream>
@@ -76,7 +77,8 @@ void Launch(const std::string &name, uint32_t numBlocks, const void *args, size_
         throw std::runtime_error("kernel not loaded: " + name);
     }
     void *devArgs = AllocArgs(argsSize);
-    Check(aclrtMemcpy(devArgs, argsSize, args, argsSize, ACL_MEMCPY_DEVICE_TO_DEVICE),
+    // `args` points at host memory (stack structs / std::vector data), so this is H2D.
+    Check(aclrtMemcpy(devArgs, argsSize, args, argsSize, ACL_MEMCPY_HOST_TO_DEVICE),
           "aclrtMemcpy args");
     aclError e = aclrtLaunchKernel(it->second, numBlocks, devArgs, argsSize,
                                    reinterpret_cast<aclrtStream>(stream));
@@ -85,7 +87,7 @@ void Launch(const std::string &name, uint32_t numBlocks, const void *args, size_
 
 }  // namespace
 
-PYBIND11_MODULE(kda_bt16_launcher, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "load_kernel_binary",
         [](const std::string &path) {
@@ -166,23 +168,37 @@ PYBIND11_MODULE(kda_bt16_launcher, m) {
             aclrtcProg prog = nullptr;
             Check(aclrtcCreateProg(&prog, src.c_str(), funcName.c_str(), 0, nullptr, nullptr),
                   "aclrtcCreateProg");
+            // The CANN layout is <ASCEND_HOME_PATH>/<arch>-linux; derive it at
+            // runtime so RTC keeps working when the toolkit is installed
+            // elsewhere or on a different host architecture.
+            const char *cannHomeEnv = std::getenv("ASCEND_HOME_PATH");
+            const std::string cannHome =
+                (cannHomeEnv != nullptr && cannHomeEnv[0] != '\0')
+                    ? cannHomeEnv
+                    : "/usr/local/Ascend/ascend-toolkit/latest";
+            const std::string ascBase = cannHome +
+#if defined(__aarch64__)
+                "/aarch64-linux";
+#else
+                "/x86_64-linux";
+#endif
             std::vector<std::string> optStrs = {
                 arch.empty() ? "--npu-soc=Ascend910B3" : arch,
                 "-O3",
                 "-std=c++17",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/tikcpp/tikcfw",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/tikcpp/tikcfw/interface",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/tikcpp/tikcfw/impl",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc/include",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc/include/basic_api",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc/include/adv_api",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc/include/c_api",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc/impl/basic_api",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc/impl/adv_api",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc/impl/c_api",
-                "-I/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/asc/impl/utils",
-                "-include/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/../include/version/asc_devkit_version.h",
+                "-I" + ascBase + "/tikcpp/tikcfw",
+                "-I" + ascBase + "/tikcpp/tikcfw/interface",
+                "-I" + ascBase + "/tikcpp/tikcfw/impl",
+                "-I" + ascBase + "/asc",
+                "-I" + ascBase + "/asc/include",
+                "-I" + ascBase + "/asc/include/basic_api",
+                "-I" + ascBase + "/asc/include/adv_api",
+                "-I" + ascBase + "/asc/include/c_api",
+                "-I" + ascBase + "/asc/impl/basic_api",
+                "-I" + ascBase + "/asc/impl/adv_api",
+                "-I" + ascBase + "/asc/impl/c_api",
+                "-I" + ascBase + "/asc/impl/utils",
+                "-include" + cannHome + "/include/version/asc_devkit_version.h",
             };
             std::vector<const char *> options;
             for (auto &o : optStrs) {
@@ -334,7 +350,7 @@ PYBIND11_MODULE(kda_bt16_launcher, m) {
             for (auto &b : argBlobs) {
                 hostArgs.push_back(const_cast<char *>(b.data()));
             }
-            Check(aclrtMemcpy(devArgs, blobSize, hostArgs.data(), blobSize, ACL_MEMCPY_DEVICE_TO_DEVICE),
+            Check(aclrtMemcpy(devArgs, blobSize, hostArgs.data(), blobSize, ACL_MEMCPY_HOST_TO_DEVICE),
                   "aclrtMemcpy args");
             uint32_t ret = reinterpret_cast<LaunchFn>(fn)(
                 0, numBlocks, reinterpret_cast<void *>(stream), &devArgs,
@@ -622,7 +638,7 @@ PYBIND11_MODULE(kda_bt16_launcher, m) {
             void *devArgs = nullptr;
             Check(aclrtMalloc(&devArgs, blobBytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc");
             Check(aclrtMemcpy(devArgs, blobBytes, blob.data(), blobBytes,
-                              ACL_MEMCPY_DEVICE_TO_DEVICE), "aclrtMemcpy");
+                              ACL_MEMCPY_HOST_TO_DEVICE), "aclrtMemcpy");
             uint32_t ret = reinterpret_cast<LaunchFn>(g_fns[key])(
                 0, numBlocks, reinterpret_cast<void *>(stream), &devArgs,
                 static_cast<uint32_t>(blobBytes));

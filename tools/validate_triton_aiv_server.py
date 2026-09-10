@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 import torch_npu
 
-ROOT = Path('/workspace/kda_ascendc_luna_20260905')
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
 from kda_ascendc_v1.api import get_last_profile, kda_bt16_fwd_ascendc
 

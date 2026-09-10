@@ -6,9 +6,16 @@ Phases (each in an independent subprocess):
   P4 k2_glue_final(AIV): out = scale*d2+d3, h_new = h*exp2(g_last)+d4
 Then compare vs pure-torch reference (exact same inputs)."""
 import subprocess, sys, os
+from pathlib import Path
 
+ACLAB_ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER_DIR = Path(os.environ.get(
+    "KDA_BT16_LAUNCHER_DIR",
+    Path.home() / ".cache" / "torch_extensions"
+    / f"py{sys.version_info.major}{sys.version_info.minor}_cpu" / "kda_bt16_launcher",
+))
 os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "1"
-ROOT = "/workspace/kda/proto/ascend_c"
+ROOT = str(ACLAB_ROOT)
 
 # ---- shared input generator (exact seed order, single source of truth) ----
 import torch
@@ -44,7 +51,7 @@ print("inputs saved")
 p1 = f'''
 import sys, struct, os
 os.environ["ASCEND_RT_VISIBLE_DEVICES"]="1"
-sys.path.insert(0,"/root/.cache/torch_extensions/py312_cpu/kda_bt16_launcher")
+sys.path.insert(0,"{LAUNCHER_DIR}")
 import torch, torch_npu
 from kda_bt16_launcher import rtc_compile, launch_argsarray_engine
 DEV=torch.device("npu:0")
@@ -52,7 +59,7 @@ def nd(x): return torch_npu.npu_format_cast(x.contiguous(),2).contiguous()
 d=torch.load("/tmp/opencode/golden_inputs.pt",weights_only=False)
 w=d["w"].to(DEV); qg=nd(d["qg"].to(DEV)); h=nd(d["h"].to(torch.bfloat16).to(DEV))
 c1=torch.zeros(16,128,dtype=torch.float32,device=DEV); c2=torch.zeros(16,128,dtype=torch.float32,device=DEV)
-rtc_compile(open("{ROOT}/kernels/k2_m1.cpp").read(),"k2_m1","")
+rtc_compile(open("{ROOT}/k2_m1.cpp").read(),"k2_m1","")
 torch.npu.synchronize()
 args=[struct.pack("<q",p) for p in [nd(w).data_ptr(),qg.data_ptr(),h.data_ptr(),c1.data_ptr(),c2.data_ptr(),0]]+[struct.pack("<i",5)]
 for _ in range(3):
@@ -68,7 +75,7 @@ print(r1.stdout.strip().splitlines()[-1] if r1.stdout else "P1 no output")
 p2 = f'''
 import sys, struct, os
 os.environ["ASCEND_RT_VISIBLE_DEVICES"]="1"
-sys.path.insert(0,"/root/.cache/torch_extensions/py312_cpu/kda_bt16_launcher")
+sys.path.insert(0,"{LAUNCHER_DIR}")
 import torch, torch_npu
 from kda_bt16_launcher import rtc_compile, launch_argsarray_engine
 DEV=torch.device("npu:0")
@@ -76,7 +83,7 @@ def nd(x): return torch_npu.npu_format_cast(x.contiguous(),2).contiguous()
 d=torch.load("/tmp/opencode/golden_inputs.pt",weights_only=False); p1=torch.load("/tmp/opencode/p1.pt",weights_only=False)
 u=nd(d["u"].to(DEV)); d1=nd(p1["d1"].to(DEV)); vb_ref=d["v_ref"].to(torch.bfloat16)
 vnew=torch.zeros(16,128,dtype=torch.bfloat16,device=DEV)
-rtc_compile(open("{ROOT}/kernels/k2_glue_v.cpp").read(),"k2_glue_v_kernel","")
+rtc_compile(open("{ROOT}/k2_glue_v.cpp").read(),"k2_glue_v_kernel","")
 torch.npu.synchronize()
 args=[struct.pack("<q",p) for p in [u.data_ptr(),d1.data_ptr(),vnew.data_ptr(),0]]+[struct.pack("<i",0)]
 for _ in range(3):
@@ -91,7 +98,7 @@ print(r2.stdout.strip().splitlines()[-1] if r2.stdout else "P2 no output")
 p3 = f'''
 import sys, struct, os
 os.environ["ASCEND_RT_VISIBLE_DEVICES"]="1"
-sys.path.insert(0,"/root/.cache/torch_extensions/py312_cpu/kda_bt16_launcher")
+sys.path.insert(0,"{LAUNCHER_DIR}")
 import torch, torch_npu
 from kda_bt16_launcher import rtc_compile, launch_argsarray_engine
 DEV=torch.device("npu:0")
@@ -100,12 +107,12 @@ d=torch.load("/tmp/opencode/golden_inputs.pt",weights_only=False); p2=torch.load
 aqk=nd(d["aqk"].to(DEV)); vnew=nd(p2["vnew"].to(DEV)); kg=nd(d["kg"].to(DEV))
 vT=nd(vnew.t().contiguous())
 c3=torch.zeros(16,128,dtype=torch.float32,device=DEV); c4=torch.zeros(128,128,dtype=torch.float32,device=DEV)
-rtc_compile(open("{ROOT}/kernels/k2_d3.cpp").read(),"k2_d3_kernel","")
+rtc_compile(open("{ROOT}/k2_d3.cpp").read(),"k2_d3_kernel","")
 torch.npu.synchronize()
 args3=[struct.pack("<q",p) for p in [aqk.data_ptr(),vnew.data_ptr(),c3.data_ptr(),0]]+[struct.pack("<i",0)]
 for _ in range(3):
     launch_argsarray_engine("k2_d3_kernel",1,torch_npu.npu.current_stream().npu_stream,args3,0); torch.npu.synchronize()
-rtc_compile(open("{ROOT}/kernels/kda_k2_m128.cpp").read(),"kda_k2_m128_kernel","")
+rtc_compile(open("{ROOT}/kda_k2_m128.cpp").read(),"kda_k2_m128_kernel","")
 torch.npu.synchronize()
 args4=[struct.pack("<q",p) for p in [vT.data_ptr(),kg.data_ptr(),c4.data_ptr(),0]]+[struct.pack("<i",0)]
 for _ in range(3):
@@ -120,7 +127,7 @@ print(r3.stdout.strip().splitlines()[-1] if r3.stdout else "P3 no output")
 p4 = f'''
 import sys, struct, os
 os.environ["ASCEND_RT_VISIBLE_DEVICES"]="1"
-sys.path.insert(0,"/root/.cache/torch_extensions/py312_cpu/kda_bt16_launcher")
+sys.path.insert(0,"{LAUNCHER_DIR}")
 import torch, torch_npu
 from kda_bt16_launcher import rtc_compile, launch_argsarray_engine
 DEV=torch.device("npu:0")
@@ -130,7 +137,7 @@ p1=torch.load("/tmp/opencode/p1.pt",weights_only=False); p3=torch.load("/tmp/ope
 gl=nd(d["g_last"].to(DEV)); h=nd(d["h"].to(DEV))
 d2=nd(p1["d2"].to(DEV)); d3=nd(p3["d3"].to(DEV)); d4=nd(p3["d4"].to(DEV))
 out=torch.zeros(16,128,dtype=torch.bfloat16,device=DEV); hnew=torch.zeros(128,128,dtype=torch.float32,device=DEV)
-rtc_compile(open("{ROOT}/kernels/k2_glue_final.cpp").read(),"k2_glue_final_kernel","")
+rtc_compile(open("{ROOT}/k2_glue_final.cpp").read(),"k2_glue_final_kernel","")
 torch.npu.synchronize()
 args=[struct.pack("<q",p) for p in [gl.data_ptr(),h.data_ptr(),d2.data_ptr(),d3.data_ptr(),d4.data_ptr(),out.data_ptr(),hnew.data_ptr(),0]]+[struct.pack("<i",0)]
 for _ in range(3):

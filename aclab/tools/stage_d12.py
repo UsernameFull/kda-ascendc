@@ -1,14 +1,22 @@
 """Stage A: d1+d2 via k2_m1 (AIC). Saves c1,c2 + inputs needed downstream to .pt."""
 import sys, struct, os
+from pathlib import Path
+
 os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "1"
-sys.path.insert(0, "/root/.cache/torch_extensions/py312_cpu/kda_bt16_launcher")
+ACLAB_ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER_DIR = Path(os.environ.get(
+    "KDA_BT16_LAUNCHER_DIR",
+    Path.home() / ".cache" / "torch_extensions"
+    / f"py{sys.version_info.major}{sys.version_info.minor}_cpu" / "kda_bt16_launcher",
+))
+sys.path.insert(0, str(LAUNCHER_DIR))
 import torch, torch_npu
 from kda_bt16_launcher import rtc_compile, launch_argsarray_engine
 
 DEV = torch.device("npu:0")
 def nd(x):
     return torch_npu.npu_format_cast(x.contiguous(), 2).contiguous()
-rtc_compile(open("kernels/k2_m1.cpp").read(), "k2_m1", "")
+rtc_compile(open(ACLAB_ROOT / "k2_m1.cpp").read(), "k2_m1", "")
 torch.npu.synchronize()
 
 torch.manual_seed(7)

@@ -2,10 +2,10 @@ from __future__ import annotations
 import json, os, sys, time
 from pathlib import Path
 import torch, torch_npu
-ROOT=Path('/workspace/kda_ascendc_luna_20260905')
-sys.path.insert(0,str(ROOT/'python')); sys.path.insert(0,str(ROOT/'baseline/triton_bv64/src'))
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/'python')); sys.path.insert(0,str(ROOT/'src'))
 from kda_ascendc_v1.api import kda_bt16_fwd_ascendc
-from kernels import kda_bt16_fwd
+from kda_bt16 import kda_bt16_fwd
 DEV=torch.device('npu:0'); D=128
 
 def sync(): torch.npu.synchronize()

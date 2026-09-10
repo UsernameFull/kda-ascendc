@@ -3,7 +3,9 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/usr/local/Ascend/cann-9.1.0/python/site-packages")
+# CANN's own Python helpers (acl, mskl) live next to the toolkit root.
+ASCEND_HOME = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann-9.1.0"))
+sys.path.insert(0, str(ASCEND_HOME / "python" / "site-packages"))
 import numpy as np
 import acl
 from mskl.launcher import get_kernel_from_binary

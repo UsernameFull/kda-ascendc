@@ -9,11 +9,11 @@ from pathlib import Path
 import torch
 import torch_npu
 
-ROOT = Path('/workspace/kda_ascendc_luna_20260905')
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
-sys.path.insert(0, str(ROOT / 'baseline/triton_bv64/src'))
+sys.path.insert(0, str(ROOT / 'src'))
 from kda_ascendc_v1.api import get_last_profile, kda_bt16_fwd_ascendc
-from kernels import kda_bt16_fwd
+from kda_bt16 import kda_bt16_fwd
 
 DEVICE = torch.device('npu:0')
 D = 128
@@ -84,7 +84,7 @@ def main():
         'profile': get_last_profile(),
     }
     out = ROOT / 'results/PERSISTENT_SCAN'
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     (out / f'persistent_cube_vs_triton_{b}_{t}_{h}.json').write_text(json.dumps(row, indent=2) + os.linesep)
     print(json.dumps(row, indent=2), flush=True)
 

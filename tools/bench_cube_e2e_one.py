@@ -2,7 +2,7 @@ from __future__ import annotations
 import json, os, sys, time
 from pathlib import Path
 import torch, torch_npu
-ROOT=Path('/workspace/kda_ascendc_luna_20260905')
+ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'python'))
 from kda_ascendc_v1.api import kda_bt16_fwd_ascendc
 DEV=torch.device('npu:0'); D=128

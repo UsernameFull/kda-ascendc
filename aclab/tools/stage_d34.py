@@ -1,15 +1,23 @@
 """Stage B: d3 (smoke P3) + d4 (k2_m128) in independent process.
 Reads stageA outputs, computes vb = u - c1, launches d3/d4, saves results."""
 import sys, struct, os
+from pathlib import Path
+
 os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "1"
-sys.path.insert(0, "/root/.cache/torch_extensions/py312_cpu/kda_bt16_launcher")
+ACLAB_ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER_DIR = Path(os.environ.get(
+    "KDA_BT16_LAUNCHER_DIR",
+    Path.home() / ".cache" / "torch_extensions"
+    / f"py{sys.version_info.major}{sys.version_info.minor}_cpu" / "kda_bt16_launcher",
+))
+sys.path.insert(0, str(LAUNCHER_DIR))
 import torch, torch_npu
 from kda_bt16_launcher import rtc_compile, launch_argsarray_engine
 
 DEV = torch.device("npu:0")
 def nd(x):
     return torch_npu.npu_format_cast(x.contiguous(), 2).contiguous()
-rtc_compile(open("kernels/kda_bt16_smoke.cpp").read(), "kda_bt16_smoke_kernel", "")
+rtc_compile(open(ACLAB_ROOT / "kda_bt16_smoke.cpp").read(), "kda_bt16_smoke_kernel", "")
 torch.npu.synchronize()
 
 torch.manual_seed(7)
@@ -54,7 +62,7 @@ torch.npu.synchronize()
 print(f"d3 err={(c3-d3_ref).abs().max().item():.2e}")
 
 # d4 via kda_k2_m128
-rtc_compile(open("kernels/kda_k2_m128.cpp").read(), "kda_k2_m128_kernel", "")
+rtc_compile(open(ACLAB_ROOT / "kda_k2_m128.cpp").read(), "kda_k2_m128_kernel", "")
 torch.npu.synchronize()
 c4 = torch.zeros(128,128, dtype=torch.float32, device=DEV)
 kgnd = nd(kg)

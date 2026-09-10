@@ -336,6 +336,20 @@ pip install -e ".[npu]"     # with triton-ascend / torch-npu
 git clone https://github.com/fla-org/flash-linear-attention.git ../fla   # optional
 ```
 
+### Ascend NPU environment
+
+`triton-ascend` is easy to break: installing or upgrading `torch` restores the
+vanilla `triton` wheel over it, and CANN >= 9.1 renamed an enumerator that the
+Ascend driver helper compiles against. `scripts/fix_triton_ascend_env.py`
+diagnoses and repairs both, then builds the driver helper to verify:
+
+```bash
+python scripts/fix_triton_ascend_env.py --check   # diagnose only
+python scripts/fix_triton_ascend_env.py           # repair + verify
+```
+
+See `docs/TRITON_ASCEND_ENV.md` for the failure modes and recovery details.
+
 ## Usage
 
 ```python

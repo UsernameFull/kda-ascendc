@@ -2,7 +2,7 @@ from __future__ import annotations
 import json,struct,sys,time,os
 from pathlib import Path
 import torch,torch_npu
-ROOT=Path('/workspace/kda_ascendc_luna_20260905'); EXT=ROOT/'build/S02_clean/torch_extensions/kda_ascendc_v1_launcher'; sys.path.insert(0,str(EXT))
+ROOT=Path(__file__).resolve().parents[1]; EXT=ROOT/'build/S02_clean/torch_extensions/kda_ascendc_v1_launcher'; sys.path.insert(0,str(EXT))
 from kda_ascendc_v1_launcher import rtc_compile, launch_argsarray_engine
 DEV=torch.device('npu:0'); M=16; BV=64; D=128; NV=2
 def ptr(x): return struct.pack('<Q',int(x.data_ptr()))

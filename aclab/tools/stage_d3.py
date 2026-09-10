@@ -1,12 +1,20 @@
 """Stage B: d3+d4 via exact test_smoke.py structure (P1 warmup, then P3/P4-style)."""
 import sys, struct
-sys.path.insert(0, "/root/.cache/torch_extensions/py312_cpu/kda_bt16_launcher")
+from pathlib import Path
+import os
+
+ACLAB_ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER_DIR = Path(os.environ.get(
+    "KDA_BT16_LAUNCHER_DIR",
+    Path.home() / ".cache" / "torch_extensions"
+    / f"py{sys.version_info.major}{sys.version_info.minor}_cpu" / "kda_bt16_launcher",
+))
+sys.path.insert(0, str(LAUNCHER_DIR))
 import torch, torch_npu
 from kda_bt16_launcher import rtc_compile, launch_argsarray_engine
 
 DEV = torch.device("npu:0")
-ROOT = "/workspace/kda/proto/ascend_c"
-KERNEL_SRC = open(f"{ROOT}/kernels/kda_bt16_smoke.cpp").read()
+KERNEL_SRC = open(ACLAB_ROOT / "kda_bt16_smoke.cpp").read()
 rtc_compile(KERNEL_SRC, "kda_bt16_smoke_kernel", "")
 
 def stream_handle():
@@ -38,7 +46,7 @@ ref3 = aqk.float() @ vb.float()
 print(f"d3 err={(C3-ref3).abs().max().item():.2e}")
 
 # ---- d4 via kda_k2_m128 (v_new^T @ kg -> C4) ----
-rtc_compile(open(f"{ROOT}/kernels/kda_k2_m128.cpp").read(), "kda_k2_m128_kernel", "")
+rtc_compile(open(ACLAB_ROOT / "kda_k2_m128.cpp").read(), "kda_k2_m128_kernel", "")
 torch.npu.synchronize()
 kg = torch.randn(16,128, dtype=bf16, device=DEV)*0.3
 vT = vb.t().contiguous()

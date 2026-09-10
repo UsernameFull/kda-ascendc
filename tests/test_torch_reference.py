@@ -448,6 +448,7 @@ def test_kda_bt16_with_initial_state(T, state_v_first, device):
         dt_bias=dt_bias,
         initial_state=initial_state.contiguous(),  # FP32, not bf16!
         output_final_state=True,
+        state_v_first=state_v_first,
     )
     
     # Compare outputs
