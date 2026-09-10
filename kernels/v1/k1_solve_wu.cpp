@@ -121,16 +121,20 @@ extern "C" __global__ __aicore__ void kda_solve_wu_kernel(
     WaitFlag<HardEvent::MTE2_V>(e2v);
 
     // ---- forward substitution: Ai = (I + L)^{-1} -------------------------
+    // Only the strict lower triangle is read; the rest of aiv stays zero.  The
+    // scalar UB reads (GetValue) are the expensive part of this kernel, so read
+    // each entry once: the coefficients of row i are exactly aiv[i][j<i], which
+    // the first loop already loaded and nothing has overwritten yet.
     float aiv[MM];
-    for (int32_t k = 0; k < MM; ++k) {
-        const int32_t i = k / M, j = k % M;
-        aiv[k] = (j < i) ? -lv.GetValue(k) : 0.0f;
+    for (int32_t k = 0; k < MM; ++k) aiv[k] = 0.0f;
+    for (int32_t i = 1; i < M; ++i) {
+        for (int32_t j = 0; j < i; ++j) aiv[i * M + j] = -lv.GetValue(i * M + j);
     }
     for (int32_t i = 2; i < M; ++i) {
         float arow[M];
         float raw[M];
         for (int32_t j = 0; j < M; ++j) {
-            raw[j] = (j < i) ? -lv.GetValue(i * M + j) : 0.0f;
+            raw[j] = (j < i) ? aiv[i * M + j] : 0.0f;
             arow[j] = raw[j];
         }
         for (int32_t j = 0; j < i; ++j) {
