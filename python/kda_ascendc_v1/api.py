@@ -200,7 +200,10 @@ def kda_bt16_fwd_ascendc(
     decay = torch.empty((c, D), dtype=torch.float32, device=q.device)
     rk = torch.empty_like(q_pack); rv = torch.empty_like(q_pack)
     qg = torch.empty_like(q_pack); kg = torch.empty_like(q_pack)
-    pre_args = _pack_ptrs([q, k, v, g, beta, A_log, bias, qn, kn, gate, gc, beta_out, decay, rk, rv, qg, kg])
+    # The preprocess kernel addresses every token in packed ``[c, CHUNK, D]``
+    # order, so the public [B, T, H, D] tensors have to be packed first.
+    pre_args = _pack_ptrs([q_pack, k_pack, v_pack, g_pack, beta_pack,
+                           A_log, bias, qn, kn, gate, gc, beta_out, decay, rk, rv, qg, kg])
     pre_args += [_i(b), _i(t), _i(h), _f(lower_bound)]
     mark("pre_start")
     _launch("kda_preprocess_kernel", c, pre_args, stream)
@@ -277,20 +280,25 @@ def kda_bt16_fwd_ascendc(
     _launch("kda_k2_init_kernel", tasks, init_args, stream)
     finish("init_ms", "init_start")
 
+    # Modes that route d3/d4 through the Cube kernels need the K-major kg^T
+    # staging buffer produced by kda_kg_transpose.
+    cube_d4_modes = {"cube_full_d4", "mix_aic_1_2", "mix_d12_vnew", "mix_all_cube"}
+    separated_modes = {"separated", "cube_separated", "cube_d3_separated"}
+    needs_kg_t = k2_mode in cube_d4_modes or k2_mode in separated_modes
     d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.float32, device=q.device)
     d2 = torch.empty_like(d1)
     vnew = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
     vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
     d3 = torch.empty_like(d1)
-    d4 = None if k2_mode in {"cube_full_d4", "mix_aic_1_2", "mix_d12_vnew", "mix_all_cube"} else torch.empty((tasks, nt, BV, D), dtype=torch.float32, device=q.device)
+    d4 = None if k2_mode in cube_d4_modes else torch.empty((c, D, D), dtype=torch.float32, device=q.device)
     d4_full = (torch.empty((bh, D, D), dtype=torch.float32, device=q.device)
                 if k2_mode in {"mix_aic_1_2", "mix_d12_vnew", "mix_all_cube"} else
                 torch.empty((c, D, D), dtype=torch.float32, device=q.device)
                 if k2_mode == "cube_full_d4" else None)
-    kg_t = torch.empty((c, D, CHUNK), dtype=torch.bfloat16, device=q.device) if k2_mode in {"cube_full_d4", "mix_aic_1_2", "mix_d12_vnew", "mix_all_cube"} else None
+    kg_t = torch.empty((c, D, CHUNK), dtype=torch.bfloat16, device=q.device) if needs_kg_t else None
     out_task = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
     mark("k2_start")
-    if k2_mode in {"cube_full_d4", "mix_aic_1_2", "mix_d12_vnew", "mix_all_cube"}:
+    if needs_kg_t:
         mark("kg_start")
         _launch("kda_kg_transpose", c, _pack_ptrs([kg, kg_t]) + [_i(c)], stream)
         finish("kg_transpose_ms", "kg_start")
@@ -326,10 +334,10 @@ def kda_bt16_fwd_ascendc(
             _launch("kda_k2_outstate_full_kernel", tasks, _pack_ptrs([d2, d3, d4_full, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
         elif k2_mode == "cube_d3_separated":
             _launch("kda_k2_d3_cube_bv64", tasks, _pack_ptrs([aqk16, vnew_t, d3]) + common, stream)
-            _launch("kda_k2_d4_only_kernel", tasks, _pack_ptrs([vnew, kg, d4]) + common, stream)
+            _launch("kda_k2_d4_only_kernel", tasks, _pack_ptrs([vnew_t, kg_t, d4]) + common, stream)
             _launch("kda_k2_outstate_kernel", tasks, _pack_ptrs([d2, d3, d4, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
         else:
-            _launch("kda_k2_d34_kernel", tasks, _pack_ptrs([aqk16, vnew, kg, d3, d4]) + common, stream)
+            _launch("kda_k2_d34_kernel", tasks, _pack_ptrs([aqk16, vnew_t, kg_t, d3, d4]) + common, stream)
             _launch("kda_k2_outstate_kernel", tasks, _pack_ptrs([d2, d3, d4, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
 
     finish("k2_ms", "k2_start")
@@ -351,4 +359,3 @@ def kda_bt16_fwd_ascendc(
         "d4_full": d4_full,
     }
     return out_public, final_state, debug
-

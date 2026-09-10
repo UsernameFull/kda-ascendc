@@ -8,7 +8,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_kernel(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     int32_t task=GetBlockIdx(), tasks=BH*NV; if(task>=tasks)return;
     int32_t bh=task/NV, iv=task-bh*NV;
-    TPipe pipe; TEventID e2v=pipe.AllocEventID<HardEvent::MTE2_V>(); TEventID ev3=pipe.AllocEventID<HardEvent::V_MTE3>();
+    TPipe pipe; TEventID e2v=pipe.AllocEventID<HardEvent::MTE2_V>(); TEventID ev3=pipe.AllocEventID<HardEvent::V_MTE3>(); TEventID evs=pipe.AllocEventID<HardEvent::V_S>();
     TBuf<TPosition::VECCALC> us,us16,uw,uq,uu,uk,ua,udec,uf,d1b,d2b,vb,d3b,d4b,ob,vfb,ofb,wfb,qfb,ufb,kfb,afb;
     pipe.InitBuffer(us,BV*D*4); pipe.InitBuffer(us16,BV*D*2); pipe.InitBuffer(uw,M*D*2); pipe.InitBuffer(uq,M*D*2); pipe.InitBuffer(uu,M*D*2); pipe.InitBuffer(uk,M*D*2); pipe.InitBuffer(ua,M*M*2); pipe.InitBuffer(udec,D*4); pipe.InitBuffer(uf,BV*D*4); pipe.InitBuffer(d1b,TILE*4); pipe.InitBuffer(d2b,TILE*4); pipe.InitBuffer(vb,TILE*2); pipe.InitBuffer(d3b,TILE*4); pipe.InitBuffer(d4b,BV*D*4); pipe.InitBuffer(ob,TILE*2); pipe.InitBuffer(vfb,TILE*4); pipe.InitBuffer(ofb,TILE*4); pipe.InitBuffer(wfb,M*D*4); pipe.InitBuffer(qfb,M*D*4); pipe.InitBuffer(ufb,M*D*4); pipe.InitBuffer(kfb,M*D*4); pipe.InitBuffer(afb,M*M*4);
     LocalTensor<float> s=us.Get<float>(), dec=udec.Get<float>(), sf=us.Get<float>(), d1=d1b.Get<float>(), d2=d2b.Get<float>(), d3=d3b.Get<float>(), d4=d4b.Get<float>(), vf=vfb.Get<float>(), of=ofb.Get<float>(), wf=wfb.Get<float>(), qf=qfb.Get<float>(), uf32=ufb.Get<float>(), kf=kfb.Get<float>(), af=afb.Get<float>();
@@ -29,9 +29,11 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_kernel(
         Duplicate(d3,0.0f,TILE); Duplicate(d4,0.0f,BV*D); PipeBarrier<PIPE_V>();
         for(int i=0;i<M;i++) for(int v=0;v<BV;v++){float z=0; for(int j=0;j<M;j++) z+=af.GetValue(i*M+j)*vf.GetValue(j*BV+v); d3.SetValue(i*BV+v,z);}
         for(int v=0;v<BV;v++) for(int k=0;k<D;k++){float z=0; for(int i=0;i<M;i++) z+=vf.GetValue(i*BV+v)*kf.GetValue(i*D+k); d4.SetValue(v*D+k,z);}
-        for(int i=0;i<M;i++) for(int v=0;v<BV;v++) of.SetValue(i*BV+v,scale*d2.GetValue(i*BV+v)+d3.GetValue(i*BV+v));
+        Muls(of,d2,scale,TILE); Add(of,of,d3,TILE);
         Cast(outb,of,RoundMode::CAST_RINT,TILE);
-        for(int v=0;v<BV;v++) for(int k=0;k<D;k++) s.SetValue(v*D+k,s.GetValue(v*D+k)*dec.GetValue(k)+d4.GetValue(v*D+k));
+        for(int v=0;v<BV;v++) Mul(s[v*D],s[v*D],dec,D);
+        Add(s,s,d4,BV*D);
+        SetFlag<HardEvent::V_S>(evs); WaitFlag<HardEvent::V_S>(evs);
         SetFlag<HardEvent::V_MTE3>(ev3); WaitFlag<HardEvent::V_MTE3>(ev3); DataCopy(Out[co],outb,DataCopyParams(M,4,0,0));
     }
     SetFlag<HardEvent::V_MTE3>(ev3); WaitFlag<HardEvent::V_MTE3>(ev3); if(pHt!=nullptr) DataCopy(Ht[s0],s,DataCopyParams(BV,16,0,0));

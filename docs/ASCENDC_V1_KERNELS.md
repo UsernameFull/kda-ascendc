@@ -1,0 +1,89 @@
+# AscendC v1 kernel inventory (`kernels/v1/`)
+
+`python/kda_ascendc_v1/api.py` compiles these sources at runtime (RTC) and
+launches them through `launch_argsarray_engine`. Every producer/consumer pair
+below has a fixed buffer layout; changing one side of a pair without the other
+silently produces wrong numbers, so the contracts are spelled out here.
+
+## K1: preprocess -> gram -> W/U solve
+
+| Source | Kernel | Output |
+|---|---|---|
+| `preprocess.cpp` | `kda_preprocess_kernel` | `Qn`/`Kn` (bf16, packed `[c,16,128]`), `Gate`, `Gc`, `Beta`, `Decay`, `Qg`, `Kg`, `Rk`, `Rv` |
+| `k1_gram.cpp` | `kda_gram_kernel` | `Aqk32`/`Aqk` bf16 `[c,16,16]`, `L` |
+| `k1_solve_wu.cpp` | `kda_solve_wu_kernel` | `A32`/`A16`, `W`, `U` |
+
+The preprocess kernel indexes the packed chunk-major layout, so `api.py` passes
+the `*_pack` tensors (`pack_tokens` / the beta permute), never the public
+`[B,T,H,D]` views.
+
+Row reductions inside these kernels use the tested idiom
+`Add(tmp, tile, tile[64], 64, M, BinaryRepeatParams(1,1,1,16,16,16))` followed by
+`WholeReduceSum(rs, tmp, 64, M, 1, 1, 16)`: the fp32 L1 mask is 64 lanes, and
+with `dstRepStride = 1` the results land contiguously at `rs[i]` (not `rs[i*8]`).
+
+## K2: d12 -> vnew -> d3 -> d4 -> out/state
+
+| Source | Kernel | Blocks | Output layout |
+|---|---|---|---|
+| `k2_init.cpp` | `kda_k2_init_kernel` | `BH*NV` | `s32`/`s16` `[task,64,128]` |
+| `k2_d12.cpp` | `kda_k2_d12_kernel` | `BH*NV` | `d1`,`d2` `[task,chunk,16,64]` fp32 |
+| `k2_d12_cube.cpp` | `kda_k2_d12_cube_kernel` | `BH*NV` | same as `k2_d12` |
+| `k2_vnew.cpp` | `kda_k2_vnew_kernel` | `BH*NV` | `vnew` `[task,chunk,16,64]` bf16 and `vnew_t` `[task,chunk,64,16]` bf16 |
+| `k2_kg_transpose.cpp` | `kda_kg_transpose` | `C` | `kg_t` `[c,128,16]` bf16 (K-major operand) |
+| `k2_d3_cube_bv64.cpp` | `kda_k2_d3_cube_bv64` | `BH*NV` | `d3` `[task,chunk,16,64]` fp32 |
+| `k2_d34.cpp` | `kda_k2_d34_kernel` | `BH*NV` | `d3` plus the task's 64 `d4` rows |
+| `k2_d4_only.cpp` | `kda_k2_d4_only_kernel` | `BH*NV` | the task's 64 `d4` rows |
+| `k2_d4_full.cpp` | `kda_k2_d4_full` | `BH` | the whole `[128,128]` `d4` tile |
+| `k2_outstate.cpp` | `kda_k2_outstate_kernel` | `BH*NV` | `out_task`, `s32`, `s16` |
+| `k2_outstate_full.cpp` | `kda_k2_outstate_full_kernel` | `BH*NV` | `out_task`, `s32`, `s16` |
+| `k2_mix_d4_outstate.cpp`, `k2_mix_d12_vnew.cpp`, `k2_mix_all_cube.cpp` | MIX kernels | `BH` | same buffers as above |
+
+### d4 layout contract
+
+`d4[v][k] = sum_i v_new[i][v] * kg[i][k]` is always stored row-major as
+`[v][k]` with a 128-float row stride, in one of two addressing modes:
+
+- reused per head (`d4_reuse == 1`): region `[bh,128,128]`, written by
+  `k2_d4_full.cpp` / the MIX kernels and read as `bh*D*D + iv*64*D`.
+- per chunk (`d4_reuse == 0`): region `[c,128,128]`, written by
+  `k2_d34.cpp` / `k2_d4_only.cpp` only for the rows owned by the block
+  (`c*D*D + iv*64*D`) and read by `k2_outstate.cpp` at the same offset.
+
+A block must never write the full `[128,128]` tile in the per-chunk layout:
+with two v-tile blocks per head that both doubles the footprint and races with
+the sibling block.
+
+### Cube operand convention
+
+`DataCopy(dst, src, Nd2NzParams(1, R, C, 0, C, R, 1, 0))` followed by a
+non-transposing `LoadData2dParams` loads a row-major `[R,C]` tile as the L0
+operand whose **rows are the n dimension and columns the k dimension**. That is
+why d3 consumes `vnew_t` (`[v][j]`) and d4 consumes `kg_t` (`[k][i]`); the
+non-transposed buffers cannot be fed to `Mmad` without an in-kernel transpose.
+
+## Verification
+
+```bash
+python tools/compile_all_server.py                     # RTC compile of every kernel
+python -m pytest tests/test_persistent_scan.py tests/test_persistent_scan_cube.py
+python tests/test_mix_aic_1_2.py                       # script-style checks
+python tests/test_d12_cube.py
+python tests/test_s15_mix_d12_vnew.py
+python tests/test_cube_separated.py
+```
+
+`tests/test_cube_separated.py` compares `separated` against `cube_separated`
+for `[1,32,2]`, `[2,1024,4]`, `[2,4096,8]` and `[1,8192,32]`; both must be
+finite and agree within 1e-3 / 1e-4. All ten `k2_mode` values are also checked
+against the Triton reference (`src/kda_bt16`) on `[1,64,2,128]` with
+`state_v_first=True`.
+
+## Reproducibility note
+
+The persistent kernels keep the cross-chunk state in UB and update it with
+vector ops, then read it back with the scalar unit on the next iteration. That
+vector -> scalar dependency needs an explicit `SetFlag/WaitFlag<HardEvent::V_S>`
+after the update; without it the final state drifts by ~1 ulp between runs and
+`tests/test_persistent_scan.py` (which requires bit-exact agreement between
+`persistent` and `persistent_scan`) fails intermittently.
