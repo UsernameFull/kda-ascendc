@@ -62,6 +62,34 @@ operand whose **rows are the n dimension and columns the k dimension**. That is
 why d3 consumes `vnew_t` (`[v][j]`) and d4 consumes `kg_t` (`[k][i]`); the
 non-transposed buffers cannot be fed to `Mmad` without an in-kernel transpose.
 
+When the tile is exactly `C == 16` columns wide - one C0 block per row - the ND
+layout *is* the NZ layout, so `Nd2Nz` degenerates to a plain copy and can be
+replaced by a plain burst `DataCopy(dst, src, R * C)`. Do that: the conversion
+still issues one 32-byte descriptor per row, which cost 7.3 ms per 512 chunks
+in `k2_d34` while the whole kernel only needs 3.4 ms. The 128-wide staging
+tiles (`W`, `Qg`, `S16`) do need `Nd2Nz` - a plain copy there silently loads
+the wrong operand layout (verified: d12 output moves by 7e-2).
+
+### Performance notes
+
+`[1,8192,32]` (16384 chunks, 512 chunk steps x 4 launches) is dominated by
+per-launch and per-stage latency, not by FLOPs:
+
+- The K2 chain is inherently sequential (`d12 -> vnew -> d34 -> outstate` all
+  read or write the running state), so batching several chunks into one launch
+  is *not* an option. Do not "optimize" the launch loop into a grid-stride
+  loop over chunks: a multi-chunk version was measured 12% faster and produced
+  stale-state results (2.4e-2 error).
+- 2048 launches alone cost ~5.7 ms (2.8 us each with an empty kernel), so
+  removing a launch is worth more than shaving a few instructions.
+- Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
+  result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
+  wrong tile (3e-1 error).
+- The K1 `solve` kernel is the largest single kernel (~6.5 ms): a scalar
+  forward substitution plus a vector matvec whose per-row scalar broadcasts
+  dominate. Moving `w = A_inv @ rk` / `u = A_inv @ rv` to the Cube is the
+  obvious next step.
+
 ## Verification
 
 ```bash
