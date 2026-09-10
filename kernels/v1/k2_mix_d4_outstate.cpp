@@ -211,23 +211,15 @@ static __aicore__ inline void run_outstate_aiv(
     SetFlag<HardEvent::MTE2_V>(e2v);
     WaitFlag<HardEvent::MTE2_V>(e2v);
 
-    for (int i = 0; i < M; ++i) {
-        for (int v = 0; v < BV; ++v) {
-            of.SetValue(i * BV + v,
-                        scale * d2.GetValue(i * BV + v) +
-                        d3.GetValue(i * BV + v));
-        }
-    }
+    Muls(of, d2, scale, TILE);
+    Add(of, of, d3, TILE);
     Cast(ob, of, RoundMode::CAST_RINT, TILE);
     PipeBarrier<PIPE_V>();
 
     for (int v = 0; v < BV; ++v) {
-        for (int k = 0; k < D; ++k) {
-            s.SetValue(v * D + k,
-                        s.GetValue(v * D + k) * dec.GetValue(k) +
-                        d4.GetValue(v * D + k));
-        }
+        Mul(s[v * D], s[v * D], dec, D);
     }
+    Add(s, s, d4, BV * D);
     Cast(s16, s, RoundMode::CAST_RINT, BV * D);
     PipeBarrier<PIPE_V>();
 

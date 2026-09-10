@@ -54,13 +54,12 @@ extern "C" __global__ __aicore__ void kda_k2_d4_full(
         Mmad(cf, a, b, MmadParams(M, N, K, 0, false, true));
         SetFlag<HardEvent::M_FIX>(emf);
         WaitFlag<HardEvent::M_FIX>(emf);
-        for (int nb = 0; nb < 8; ++nb) {
-            auto ip = FixpipeParamsV220(M, M, 1, N, false);
+        {
+            auto ip = FixpipeParamsV220(N, M, 16, N, false);
             ip.quantPre = QuantMode_t::NoQuant;
             ip.unitFlag = 0;
             Fixpipe<float, float, CFG_ROW_MAJOR>(
-                D4[static_cast<uint64_t>(bh) * D * D + mb * M * D + nb * M],
-                cf[nb * 256], ip);
+                D4[static_cast<uint64_t>(bh) * D * D + mb * M * D], cf, ip);
         }
         SetFlag<HardEvent::FIX_M>(efm);
         WaitFlag<HardEvent::FIX_M>(efm);

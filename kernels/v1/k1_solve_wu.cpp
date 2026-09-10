@@ -42,18 +42,36 @@ static __aicore__ inline void ScaleRows(LocalTensor<float> t0, const LocalTensor
     Mul(t0[64], ab, r[64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 8, 16));
 }
 
-static __aicore__ inline void MatVec(LocalTensor<bfloat16_t> outb, LocalTensor<float> t0,
-                                     const LocalTensor<float> ab, const LocalTensor<float> r,
-                                     const LocalTensor<float> af) {
+// Sum the 16 rows of a 16x16 fp32 tile into its first row (one block per row).
+static __aicore__ inline void ColSum16(LocalTensor<float> tile) {
+    Add(tile, tile, tile[8 * M], 16, 8, BinaryRepeatParams(1, 1, 1, 2, 2, 2));
+    PipeBarrier<PIPE_V>();
+    Add(tile, tile, tile[4 * M], 16, 4, BinaryRepeatParams(1, 1, 1, 2, 2, 2));
+    PipeBarrier<PIPE_V>();
+    Add(tile, tile, tile[2 * M], 16, 2, BinaryRepeatParams(1, 1, 1, 2, 2, 2));
+    PipeBarrier<PIPE_V>();
+    Add(tile, tile, tile[M], 16, 1, BinaryRepeatParams(1, 1, 1, 2, 2, 2));
+    PipeBarrier<PIPE_V>();
+}
+
+// Both right-hand sides share the broadcast of the A_inv row, so W and U are
+// formed in the same pass (halves the scalar broadcast work of MatVec).
+static __aicore__ inline void MatVec2(LocalTensor<bfloat16_t> outw, LocalTensor<bfloat16_t> outu,
+                                      LocalTensor<float> t0, LocalTensor<float> t1,
+                                      const LocalTensor<float> ab, const LocalTensor<float> rk,
+                                      const LocalTensor<float> rv, const LocalTensor<float> af) {
     for (int32_t i = 0; i < M; ++i) {
         for (int32_t j = 0; j < M; ++j) {
             Duplicate(ab[j * 64], af.GetValue(i * M + j), 64);
         }
         PipeBarrier<PIPE_V>();
-        ScaleRows(t0, ab, r);
+        ScaleRows(t0, ab, rk);
+        ScaleRows(t1, ab, rv);
         PipeBarrier<PIPE_V>();
         ColSum(t0);
-        Cast(outb[i * D], t0, RoundMode::CAST_RINT, D);
+        ColSum(t1);
+        Cast(outw[i * D], t0, RoundMode::CAST_RINT, D);
+        Cast(outu[i * D], t1, RoundMode::CAST_RINT, D);
         PipeBarrier<PIPE_V>();
     }
 }
@@ -68,8 +86,10 @@ extern "C" __global__ __aicore__ void kda_solve_wu_kernel(
     TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
     TEventID e3 = pipe.AllocEventID<HardEvent::V_MTE3>();
     TEventID sv = pipe.AllocEventID<HardEvent::S_V>();
-    TBuf<TPosition::VECCALC> bL, bRkf, bRvf, bAb, bT0, bA16f, bWb, bUb, bRkb, bRvb, bA16b;
+    TBuf<TPosition::VECCALC> bL, bRkf, bRvf, bAb, bT0, bT1, bA16f, bWb, bUb, bRkb,
+        bRvb, bA16b;
     pipe.InitBuffer(bL, MM * 4);
+    pipe.InitBuffer(bT1, N * 4);
     pipe.InitBuffer(bRkf, N * 4); pipe.InitBuffer(bRvf, N * 4);
     pipe.InitBuffer(bAb, M * 64 * 4); pipe.InitBuffer(bT0, N * 4);
     pipe.InitBuffer(bA16f, MM * 4); pipe.InitBuffer(bA16b, MM * 2);
@@ -77,7 +97,7 @@ extern "C" __global__ __aicore__ void kda_solve_wu_kernel(
     pipe.InitBuffer(bRkb, N * 2); pipe.InitBuffer(bRvb, N * 2);
     LocalTensor<float> lv = bL.Get<float>();
     LocalTensor<float> rkf = bRkf.Get<float>(), rvf = bRvf.Get<float>();
-    LocalTensor<float> ab = bAb.Get<float>(), t0 = bT0.Get<float>();
+    LocalTensor<float> ab = bAb.Get<float>(), t0 = bT0.Get<float>(), t1 = bT1.Get<float>();
     LocalTensor<float> a16f = bA16f.Get<float>();
     LocalTensor<bfloat16_t> a16b = bA16b.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> wb = bWb.Get<bfloat16_t>(), ub = bUb.Get<bfloat16_t>();
@@ -141,8 +161,7 @@ extern "C" __global__ __aicore__ void kda_solve_wu_kernel(
     Cast(rvf, rvb, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
 
-    MatVec(wb, t0, ab, rkf, a16f);
-    MatVec(ub, t0, ab, rvf, a16f);
+    MatVec2(wb, ub, t0, t1, ab, rkf, rvf, a16f);
 
     SetFlag<HardEvent::V_MTE3>(e3);
     WaitFlag<HardEvent::V_MTE3>(e3);

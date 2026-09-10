@@ -52,13 +52,12 @@ extern "C" __global__ __aicore__ void kda_k2_d3_cube_bv64(
     Mmad(cf, a, b, MmadParams(M, N3, K, 0, false, true));
     SetFlag<HardEvent::M_FIX>(emf);
     WaitFlag<HardEvent::M_FIX>(emf);
-    for (int nb = 0; nb < 4; ++nb) {
-        auto ip = FixpipeParamsV220(M, M, 1, N3, false);
+    {
+        auto ip = FixpipeParamsV220(N3, M, 16, N3, false);
         ip.quantPre = QuantMode_t::NoQuant;
         ip.unitFlag = 0;
         Fixpipe<float, float, CFG_ROW_MAJOR>(
-            D3[(static_cast<uint64_t>(task) * NT + chunk) * M * BV + nb * M],
-            cf[nb * 256], ip);
+            D3[(static_cast<uint64_t>(task) * NT + chunk) * M * BV], cf, ip);
     }
     SetFlag<HardEvent::FIX_M>(efm);
     WaitFlag<HardEvent::FIX_M>(efm);

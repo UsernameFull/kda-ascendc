@@ -33,7 +33,8 @@ static __aicore__ inline void RowBroadcastMul(LocalTensor<float> t0, const Local
 
 extern "C" __global__ __aicore__ void kda_gram_kernel(
     GM_ADDR pQn, GM_ADDR pKn, GM_ADDR pGc, GM_ADDR pBeta,
-    GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, int32_t C, float scale) {
+    GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
+    int32_t C, float scale) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const int32_t c = GetBlockIdx();
     if (c >= C) return;
@@ -41,25 +42,31 @@ extern "C" __global__ __aicore__ void kda_gram_kernel(
     TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
     TEventID e3 = pipe.AllocEventID<HardEvent::V_MTE3>();
     TEventID sv = pipe.AllocEventID<HardEvent::S_V>();
-    TBuf<TPosition::VECCALC> bQf, bKf, bEf, bEfn, bA, bK1, bB, bT0, bRed,
-        bA32, bL32, bA16, bBeta, bQnb, bKnb;
+    TBuf<TPosition::VECCALC> bQf, bKf, bEf, bEfn, bA, bK1, bB, bT0,
+        bA32, bL32, bA16, bBeta, bQnb, bKnb, bRedA, bRedK, bMaskS, bMaskL, bTb;
     pipe.InitBuffer(bQf, N * 4); pipe.InitBuffer(bKf, N * 4);
     pipe.InitBuffer(bEf, N * 4); pipe.InitBuffer(bEfn, N * 4);
     pipe.InitBuffer(bA, N * 4); pipe.InitBuffer(bK1, N * 4); pipe.InitBuffer(bB, N * 4);
-    pipe.InitBuffer(bT0, N * 4); pipe.InitBuffer(bRed, 384 * 4);
+    pipe.InitBuffer(bT0, N * 4);
+    pipe.InitBuffer(bRedA, M * M * 4); pipe.InitBuffer(bRedK, M * M * 4);
+    pipe.InitBuffer(bMaskS, M * M * 4); pipe.InitBuffer(bMaskL, M * M * 4);
+    pipe.InitBuffer(bTb, D * 4);
     pipe.InitBuffer(bA32, M * M * 4); pipe.InitBuffer(bL32, M * M * 4);
     pipe.InitBuffer(bA16, M * M * 2);
     pipe.InitBuffer(bBeta, M * 4); pipe.InitBuffer(bQnb, N * 2); pipe.InitBuffer(bKnb, N * 2);
     LocalTensor<float> qf = bQf.Get<float>(), kf = bKf.Get<float>();
     LocalTensor<float> ef = bEf.Get<float>(), efn = bEfn.Get<float>();
     LocalTensor<float> a = bA.Get<float>(), k1 = bK1.Get<float>(), b = bB.Get<float>();
-    LocalTensor<float> t0 = bT0.Get<float>(), red = bRed.Get<float>();
+    LocalTensor<float> t0 = bT0.Get<float>();
+    LocalTensor<float> redA = bRedA.Get<float>(), redK = bRedK.Get<float>();
+    LocalTensor<float> maskS = bMaskS.Get<float>(), maskL = bMaskL.Get<float>();
+    LocalTensor<float> tb = bTb.Get<float>();
     LocalTensor<float> a32 = bA32.Get<float>(), l32 = bL32.Get<float>();
     LocalTensor<bfloat16_t> a16 = bA16.Get<bfloat16_t>();
     LocalTensor<float> beta = bBeta.Get<float>();
     LocalTensor<bfloat16_t> qnb = bQnb.Get<bfloat16_t>(), knb = bKnb.Get<bfloat16_t>();
     GlobalTensor<bfloat16_t> Qn, Kn, Aqk16;
-    GlobalTensor<float> Gc, Beta, Aqk32, L;
+    GlobalTensor<float> Gc, Beta, Aqk32, L, MaskS, MaskL;
     Qn.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pQn));
     Kn.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pKn));
     Aqk16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pAqk16));
@@ -67,6 +74,8 @@ extern "C" __global__ __aicore__ void kda_gram_kernel(
     Beta.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pBeta));
     Aqk32.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pAqk32));
     L.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pL));
+    MaskS.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pMaskS));
+    MaskL.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pMaskL));
     const uint64_t x0 = static_cast<uint64_t>(c) * N;
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
 
@@ -74,6 +83,8 @@ extern "C" __global__ __aicore__ void kda_gram_kernel(
     DataCopy(knb, Kn[x0], DataCopyParams(M, 8, 0, 0));
     DataCopy(ef, Gc[x0], DataCopyParams(M, 16, 0, 0));
     DataCopy(beta, Beta[static_cast<uint64_t>(c) * M], DataCopyParams(1, 2, 0, 0));
+    DataCopy(maskS, MaskS[0], DataCopyParams(M, 2, 0, 0));
+    DataCopy(maskL, MaskL[0], DataCopyParams(M, 2, 0, 0));
     SetFlag<HardEvent::MTE2_V>(e2v);
     WaitFlag<HardEvent::MTE2_V>(e2v);
     Cast(qf, qnb, RoundMode::CAST_NONE, N);
@@ -95,27 +106,26 @@ extern "C" __global__ __aicore__ void kda_gram_kernel(
     Mul(b, kf, efn, N);
     PipeBarrier<PIPE_V>();
 
+    // Row i of the Gram matrix lands in row i of redA/redK, so the triangular
+    // masks are applied with a single elementwise multiply instead of 512
+    // scalar SetValue/GetValue pairs per chunk.
     for (int32_t i = 0; i < M; ++i) {
         RowBroadcastMul(t0, a[i * D], b);
         PipeBarrier<PIPE_V>();
-        RowDot(red, ef, t0);
+        RowDot(redA[i * M], ef, t0);
         PipeBarrier<PIPE_V>();
-        const int32_t base = i * M;
-        for (int32_t j = 0; j < M; ++j) {
-            a32.SetValue(base + j, j <= i ? scale * red.GetValue(j) : 0.0f);
-        }
-        RowBroadcastMul(t0, k1[i * D], b);
+        Muls(tb, k1[i * D], beta.GetValue(i), D);
         PipeBarrier<PIPE_V>();
-        RowDot(red, ef, t0);
+        RowBroadcastMul(t0, tb, b);
         PipeBarrier<PIPE_V>();
-        const float bi = beta.GetValue(i);
-        for (int32_t j = 0; j < M; ++j) {
-            l32.SetValue(base + j, j < i ? bi * red.GetValue(j) : 0.0f);
-        }
+        RowDot(redK[i * M], ef, t0);
         PipeBarrier<PIPE_V>();
     }
-    SetFlag<HardEvent::S_V>(sv);
-    WaitFlag<HardEvent::S_V>(sv);
+    Muls(redA, redA, scale, M * M);
+    PipeBarrier<PIPE_V>();
+    Mul(a32, redA, maskS, M * M);
+    Mul(l32, redK, maskL, M * M);
+    PipeBarrier<PIPE_V>();
     Cast(a16, a32, RoundMode::CAST_RINT, M * M);
     PipeBarrier<PIPE_V>();
     SetFlag<HardEvent::V_MTE3>(e3);

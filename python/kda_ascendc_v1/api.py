@@ -29,6 +29,8 @@ _PERSISTENT_SCAN_COMPILED = False
 _PERSISTENT_SCAN_CUBE_COMPILED = False
 _TRITON_AIV_COMPILED = False
 _LAST_PROFILE: dict[str, object] = {}
+# Triangular 0/1 masks for the intra-chunk Gram kernel, built once per device.
+_GRAM_MASKS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 _LAUNCH_COUNTS: dict[str, int] = {}
 _LAUNCH_BLOCKS: dict[str, int] = {}
 
@@ -111,6 +113,20 @@ def _compile_triton_aiv() -> None:
     rtc_compile((ROOT / "kernels/v1/k2_triton_aiv.cpp").read_text(),
                 "kda_k2_triton_aiv", "")
     _TRITON_AIV_COMPILED = True
+
+def _tri_masks(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    masks = _GRAM_MASKS.get(device)
+    if masks is None:
+        idx = torch.arange(CHUNK, device=device)
+        masks = ((idx[None, :] <= idx[:, None]).to(torch.float32).contiguous(),
+                 (idx[None, :] < idx[:, None]).to(torch.float32).contiguous())
+        # torch_npu does not order every elementwise op against the raw
+        # aclrtLaunchKernel calls made by the launcher, so make sure the mask
+        # tensors are on device before any kernel can read them.
+        torch.npu.synchronize()
+        _GRAM_MASKS[device] = masks
+    return masks
+
 
 def _check_inputs(q, k, v, g, beta, A_log, bias, initial_state):
     if q.device.type != "npu":
@@ -212,7 +228,8 @@ def kda_bt16_fwd_ascendc(
     aqk32 = torch.empty((c, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     aqk16 = torch.empty((c, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
     L = torch.empty_like(aqk32)
-    gram_args = _pack_ptrs([qn, kn, gc, beta_out, aqk32, aqk16, L]) + [_i(c), _f(scale)]
+    mask_s, mask_l = _tri_masks(q.device)
+    gram_args = _pack_ptrs([qn, kn, gc, beta_out, aqk32, aqk16, L, mask_s, mask_l]) + [_i(c), _f(scale)]
     mark("gram_start")
     _launch("kda_gram_kernel", c, gram_args, stream)
     finish("gram_ms", "gram_start")
@@ -297,6 +314,9 @@ def kda_bt16_fwd_ascendc(
                 if k2_mode == "cube_full_d4" else None)
     kg_t = torch.empty((c, D, CHUNK), dtype=torch.bfloat16, device=q.device) if needs_kg_t else None
     out_task = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+    # Every K2 kernel of a chunk depends on the previous chunk's state update,
+    # so the chain stays one launch per (chunk, stage); each batch kernel is
+    # launched with nchunk=1 here.
     mark("k2_start")
     if needs_kg_t:
         mark("kg_start")
@@ -321,8 +341,8 @@ def kda_bt16_fwd_ascendc(
                 if k2_mode in {"cube_separated", "cube_d3_separated", "cube_full_d4", "mix_aic_1_2"}
                 else "kda_k2_d12_kernel"
             )
-            _launch(d12_name, tasks, _pack_ptrs([W, qg, s16, d1, d2]) + common, stream)
-            _launch("kda_k2_vnew_kernel", tasks, _pack_ptrs([U, d1, vnew, vnew_t]) + common, stream)
+            _launch(d12_name, tasks, _pack_ptrs([W, qg, s16, d1, d2]) + common + [_i(1)], stream)
+            _launch("kda_k2_vnew_kernel", tasks, _pack_ptrs([U, d1, vnew, vnew_t]) + common + [_i(1)], stream)
         if k2_mode in {"mix_aic_1_2", "mix_d12_vnew"}:
             _launch("kda_k2_mix_d4_outstate", bh,
                     _pack_ptrs([aqk16, vnew_t, kg_t, d2, d3, d4_full,
@@ -337,7 +357,7 @@ def kda_bt16_fwd_ascendc(
             _launch("kda_k2_d4_only_kernel", tasks, _pack_ptrs([vnew_t, kg_t, d4]) + common, stream)
             _launch("kda_k2_outstate_kernel", tasks, _pack_ptrs([d2, d3, d4, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
         else:
-            _launch("kda_k2_d34_kernel", tasks, _pack_ptrs([aqk16, vnew_t, kg_t, d3, d4]) + common, stream)
+            _launch("kda_k2_d34_kernel", tasks, _pack_ptrs([aqk16, vnew_t, kg_t, d3, d4]) + common + [_i(1)], stream)
             _launch("kda_k2_outstate_kernel", tasks, _pack_ptrs([d2, d3, d4, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
 
     finish("k2_ms", "k2_start")

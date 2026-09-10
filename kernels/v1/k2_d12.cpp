@@ -7,11 +7,13 @@ constexpr int32_t BV = 64, D = 128, M = 16, N = 64;
 
 extern "C" __global__ __aicore__ void kda_k2_d12_kernel(
     GM_ADDR pW, GM_ADDR pQg, GM_ADDR pS16, GM_ADDR pd1, GM_ADDR pd2,
-    int32_t BH, int32_t NT, int32_t NV, int32_t chunk) {
+    int32_t BH, int32_t NT, int32_t NV, int32_t chunk0, int32_t nchunk) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
-    const int32_t task = GetBlockIdx();
     const int32_t tasks = BH * NV;
-    if (task >= tasks) return;
+    const int32_t blk = GetBlockIdx();
+    if (blk >= tasks * nchunk) return;
+    const int32_t task = blk % tasks;
+    const int32_t chunk = chunk0 + blk / tasks;
     const int32_t bh = task / NV;
     const int32_t c = bh * NT + chunk;
     TPipe pipe;
@@ -51,11 +53,11 @@ extern "C" __global__ __aicore__ void kda_k2_d12_kernel(
     SetFlag<HardEvent::MTE1_M>(ev1m); WaitFlag<HardEvent::MTE1_M>(ev1m);
     Mmad(l0cf, l0a, l0b, MmadParams(M, N, D, 0, false, true));
     SetFlag<HardEvent::M_FIX>(evmfix); WaitFlag<HardEvent::M_FIX>(evmfix);
-    for (int32_t nb = 0; nb < 4; ++nb) {
-        auto ip = FixpipeParamsV220(M, N / 4, 1, N, false);
+    {
+        auto ip = FixpipeParamsV220(N, M, 16, N, false);
         ip.quantPre = QuantMode_t::NoQuant;
         ip.unitFlag = 0;
-        Fixpipe<float, float, CFG_ROW_MAJOR>(D1[o0 + nb * M], l0cf[nb * M * (N / 4)], ip);
+        Fixpipe<float, float, CFG_ROW_MAJOR>(D1[o0], l0cf, ip);
     }
     SetFlag<HardEvent::FIX_M>(evfixm); WaitFlag<HardEvent::FIX_M>(evfixm);
     l1AQue.FreeTensor(la);
@@ -68,11 +70,11 @@ extern "C" __global__ __aicore__ void kda_k2_d12_kernel(
     SetFlag<HardEvent::MTE1_M>(ev1m); WaitFlag<HardEvent::MTE1_M>(ev1m);
     Mmad(l0cf, l0a, l0b, MmadParams(M, N, D, 0, false, true));
     SetFlag<HardEvent::M_FIX>(evmfix); WaitFlag<HardEvent::M_FIX>(evmfix);
-    for (int32_t nb = 0; nb < 4; ++nb) {
-        auto ip = FixpipeParamsV220(M, N / 4, 1, N, false);
+    {
+        auto ip = FixpipeParamsV220(N, M, 16, N, false);
         ip.quantPre = QuantMode_t::NoQuant;
         ip.unitFlag = 0;
-        Fixpipe<float, float, CFG_ROW_MAJOR>(D2[o0 + nb * M], l0cf[nb * M * (N / 4)], ip);
+        Fixpipe<float, float, CFG_ROW_MAJOR>(D2[o0], l0cf, ip);
     }
     SetFlag<HardEvent::FIX_M>(evfixm); WaitFlag<HardEvent::FIX_M>(evfixm);
     l1AQue.FreeTensor(la); l1BQue.FreeTensor(lb); l0CQue.FreeTensor(l0cf);
