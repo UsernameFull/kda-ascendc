@@ -1,0 +1,11 @@
+# Core deps: DO NOT install directly from here for NPU
+# Use: pip install -e ".[cuda]" or pip install -e ".[npu]"
+# See pyproject.toml for proper platform-specific installation
+
+torch>=2.1
+
+# CUDA: install with pip install -e ".[cuda]"
+# NPU: install with pip install -e ".[npu]"
+
+# Optional: FLA main checkout for reference implementations used by tests/bench
+# git clone https://github.com/fla-org/flash-linear-attention.git  # set FLA_ROOT

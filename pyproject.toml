@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kda-bt16"
+version = "0.1.0"
+description = "Two-stage BT=16 Triton kernels for Kimi Delta Attention (KDA) forward"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "KDA-BT16 contributors" }]
+keywords = ["triton", "kda", "linear-attention", "ascend", "npu"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+# CUDA backend: community Triton
+cuda = ["triton>=3.0"]
+# NPU backend: Triton-Ascend (conflicts with community triton, install exclusively)
+npu = ["torch-npu", "triton-ascend>=3.2.1"]
+# test dependencies (independent torch reference - no FLA required)
+test = ["pytest>=7.0"]
+# gold reference implementations (fused_recurrent_kda / chunk_kda) for comparison
+compare = ["flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "npu: tests that require an Ascend NPU",
+    "cuda: tests that require a CUDA GPU",
+    "unit: backend-independent tests",
+    "slow: long-running tests",
+]
