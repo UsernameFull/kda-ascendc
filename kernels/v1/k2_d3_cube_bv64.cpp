@@ -35,10 +35,8 @@ extern "C" __global__ __aicore__ void kda_k2_d3_cube_bv64(
     D3.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD3));
     auto la = qa.AllocTensor<bfloat16_t>();
     auto lb = qb.AllocTensor<bfloat16_t>();
-    DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K],
-             Nd2NzParams(1, M, K, 0, K, M, 1, 0));
-    DataCopy(lb, Vt[(static_cast<uint64_t>(task) * NT + chunk) * BV * K],
-             Nd2NzParams(1, BV, K, 0, K, BV, 1, 0));
+    DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
+    DataCopy(lb, Vt[(static_cast<uint64_t>(task) * NT + chunk) * BV * K], BV * K);
     SetFlag<HardEvent::MTE2_MTE1>(e21);
     WaitFlag<HardEvent::MTE2_MTE1>(e21);
     qa.EnQue(la);

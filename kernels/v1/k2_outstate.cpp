@@ -58,9 +58,10 @@ extern "C" __global__ __aicore__ void kda_k2_outstate_kernel(
     Add(of, of, d3, TILE);
     Cast(ob, of, RoundMode::CAST_RINT, TILE);
     PipeBarrier<PIPE_V>();
-    for (int32_t v = 0; v < BV; ++v) {
-        Mul(s[v * D], s[v * D], dec, D);
-    }
+    // s[v][k] *= dec[k] for all BV rows in two strided Mul repeats (the decay
+    // vector is reused with a zero source-repeat stride).
+    Mul(s, s, dec, 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Mul(s[64], s[64], dec[64], 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
     Add(s, s, d4, BV * D);
     Cast(s16, s, RoundMode::CAST_RINT, BV * D);
     PipeBarrier<PIPE_V>();

@@ -45,9 +45,8 @@ extern "C" __global__ __aicore__ void kda_k2_d4_only_kernel(
                             static_cast<uint64_t>(rr) * M * K;
         auto la = qa.AllocTensor<bfloat16_t>();
         auto lb = qb.AllocTensor<bfloat16_t>();
-        DataCopy(la, Vt[ao], Nd2NzParams(1, M, K, 0, K, M, 1, 0));
-        DataCopy(lb, Kt[static_cast<uint64_t>(c) * D * K],
-                 Nd2NzParams(1, D, K, 0, K, D, 1, 0));
+        DataCopy(la, Vt[ao], M * K);
+        DataCopy(lb, Kt[static_cast<uint64_t>(c) * D * K], D * K);
         SetFlag<HardEvent::MTE2_MTE1>(e21);
         WaitFlag<HardEvent::MTE2_MTE1>(e21);
         qa.EnQue(la);

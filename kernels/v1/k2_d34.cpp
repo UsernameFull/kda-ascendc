@@ -49,12 +49,16 @@ extern "C" __global__ __aicore__ void kda_k2_d34_kernel(
     D4.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD4));
 
     // ---- stage the three operands once: v_new^T, kg^T and Aqk
+    // Every operand is 16 columns wide, i.e. exactly one C0 block per row, so
+    // the ND layout already is the NZ layout the Cube wants: a plain burst copy
+    // into L1 is equivalent to Nd2Nz here and much faster (Nd2Nz issues one
+    // 32-byte descriptor per row, which cost ~7 ms per 512 chunks).
     auto lv = qv.AllocTensor<bfloat16_t>();
     auto lk = qk.AllocTensor<bfloat16_t>();
     auto la = qa.AllocTensor<bfloat16_t>();
-    DataCopy(lv, Vt[t0 * BV * K], Nd2NzParams(1, BV, K, 0, K, BV, 1, 0));
-    DataCopy(lk, Kt[static_cast<uint64_t>(c) * D * K], Nd2NzParams(1, D, K, 0, K, D, 1, 0));
-    DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], Nd2NzParams(1, M, K, 0, K, M, 1, 0));
+    DataCopy(lv, Vt[t0 * BV * K], BV * K);
+    DataCopy(lk, Kt[static_cast<uint64_t>(c) * D * K], D * K);
+    DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
     SetFlag<HardEvent::MTE2_MTE1>(e21);
     WaitFlag<HardEvent::MTE2_MTE1>(e21);
     qv.EnQue(lv);

@@ -41,10 +41,8 @@ static __aicore__ inline void run_d3_aic(
         int32_t task = bh * 2 + iv;
         auto la = qa.AllocTensor<bfloat16_t>();
         auto lb = qb.AllocTensor<bfloat16_t>();
-        DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K],
-                 Nd2NzParams(1, M, K, 0, K, M, 1, 0));
-        DataCopy(lb, Vt[(static_cast<uint64_t>(task) * NT + chunk) * BV * K],
-                 Nd2NzParams(1, BV, K, 0, K, BV, 1, 0));
+        DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
+        DataCopy(lb, Vt[(static_cast<uint64_t>(task) * NT + chunk) * BV * K], BV * K);
         SetFlag<HardEvent::MTE2_MTE1>(e21);
         WaitFlag<HardEvent::MTE2_MTE1>(e21);
         qa.EnQue(la);
@@ -116,9 +114,8 @@ static __aicore__ inline void run_d4_aic(
                           64 * M + static_cast<uint64_t>(rr) * M * K;
         auto la = qa.AllocTensor<bfloat16_t>();
         auto lb = qb.AllocTensor<bfloat16_t>();
-        DataCopy(la, Vt[ao], Nd2NzParams(1, M, K, 0, K, M, 1, 0));
-        DataCopy(lb, Kt[static_cast<uint64_t>(c) * D * K],
-                 Nd2NzParams(1, D, K, 0, K, D, 1, 0));
+        DataCopy(la, Vt[ao], M * K);
+        DataCopy(lb, Kt[static_cast<uint64_t>(c) * D * K], D * K);
         SetFlag<HardEvent::MTE2_MTE1>(e21);
         WaitFlag<HardEvent::MTE2_MTE1>(e21);
         qa.EnQue(la);
@@ -216,9 +213,10 @@ static __aicore__ inline void run_outstate_aiv(
     Cast(ob, of, RoundMode::CAST_RINT, TILE);
     PipeBarrier<PIPE_V>();
 
-    for (int v = 0; v < BV; ++v) {
-        Mul(s[v * D], s[v * D], dec, D);
-    }
+    // s[v][k] *= dec[k] for all BV rows in two strided Mul repeats (the decay
+    // vector is reused with a zero source-repeat stride).
+    Mul(s, s, dec, 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Mul(s[64], s[64], dec[64], 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
     Add(s, s, d4, BV * D);
     Cast(s16, s, RoundMode::CAST_RINT, BV * D);
     PipeBarrier<PIPE_V>();
