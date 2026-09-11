@@ -91,13 +91,22 @@ per-launch and per-stage latency, not by FLOPs:
   is *not* an option. Do not "optimize" the launch loop into a grid-stride
   loop over chunks: a multi-chunk version was measured 12% faster and produced
   stale-state results (2.4e-2 error).
-- Launch dispatch is cheap at the block counts the K2 stages use: an empty
-  kernel costs ~2.8 us per launch for 1..256 blocks, so the 256 launches of a
-  `[1,8192,32]` pass only pay ~0.7 ms. The same empty kernel costs 22.9 us per
-  launch at 2048 blocks, i.e. the cost tracks the block count, not the launch
-  count - do not fuse stages to save launches, and measure any launch change
-  with a device event rather than host wall time (host issue is 13.9 ms of the
-  22.6 ms pass, well inside the device time).
+- The chunk is 16 tokens (`CHUNK = 16`), so a `[1,8192,32]` pass runs 512
+  chunk steps x 4 stage launches = 2048 launches. An empty kernel costs
+  2.66 us of host time and 2.72 us of device time per launch at 64 blocks
+  (the K2 stage width), so dispatch alone is ~5.5 ms of the ~14.1 ms K2 pass,
+  while a whole `d12` launch is only 5.05 us of device time - the dispatch is
+  as expensive as the work. Cutting the launch count is therefore the single
+  biggest K2 lever left; do not spend it on fusing stages whose engines differ
+  (the `mix_*` kernels lose 2-5x that way).
+- Cost also tracks the *block* count: the same empty kernel takes 22.9 us per
+  launch with 2048 blocks (~11 ns per block). Kernels that spawn one block per
+  chunk (K1 `gram`/`solve`/`preprocess` and `kg_transpose`, 16384 blocks) can
+  therefore amortise their per-block setup by handling several chunks per
+  block - those stages have no cross-chunk dependency, unlike K2.
+- Swapping the two 128-wide `Nd2Nz` loads in `k2_d12` for plain copies saves
+  only 0.12 ms of its 3.02 ms (measured over the full 512-launch stage), so the
+  earlier "Nd2Nz is 64% of d12" note does not reproduce; do not chase it.
 - Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
   result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
   wrong tile (3e-1 error).
