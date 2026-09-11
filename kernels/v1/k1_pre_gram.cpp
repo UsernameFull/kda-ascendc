@@ -48,6 +48,40 @@
 // hidden) put the optimum at >= 256 blocks; at chunk counts under 256 the
 // loop wrapper itself costs ~6%, so `api.py` leaves those at unroll 1.
 //
+// A last pass deleted four more instructions per chunk, again bit-identical
+// (0.000e+00 on all 13 outputs, 2.289 -> 2.262 ms at [1,8192,32] with the same
+// back-to-back harness):
+//   * "Muls(gf, gf, aexp)" followed by "Muls(gf, gf, -1)" is one "Muls" with
+//     the negated scalar (a sign flip is exact, so this is not a rounding
+//     change);
+//   * "Muls(t2, t2, -1.0f)" after "gf - gf[15]" is the same as computing
+//     "gf[15] - gf" directly - swap the two "Sub" operands *and* their repeat
+//     strides (src0 is the fixed row, so its stride is the 0 one);
+//   * the A-side triangular mask multiply is a no-op: the Gram loop writes
+//     exactly the lower triangle and "Duplicate" already put zeros above it,
+//     so "Muls(ga32, redA, scale)" is the whole post-processing - and the
+//     "MaskS" tile no longer has to be fetched.  "MaskL" has to stay, because
+//     the K-side loop does write L's diagonal and the mask is what zeroes it.
+//
+// Cost model from probes on this kernel (+8 instructions per chunk, launch
+// time at [1,8192,32]): +0.040 ms for 8 one-repeat "Adds" => ~27 cycles per
+// vector instruction, +0.056 ms for 8 "Mul"s with 16 repeats => ~0.6 cycles
+// per extra repeat, +0.051 ms for 8 one-repeat "Exp" => the special-function
+// unit is dearer per repeat but does not dominate.  msprof agrees: the vector
+// pipe is busy 70% of this kernel and the instruction count, not the lane
+// count, is what it waits on.
+//
+// Negative results, worth not retrying: dropping the 15 barriers of the gate
+// cumsum and/or the 64 of the Gram loop changes nothing (the vector pipe is
+// in-order, so they are free); giving the Gram loop a second product tile so
+// the A and K halves stop serialising on one buffer changes nothing (the pipe
+// is issue-limited, not latency-limited); 256B UB padding on "gb" or "redA"
+// costs 4.5% and on "ga"/"gtb" nothing, so the natural layout is already the
+// good one; unroll 4/16/32 are all worse than 8; and moving the Gram to the
+// Cube would need 24 KB per chunk of extra GM traffic in each direction to
+// save ~4.7k of the ~13.7k core cycles per chunk, a wash at this kernel's
+// ~370 GB/s.
+//
 // NOTE: the body below is sensitive to how it is written - an equivalent
 // rewrite that only reformats the buffer declarations or moves the
 // "PipeBarrier<PIPE_V>" after the gate re-centring loop trips an aivec error
@@ -197,7 +231,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     SetFlag<HardEvent::MTE2_V>(e2vv);
     DataCopy(alog, Alog[head], 8);
     DataCopy(beta, Beta[cm], DataCopyParams(1, 2, 0, 0));
-    DataCopy(gmaskS, MaskS[0], DataCopyParams(M, 2, 0, 0));
     DataCopy(gmaskL, MaskL[0], DataCopyParams(M, 2, 0, 0));
     SetFlag<HardEvent::MTE2_V>(e2vs);
     WaitFlag<HardEvent::MTE2_V>(e2vq);
@@ -264,9 +297,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     Exp(alog, alog, 8);
     SetFlag<HardEvent::V_S>(evs);
     WaitFlag<HardEvent::V_S>(evs);
-    const float aexp = alog.GetValue(0);
+    const float aexp = -alog.GetValue(0);
     Muls(gf, gf, aexp, N);
-    Muls(gf, gf, -1.0f, N);
     Exp(gf, gf, N);
     Adds(gf, gf, 1.0f, N);
     Duplicate(t2, 1.0f, N);
@@ -340,9 +372,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     PipeBarrier<PIPE_V>();
 
     // ---- kg = kn * exp2(gate_last - gate) --------------------------------
-    Sub(t2, gf, gf[15 * D], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-    Sub(t2[64], gf[64], gf[15 * D + 64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-    Muls(t2, t2, -1.0f, N);
+    Sub(t2, gf[15 * D], gf, 64, M, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
+    Sub(t2[64], gf[15 * D + 64], gf[64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
     PipeBarrier<PIPE_V>();
     Muls(t2, t2, LN2, N);
     Exp(t2, t2, N);
@@ -389,9 +420,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
         RowDot(redK[i * M], gtb, rows);
         PipeBarrier<PIPE_V>();
     }
-    Muls(redA, redA, scale, M * M);
-    PipeBarrier<PIPE_V>();
-    Mul(ga32, redA, gmaskS, M * M);
+    Muls(ga32, redA, scale, M * M);
     Mul(gl32, redK, gmaskL, M * M);
     PipeBarrier<PIPE_V>();
     Cast(ga16, ga32, RoundMode::CAST_RINT, M * M);
