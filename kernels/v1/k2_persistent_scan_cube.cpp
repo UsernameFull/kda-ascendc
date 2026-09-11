@@ -267,14 +267,17 @@ static __aicore__ inline void run_state_aiv(
     TPipe pipe;
     TEventID ev2v = pipe.AllocEventID<HardEvent::MTE2_V>();
     TEventID evv3 = pipe.AllocEventID<HardEvent::V_MTE3>();
-    TBuf<TPosition::VECCALC> us0,us1,udec,ud1,ud2,ud3,ud4,uv,uu,uub,uvb,uvt,uo,uof,uhf;
+    TEventID evv2 = pipe.AllocEventID<HardEvent::V_MTE2>();
+    TBuf<TPosition::VECCALC> us0,us1,udec,ud1,ud2,ud3,ud4,uv,uu,uub,uvb,uvt,uo,uof,uhf,usc;
     pipe.InitBuffer(us0,BV*D*4); pipe.InitBuffer(us1,BV*D*4); pipe.InitBuffer(udec,D*4); pipe.InitBuffer(ud1,TILE*4); pipe.InitBuffer(ud2,TILE*4);
     pipe.InitBuffer(ud3,TILE*4); pipe.InitBuffer(ud4,BV*D*4); pipe.InitBuffer(uv,TILE*4); pipe.InitBuffer(uu,M*D*4); pipe.InitBuffer(uub,M*D*2);
     pipe.InitBuffer(uvb,TILE*2); pipe.InitBuffer(uvt,BV*M*2); pipe.InitBuffer(uo,TILE*2); pipe.InitBuffer(uof,TILE*4); pipe.InitBuffer(uhf,BV*D*2);
+    pipe.InitBuffer(usc,BV*M*2);
     LocalTensor<float> h0=us0.Get<float>(), h1=us1.Get<float>(), dec=udec.Get<float>(), d1=ud1.Get<float>(), d2=ud2.Get<float>(), d3=ud3.Get<float>(), d4=ud4.Get<float>();
     LocalTensor<float> vf=uv.Get<float>(), uf32=uu.Get<float>(), outf=uof.Get<float>();
     LocalTensor<bfloat16_t> ub=uub.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> vb=uvb.Get<bfloat16_t>(), vt=uvt.Get<bfloat16_t>(), outb=uo.Get<bfloat16_t>(), hbf=uhf.Get<bfloat16_t>();
+    LocalTensor<bfloat16_t> sc=usc.Get<bfloat16_t>();
     GlobalTensor<bfloat16_t> U,S16,Vnew,VnewT,Out; GlobalTensor<float> D1,D2,D3,D4,Decay,H0,Ht;
     U.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pU)); S16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pS16));
     Vnew.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnew)); VnewT.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnewT)); Out.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pOut));
@@ -301,7 +304,18 @@ static __aicore__ inline void run_state_aiv(
             Cast(vf,uf32[iv*BV],RoundMode::CAST_NONE,TILE);
             Sub(vf,vf,d1,TILE);
             Cast(vb,vf,RoundMode::CAST_RINT,TILE);
-            for(int i=0;i<M;i++) for(int v=0;v<BV;v++) vt.SetValue(v*M+i,vb.GetValue(i*BV+v));
+            // vnew^T via 16x16 block transposes: gather the four 16-column
+            // blocks of v_new into contiguous 16x16 tiles, then transpose
+            // them on the vector unit (same recipe as k2_vnew.cpp).
+            SetFlag<HardEvent::V_MTE2>(evv2); WaitFlag<HardEvent::V_MTE2>(evv2);
+            for(int32_t bl=0; bl<BV/M; ++bl) {
+                for(int32_t r=0; r<M; ++r) {
+                    DataCopy(sc[bl*M*M + r*M], vb[r*BV + bl*M], DataCopyParams(1,1,0,0));
+                }
+            }
+            SetFlag<HardEvent::MTE2_V>(ev2v); WaitFlag<HardEvent::MTE2_V>(ev2v);
+            for(int32_t bl=0; bl<BV/M; ++bl) { AscendC::Transpose(vt[bl*M*M], sc[bl*M*M]); }
+            PipeBarrier<PIPE_V>();
             SetFlag<HardEvent::V_MTE3>(evv3); WaitFlag<HardEvent::V_MTE3>(evv3);
             DataCopy(Vnew[base],vb,DataCopyParams(M,4,0,0));
             DataCopy(VnewT[(static_cast<uint64_t>(task)*NT+chunk)*BV*M],vt,DataCopyParams(BV,1,0,0));
@@ -320,7 +334,12 @@ static __aicore__ inline void run_state_aiv(
             SetFlag<HardEvent::MTE2_V>(ev2v); WaitFlag<HardEvent::MTE2_V>(ev2v);
             Muls(outf,d2,scale,TILE); Add(outf,outf,d3,TILE); Cast(outb,outf,RoundMode::CAST_RINT,TILE);
             SetFlag<HardEvent::V_MTE3>(evv3); WaitFlag<HardEvent::V_MTE3>(evv3); DataCopy(Out[base],outb,DataCopyParams(M,4,0,0));
-            for(int v=0;v<BV;v++) for(int k=0;k<D;k++) state.SetValue(v*D+k,state.GetValue(v*D+k)*dec.GetValue(k)+d4.GetValue(v*D+k));
+            // state[v][k] = state[v][k]*dec[k] + d4[v][k] with two strided
+            // Mul repeats instead of a per-element scalar loop.
+            Mul(state,state,dec,64,BV,BinaryRepeatParams(1,1,1,16,16,0));
+            Mul(state[64],state[64],dec[64],64,BV,BinaryRepeatParams(1,1,1,16,16,0));
+            Add(state,state,d4,BV*D);
+            PipeBarrier<PIPE_V>();
             Cast(hbf,state,RoundMode::CAST_RINT,BV*D); SetFlag<HardEvent::V_MTE3>(evv3); WaitFlag<HardEvent::V_MTE3>(evv3);
             DataCopy(S16[static_cast<uint64_t>(task)*BV*D],hbf,DataCopyParams(BV,16,0,0));
         }
