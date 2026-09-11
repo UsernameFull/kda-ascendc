@@ -42,6 +42,13 @@ This result is evidence that Cube MMAD is worthwhile, but it is not an end-to-en
 
 On 2026-09-09, `k2_mode="persistent_scan_cube"` was connected to the verified `cube_full_d4` execution path. This path keeps state and intermediates on NPU, uses Cube MMAD for d12/d3/d4, and performs state updates on device for each chunk. The experimental single-kernel AIC/AIV loop remains RTC-compilable, but is not used by the public mode because its cross-core loop barriers stall on the current CANN runtime.
 
+Update 2026-09-11: the stall is confirmed and the loop was removed. Wiring the
+single-kernel loop into `kda_bt16_fwd_ascendc` and launching it directly never
+returns on this CANN runtime (killed after 150 s at `[1,8192,32]` and after
+100 s at `[1,64,2]`); the public `persistent_scan_cube` mode is served by
+`kda_k2_mix_all_cube` and measures 79.2 ms at `[1,8192,32]` against 22.7 ms for
+`separated`, i.e. today's fastest Cube path is the separated one.
+
 Synchronized wall-clock medians on Ascend910_9382:
 
 | Shape | Vector persistent scan | Cube target path | Speedup | Output error | State error |

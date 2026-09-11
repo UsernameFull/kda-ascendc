@@ -122,16 +122,18 @@ per-launch and per-stage latency, not by FLOPs:
   1.3 ms. The prep is the part worth attacking (it computes `2^gc` and
   `2^-gc` from scratch even though `preprocess` already materialises the gated
   `Qg`/`Kg`).
-- `persistent_scan_cube` is the only path that removes the 2048 launches: one
-  MIX kernel (`KERNEL_TYPE_MIX_AIC_1_2`) runs the whole chunk chain with
-  cross-core flags. It was 3504 ms because the AIV half updated the state and
-  transposed `vnew` with per-element `GetValue`/`SetValue` loops; replacing
-  those with two strided `Mul`s plus `Add` and with the gather+`Transpose`
-  recipe took it to 79 ms. It is still 3.5x behind `separated` (22.6 ms)
-  because each `run_*_aic` helper builds its own `TPipe`/`InitBuffer` *per
-  chunk*, and `run_state_aiv` returns on `GetSubBlockIdx() != 0` so half the
-  vector cores idle. Hoisting the pipe setup out of the helpers is the next
-  step; the numerics are already identical to `separated`.
+- `persistent_scan_cube` is *not* a persistent kernel: `api.py` remaps the name
+  onto the fused per-chunk `kda_k2_mix_all_cube`, which still launches once per
+  chunk (512 launches instead of 2048). Measured 2026-09-11 at `[1,8192,32]`:
+  `mix_all_cube` 79.2 ms against `separated` 22.7 ms, so the fusion is 3.5x
+  *slower* and the 2048 -> 512 launch saving does not pay for the lost
+  per-stage parallelism. A single-kernel MIX loop (`k2_persistent_scan_cube.cpp`)
+  was deleted in the same pass: it deadlocks on this CANN runtime (launching it
+  directly never returns - killed after 150 s at `[1,8192,32]` and after 100 s
+  at `[1,64,2]`, where the public mode needs 79 ms and tens of microseconds
+  respectively), so the earlier "3504 ms -> 79 ms for the mode" note was
+  comparing the dead kernel with the live `mix_all_cube` path, not measuring
+  the same thing. Do not restart this line.
 - Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
   result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
   wrong tile (3e-1 error).

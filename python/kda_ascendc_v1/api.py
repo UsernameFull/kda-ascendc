@@ -26,7 +26,6 @@ NV = 2
 _COMPILED = False
 _PERSISTENT_COMPILED = False
 _PERSISTENT_SCAN_COMPILED = False
-_PERSISTENT_SCAN_CUBE_COMPILED = False
 _TRITON_AIV_COMPILED = False
 _LAST_PROFILE: dict[str, object] = {}
 # Triangular 0/1 masks for the intra-chunk Gram kernel, built once per device.
@@ -98,14 +97,6 @@ def _compile_persistent_scan() -> None:
     rtc_compile((ROOT / "kernels/v1/k2_persistent_scan.cpp").read_text(),
                 "kda_k2_persistent_scan_kernel", "")
     _PERSISTENT_SCAN_COMPILED = True
-
-def _compile_persistent_scan_cube() -> None:
-    global _PERSISTENT_SCAN_CUBE_COMPILED
-    if _PERSISTENT_SCAN_CUBE_COMPILED:
-        return
-    rtc_compile((ROOT / "kernels/v1/k2_persistent_scan_cube.cpp").read_text(),
-                "kda_k2_persistent_scan_cube_kernel", "")
-    _PERSISTENT_SCAN_CUBE_COMPILED = True
 
 def _compile_triton_aiv() -> None:
     global _TRITON_AIV_COMPILED
@@ -247,6 +238,8 @@ def kda_bt16_fwd_ascendc(
     _launch("kda_solve_wu_cube_kernel", c, _pack_ptrs([a16, rk, rv, W, U]) + [_i(c)], stream)
     finish("solve_ms", "solve_start")
 
+    # Historical name: ``persistent_scan_cube`` has always been served by the
+    # fused per-chunk Cube kernel, never by a single-kernel persistent loop.
     if k2_mode == "persistent_scan_cube":
         k2_mode = "mix_all_cube"
 
