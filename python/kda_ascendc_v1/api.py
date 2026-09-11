@@ -1,4 +1,4 @@
-﻿"""S07 separated AscendC device closure for KDA v1."""
+"""S07 separated AscendC device closure for KDA v1."""
 from __future__ import annotations
 
 import struct
@@ -253,7 +253,7 @@ def kda_bt16_fwd_ascendc(
         mark("k2_start")
         _launch("kda_k2_triton_aiv", tasks, pargs, stream)
         finish("k2_ms", "k2_start")
-        out_public = out_task.view(bh, NV, nt, CHUNK, BV).permute(0, 2, 3, 1, 4).contiguous().view(b, t, h, D)
+        out_public = out_task.view(b, h, NV, nt, CHUNK, BV).permute(0, 3, 4, 1, 2, 5).contiguous().view(b, t, h, D)
         final_state = None if htf is None else htf.view(bh, NV, BV, D).reshape(b, h, D, D)
         if profile:
             prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
@@ -273,7 +273,7 @@ def kda_bt16_fwd_ascendc(
         mark("k2_start")
         _launch("kda_k2_persistent_scan_kernel" if k2_mode == "persistent_scan" else "kda_k2_persistent_kernel", tasks, pargs, stream)
         finish("k2_ms", "k2_start")
-        out_public = out_task.view(bh, NV, nt, CHUNK, BV).permute(0, 2, 3, 1, 4).contiguous().view(b, t, h, D)
+        out_public = out_task.view(b, h, NV, nt, CHUNK, BV).permute(0, 3, 4, 1, 2, 5).contiguous().view(b, t, h, D)
         final_state = None if htf is None else htf.view(bh, NV, BV, D).reshape(b, h, D, D)
         if profile:
             prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
@@ -358,7 +358,7 @@ def kda_bt16_fwd_ascendc(
             _launch("kda_k2_outstate_kernel", tasks, _pack_ptrs([d2, d3, d4, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
 
     finish("k2_ms", "k2_start")
-    out_public = out_task.view(bh, NV, nt, CHUNK, BV).permute(0, 2, 3, 1, 4).contiguous().view(b, t, h, D)
+    out_public = out_task.view(b, h, NV, nt, CHUNK, BV).permute(0, 3, 4, 1, 2, 5).contiguous().view(b, t, h, D)
     final_state = None
     if profile:
         prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))

@@ -77,11 +77,11 @@ Triton pays 18.793 / 512 = **36.7 us**; we pay 13.95 / 512 = **27.2 us**.
 5. *No output permute.* Triton stores `o` in its public layout directly, while
    we pay aclnn layout kernels per call: `pack_tokens` x4 = 0.259 ms, the
    output `permute().contiguous()` = 0.113 ms, the beta permute 0.015 ms,
-   0.39 ms total (1.7% of the pass).  This is the one place where the
-   reference is structurally cheaper: `kda_k2_outstate_kernel` could store its
-   16x64 rows straight into `[B, T, H, D]` (`DataCopyParams(16, 4, 0, 508)`),
-   and the four `pack_tokens` copies disappear if the K1 kernels address the
-   public layout with a row stride of `H * D`.
+   0.39 ms total (1.7% of the pass).  Both halves of that were tried and
+   reverted: the strided store from `kda_k2_outstate_kernel` costs 3.8 ms over
+   the 512 launches (16 rows of 128 B at an 8 KB stride) and the strided read
+   in `preprocess` is inside the noise once the stage pays ~0.15 ms for the
+   addressing.  The permute stays - see `ASCENDC_V1_KERNELS.md`.
 
 ## Related measurement
 

@@ -122,6 +122,25 @@ per-launch and per-stage latency, not by FLOPs:
   1.3 ms. The prep is the part worth attacking (it computes `2^gc` and
   `2^-gc` from scratch even though `preprocess` already materialises the gated
   `Qg`/`Kg`).
+- Every returned output used to be scrambled in ``t`` and ``h``:
+  ``out_task.view(bh, NV, nt, CHUNK, BV).permute(0, 2, 3, 1, 4)`` keeps
+  ``bh = b * H + h`` as one merged dimension through the permute, so the tensor
+  that is finally shaped ``[b, t, h, d]`` actually holds ``[b, h, t, d]``.  Ten
+  of the twelve modes return through that line, so they were all wrong the same
+  way: the bit-exact mode-vs-mode checks cannot see it and the reference
+  comparison accepted it because a swap error has the same magnitude as the
+  signal (4.7e-3 against a 4.6e-3 reference absmax).  Splitting ``b`` and ``h``
+  before the permute moves every mode to 3.05e-5 against the Triton reference
+  while the cross-mode agreement stays bit-exact; `tests/test_output_layout.py`
+  now fails on either mistake.
+- Two layout optimizations that the Triton comparison suggested were measured
+  and reverted.  Storing ``o`` straight into ``[B, T, H, D]`` from the outstate
+  kernel turns each 16x64 tile into 16 rows of 128 B at an 8 KB stride and cost
+  3.8 ms over the 512 launches (k2 stage 14.0 -> 17.8 ms) against the 0.11 ms
+  the host permute costs.  Reading the public layout in ``preprocess`` removes
+  the four ``pack_tokens`` copies (0.26 ms) but adds ~0.15 ms of strided load
+  to the stage and the remainder is inside the +/-0.5 ms run-to-run noise of
+  this device, so it was reverted too.
 - The Triton reference compiles to a 16384-block MIX K1 (11.09 ms) and a
   64-block, single-launch K2 that keeps the fp32 state resident for all 512
   chunks (18.79 ms); both are slower than the `separated` path here (7.53 ms /
