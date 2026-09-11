@@ -209,6 +209,12 @@ per-launch and per-stage latency, not by FLOPs:
     (`[1,8192,32]` 13.8 -> 17.2 ms).  `KDA_PERSIST_LOOP_BLOCKS` overrides it
     for experiments; the kernel requires `nblk * 2 >= bh` or the head map is
     not total.
+  - The AIV's `v_new^T` build (64 one-block `DataCopy` gathers + four 16x16
+    `Transpose`s per head and chunk) looks like the obvious next target and is
+    *not* worth attacking: stubbing the gather, the transpose and the store out
+    of the loop moves the pass from 13.67 to 13.66 ms. The 64 tiny MTE ops are
+    fully hidden behind the AIC's `d34`, so any replacement would be a rewrite
+    for nothing. Measured, reverted, recorded here.
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column
