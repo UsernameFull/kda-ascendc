@@ -99,16 +99,17 @@ device, same inputs, output checked against the Triton path):
 
 | shape | `separated` | `persistent_loop` | Triton | `persistent_loop` vs Triton | out err vs Triton | state err |
 |---|---:|---:|---:|---:|---:|---:|
-| `[1,32,2,128]` | 0.403 ms | 0.339 ms | 0.257 ms | 0.76x (Triton wins) | 2.3e-05 | 2.4e-04 |
-| `[2,1024,4,128]` | 2.059 ms | 0.914 ms | 1.230 ms | 1.35x | 4.6e-05 | 4.2e-04 |
-| `[1,1024,32,128]` | 2.344 ms | 1.259 ms | 3.991 ms | 3.17x | 6.1e-05 | 4.9e-04 |
-| `[3,2048,8,128]` | 3.659 ms | 1.961 ms | 6.239 ms | 3.18x | 6.1e-05 | 4.1e-04 |
-| `[2,4096,8,128]` | 6.726 ms | 3.193 ms | 8.653 ms | 2.71x | 6.1e-05 | 2.4e-04 |
-| `[1,8192,32,128]` | 17.340 ms | 8.506 ms | 30.300 ms | 3.56x | 6.1e-05 | 5.5e-04 |
+| `[1,32,2,128]` | 0.409 ms | 0.360 ms | 0.246 ms | 0.68x (Triton wins) | 2.3e-05 | 2.4e-04 |
+| `[2,1024,4,128]` | 2.113 ms | 0.844 ms | 1.219 ms | 1.44x | 4.6e-05 | 4.2e-04 |
+| `[1,1024,32,128]` | 2.283 ms | 1.175 ms | 4.002 ms | 3.41x | 6.1e-05 | 4.0e-04 |
+| `[3,2048,8,128]` | 3.862 ms | 1.915 ms | 6.207 ms | 3.24x | 9.2e-05 | 4.0e-04 |
+| `[2,4096,8,128]` | 7.015 ms | 3.115 ms | 8.644 ms | 2.78x | 6.1e-05 | 3.2e-04 |
+| `[1,8192,32,128]` | 17.333 ms | 8.413 ms | 30.276 ms | 3.60x | 6.1e-05 | 5.5e-04 |
 
-(Re-measured after the four instruction cuts in the fused kernel and the
-wide solve of `k1_solve_wu_wide.cpp` (`docs/ASCENDC_V1_KERNELS.md`; the solve
-stage alone went 1.47 -> 0.65 ms at `[1,8192,32]`), on top of the three
+(Re-measured after the four instruction cuts in the fused kernel, the wide
+solve of `k1_solve_wu_wide.cpp` and the persistent loop's merged `v_new` row
+loop; the solve stage alone went 1.47 -> 0.65 ms at `[1,8192,32]`), on top of
+the three
 `pre_gram` changes
 (fusing preprocess with the Gram build, replacing the per-row scalar loops
 with `Brcb`, then hiding the load/store latencies behind the compute and
@@ -118,8 +119,8 @@ digit at every shape, so only the *times* in this table moved.  The first two
 rows are included because they are the cases that still favour the reference
 or nearly break even.)
 
-Only the smallest shape still favours the reference (0.249 vs 0.350 ms, 29%),
+Only the smallest shape still favours the reference (0.246 vs 0.360 ms, 46%),
 where the pass is dominated by fixed costs and the device-side chunk loop is
 pure overhead.  Everything else is now AscendC's: at `[1,8192,32]` the
 reference spends 11.09 ms in one 16384-block MIX K1 launch plus 18.79 ms in its
-resident-state K2 launch, against 3.8 ms and 4.7 ms for our K1 and K2.
+resident-state K2 launch, against 2.9 ms and 4.6 ms for our K1 and K2.
