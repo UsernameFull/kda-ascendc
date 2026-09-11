@@ -114,9 +114,14 @@ per-launch and per-stage latency, not by FLOPs:
   loads entirely only reaches 2.23 ms and removing its stores 2.30 ms, so the
   stage is ~95% vector compute: the per-chunk cost is the 16-iteration row loop
   (5 vector ops and 4-5 `PipeBarrier`s per row, plus one `WholeReduceSum`),
-  which is latency-bound rather than load-bound. Fix that by moving the 16x128
-  x16 Gram matmuls onto the Cube (the K1 w/u kernel does the same 65k MACs per
-  chunk at 41 ns, against 134 ns per chunk here), not by batching chunks.
+  which is latency-bound rather than load-bound. Do not expect much from
+  moving the Gram matmuls to the Cube either: the whole 16-row loop is 1.30 ms
+  of the 2.35 ms (the `K` half alone is 0.93 ms, the `A` half 0.38 ms) while
+  the exponent/mask prep is already 1.04 ms, so a Cube split would spend
+  roughly 0.9 ms of prep plus ~0.7 ms of Cube work plus a mask pass to save
+  1.3 ms. The prep is the part worth attacking (it computes `2^gc` and
+  `2^-gc` from scratch even though `preprocess` already materialises the gated
+  `Qg`/`Kg`).
 - Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
   result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
   wrong tile (3e-1 error).
