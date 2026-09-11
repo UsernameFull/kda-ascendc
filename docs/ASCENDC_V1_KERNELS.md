@@ -107,6 +107,16 @@ per-launch and per-stage latency, not by FLOPs:
 - Swapping the two 128-wide `Nd2Nz` loads in `k2_d12` for plain copies saves
   only 0.12 ms of its 3.02 ms (measured over the full 512-launch stage), so the
   earlier "Nd2Nz is 64% of d12" note does not reproduce; do not chase it.
+- Batching several chunks per block in the K1 stages was measured and is *not*
+  worth much: `k1_gram.cpp` rewritten to take `nchunk` (bit-exact against the
+  one-chunk kernel) runs 2.36 ms at 16384 blocks, 2.27 ms at 8192, 2.21 ms at
+  2048 and 2.24 ms at 512 blocks - a 7% ceiling. Removing the kernel's input
+  loads entirely only reaches 2.23 ms and removing its stores 2.30 ms, so the
+  stage is ~95% vector compute: the per-chunk cost is the 16-iteration row loop
+  (5 vector ops and 4-5 `PipeBarrier`s per row, plus one `WholeReduceSum`),
+  which is latency-bound rather than load-bound. Fix that by moving the 16x128
+  x16 Gram matmuls onto the Cube (the K1 w/u kernel does the same 65k MACs per
+  chunk at 41 ns, against 134 ns per chunk here), not by batching chunks.
 - Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
   result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
   wrong tile (3e-1 error).
