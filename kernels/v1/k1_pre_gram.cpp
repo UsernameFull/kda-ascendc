@@ -26,6 +26,19 @@
 // max(abs(diff)) = 0.000e+00 on all 13 outputs): 3.114 -> 2.679 ms at
 // [1,8192,32] and 1.590 -> 1.373 ms at [1,4096,32].
 //
+// The kernel is issue-bound, not FLOP-bound (msprof ArithmeticUtilization: the
+// fp32 vector ALU is busy 20% of the block, while a micro-benchmark puts a
+// fixed ~25-35 cycles on every vector instruction, plus ~1-7 cycles per repeat
+// depending on the form).  Three changes follow from that, all bit-identical
+// and worth 2.69 -> 2.59 ms at [1,8192,32]:
+//   * every input load is issued up front behind its own MTE2->V flag and the
+//     wait is deferred to the consumer, so the q/k norms run while G/V/the
+//     masks are still in flight (the block used to wait for all five copies);
+//   * Qg/Kg/Rk/Rv/BetaOut are stored as soon as they exist, so their MTE3
+//     traffic drains behind the Gram loop instead of at the end of the block;
+//   * the two "V_S" sync pairs around the l2 norms are dead (nothing reads
+//     those reductions with the scalar unit any more) and cost ~2%.
+//
 // NOTE: the body below is sensitive to how it is written - an equivalent
 // rewrite that only reformats the buffer declarations or moves the
 // "PipeBarrier<PIPE_V>" after the gate re-centring loop trips an aivec error
@@ -78,6 +91,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
 
     TPipe pipe;
     TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
+    TEventID e2vq = pipe.AllocEventID<HardEvent::MTE2_V>();
+    TEventID e2vk = pipe.AllocEventID<HardEvent::MTE2_V>();
+    TEventID e2vg = pipe.AllocEventID<HardEvent::MTE2_V>();
+    TEventID e2vv = pipe.AllocEventID<HardEvent::MTE2_V>();
+    TEventID e2vs = pipe.AllocEventID<HardEvent::MTE2_V>();
     TEventID ev3 = pipe.AllocEventID<HardEvent::V_MTE3>();
     TEventID evs = pipe.AllocEventID<HardEvent::V_S>();
     TBuf<TPosition::VECCALC> bQf, bKf, bT0, bT2, bEf, bRed,
@@ -153,13 +171,20 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     const uint64_t x0 = static_cast<uint64_t>(c) * N;
     const uint64_t cm = static_cast<uint64_t>(c) * M;
 
+    DataCopy(qnb, Q[x0], DataCopyParams(M, 8, 0, 0));
+    SetFlag<HardEvent::MTE2_V>(e2vq);
+    DataCopy(knb, K[x0], DataCopyParams(M, 8, 0, 0));
+    SetFlag<HardEvent::MTE2_V>(e2vk);
+    DataCopy(gf, G[x0], DataCopyParams(M, 16, 0, 0));
+    SetFlag<HardEvent::MTE2_V>(e2vg);
+    DataCopy(rvb, V[x0], DataCopyParams(M, 8, 0, 0));
+    SetFlag<HardEvent::MTE2_V>(e2vv);
     DataCopy(alog, Alog[head], 8);
     DataCopy(beta, Beta[cm], DataCopyParams(1, 2, 0, 0));
-    DataCopy(qnb, Q[x0], DataCopyParams(M, 8, 0, 0));
-    DataCopy(gf, G[x0], DataCopyParams(M, 16, 0, 0));
-    DataCopy(rvb, V[x0], DataCopyParams(M, 8, 0, 0));
-    SetFlag<HardEvent::MTE2_V>(e2v);
-    WaitFlag<HardEvent::MTE2_V>(e2v);
+    DataCopy(gmaskS, MaskS[0], DataCopyParams(M, 2, 0, 0));
+    DataCopy(gmaskL, MaskL[0], DataCopyParams(M, 2, 0, 0));
+    SetFlag<HardEvent::MTE2_V>(e2vs);
+    WaitFlag<HardEvent::MTE2_V>(e2vq);
     Cast(qf, qnb, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
 
@@ -167,8 +192,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     Mul(t2, qf, qf, N);
     PipeBarrier<PIPE_V>();
     RowReduce(red, ef, t2);
-    SetFlag<HardEvent::V_S>(evs);
-    WaitFlag<HardEvent::V_S>(evs);
     Adds(red, red, EPS, M);
     Rsqrt(red, red, M);
     PipeBarrier<PIPE_V>();
@@ -183,16 +206,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     PipeBarrier<PIPE_V>();
 
     // ---- k l2 norm -------------------------------------------------------
-    DataCopy(knb, K[x0], DataCopyParams(M, 8, 0, 0));
-    SetFlag<HardEvent::MTE2_V>(e2v);
-    WaitFlag<HardEvent::MTE2_V>(e2v);
+    WaitFlag<HardEvent::MTE2_V>(e2vk);
     Cast(kf, knb, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
     Mul(t2, kf, kf, N);
     PipeBarrier<PIPE_V>();
     RowReduce(red, ef, t2);
-    SetFlag<HardEvent::V_S>(evs);
-    WaitFlag<HardEvent::V_S>(evs);
     Adds(red, red, EPS, M);
     Rsqrt(red, red, M);
     PipeBarrier<PIPE_V>();
@@ -207,6 +226,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     PipeBarrier<PIPE_V>();
 
     // ---- beta sigmoid ----------------------------------------------------
+    WaitFlag<HardEvent::MTE2_V>(e2vs);
+    WaitFlag<HardEvent::MTE2_V>(e2vg);
     Muls(beta, beta, -1.0f, M);
     Exp(beta, beta, M);
     Adds(beta, beta, 1.0f, M);
@@ -293,6 +314,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     PipeBarrier<PIPE_V>();
 
     // ---- rv = v * beta ---------------------------------------------------
+    WaitFlag<HardEvent::MTE2_V>(e2vv);
     Cast(t2, rvb, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
     Mul(t2, t2, bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
@@ -315,6 +337,15 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     PipeBarrier<PIPE_V>();
 
 
+    // early stores: let MTE3 drain behind the Gram work
+    SetFlag<HardEvent::V_MTE3>(ev3);
+    WaitFlag<HardEvent::V_MTE3>(ev3);
+    DataCopy(Qg[x0], qgb, DataCopyParams(M, 8, 0, 0));
+    DataCopy(Kg[x0], kgb, DataCopyParams(M, 8, 0, 0));
+    DataCopy(Rk[x0], rkb, DataCopyParams(M, 8, 0, 0));
+    DataCopy(Rv[x0], rvb, DataCopyParams(M, 8, 0, 0));
+    DataCopy(BetaOut[cm], beta, DataCopyParams(1, 2, 0, 0));
+
     // ---- Gram half (prep only) ----
     Muls(gef, zz, LN2, N);
     Exp(gef, gef, N);
@@ -328,10 +359,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     Mul(gk1, gk1, bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     Mul(gk1[64], gk1[64], bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
-    DataCopy(gmaskS, MaskS[0], DataCopyParams(M, 2, 0, 0));
-    DataCopy(gmaskL, MaskL[0], DataCopyParams(M, 2, 0, 0));
-    SetFlag<HardEvent::MTE2_V>(e2v);
-    WaitFlag<HardEvent::MTE2_V>(e2v);
     Duplicate(redA, 0.0f, M * M);
     Duplicate(redK, 0.0f, M * M);
     PipeBarrier<PIPE_V>();
@@ -358,11 +385,6 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     WaitFlag<HardEvent::V_MTE3>(ev3);
     if (pQn != nullptr) DataCopy(Qn[x0], qnb, DataCopyParams(M, 8, 0, 0));
     if (pKn != nullptr) DataCopy(Kn[x0], knb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Qg[x0], qgb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Kg[x0], kgb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Rk[x0], rkb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Rv[x0], rvb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(BetaOut[cm], beta, DataCopyParams(1, 2, 0, 0));
     DataCopy(Aqk32[m0], ga32, DataCopyParams(M, 2, 0, 0));
     DataCopy(L[m0], gl32, DataCopyParams(M, 2, 0, 0));
     DataCopy(Aqk16[m0], ga16, DataCopyParams(M, 1, 0, 0));

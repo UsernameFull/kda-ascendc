@@ -231,6 +231,33 @@ per-launch and per-stage latency, not by FLOPs:
       0.716 -> 0.686, `aiv_scalar_ratio` 0.309 -> 0.223, `aiv_mte2_ratio`
       0.104 -> 0.119, total AIV cycles 265.6M -> 233.5M, so the win is real
       issue-bound work and the stage is still VEC bound (69%).
+    - The fused body is issue-bound, not FLOP-bound, and three latency
+      changes follow from that (`msprof --aic-metrics=ArithmeticUtilization`
+      on the fused kernel: `aiv_vec_fp32_ratio` 0.20 while `aiv_vec_ratio` is
+      0.686, i.e. the vector pipe is *engaged* 69% of the block but doing fp32
+      math only 20% of it; a micro-benchmark of bare instructions puts a fixed
+      ~25-35 cycles on every vector instruction plus ~1.1 cycles per repeat
+      for elementwise ops and ~7 for each repeat of a `WholeReduceSum`):
+      2.679 -> 2.593 ms at `[1,8192,32]`, still bit-identical on all 13
+      outputs.
+      - Every input load is now issued up front behind its own
+        `MTE2 -> V` event and the matching `WaitFlag` sits at the consumer:
+        `Q` gates the q norm, `K` the k norm, `G`+`Beta`/`Alog`(+the two
+        triangular masks, also hoisted) the gate section, `V` the `rv` chain.
+        The block used to issue five copies and then wait for *all* of them,
+        so the two l2 norms were stalled behind `G` (8 KB) and `V` (4 KB).
+      - `Qg`/`Kg`/`Rk`/`Rv`/`BetaOut` are stored as soon as they exist
+        instead of in the final store block, so ~16 KB/block of MTE3 drains
+        behind the Gram loop.
+      - The two `V_S` sync pairs around the l2 norms were dead (the norms were
+        read back with `GetValue` before the `Brcb` rewrite) and cost ~2%; the
+        pair that *is* live is the one around `Exp(alog)`.
+      Measured and rejected in the same round: dropping all 48
+      `PipeBarrier<PIPE_V>()` (2.72 vs 2.69, i.e. the barriers are ~free),
+      `Muls(1.0)` for every `Exp` (2.66, so the five `Exp` passes are worth
+      only 0.03 ms), and `Muls` for `Rsqrt` (no change).  Removing every
+      input `DataCopy` and every store of the pack chains are the two big
+      levers that remain: 2.69 -> 2.49 and 2.69 -> 2.39 ms respectively.
     - The fused body is *compiler fragile* and must not be reformatted: the
       same arithmetic written slightly differently trips `aivec error` (mte
       error info `0x8030860ef`, "address for the scalar to access the internal
