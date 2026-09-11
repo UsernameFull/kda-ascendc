@@ -21,6 +21,7 @@ from kda_ascendc_v1_launcher import launch_argsarray_engine, rtc_compile
 
 CHUNK = 16
 SOLVE_NCHUNK = 8
+SOLVE_WIDE_NCHUNK = 32
 KGT_NCHUNK = 8
 WU_NCHUNK = 4
 D = 128
@@ -78,6 +79,7 @@ def _compile_all() -> None:
         ("kernels/v1/k1_gram.cpp", "kda_gram_kernel"),
         ("kernels/v1/k1_pre_gram.cpp", "kda_pre_gram_kernel"),
         ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
+        ("kernels/v1/k1_solve_wu_wide.cpp", "kda_solve_wu_wide"),
         ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
         ("kernels/v1/k2_init.cpp", "kda_k2_init_kernel"),
         ("kernels/v1/k2_d12.cpp", "kda_k2_d12_kernel"),
@@ -229,7 +231,15 @@ def kda_bt16_fwd_ascendc(
     qg = torch.empty_like(q_pack); kg = torch.empty_like(q_pack)
     aqk32 = torch.empty((c, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     aqk16 = torch.empty((c, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
-    L = torch.empty_like(aqk32)
+    # The wide solve kernel rounds the chunk count up to SOLVE_WIDE_NCHUNK and
+    # walks whole chunk groups, so L and its two outputs are allocated with the
+    # padded length: that keeps every gather and store of the last group inside
+    # an allocation, and the values it computes for the padded chunks (never
+    # read, and never handed out below) may be whatever uninitialised device
+    # memory holds.  The debug dict hands out narrowed views so the shapes stay
+    # ``[c, 16, 16]``.
+    c_solve = (c + SOLVE_WIDE_NCHUNK - 1) // SOLVE_WIDE_NCHUNK * SOLVE_WIDE_NCHUNK
+    L = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     mask_s, mask_l = _tri_masks(q.device)
     # Stages 1+2 run as one AIV block per chunk ("k1_pre_gram.cpp"): the fused
     # kernel consumes Qn/Kn/Gc out of UB instead of round-tripping 32 KB per
@@ -256,14 +266,16 @@ def kda_bt16_fwd_ascendc(
     _launch("kda_pre_gram_kernel", (c + pre_unroll - 1) // pre_unroll, pre_args, stream)
     finish("pre_gram_ms", "pre_gram_start")
 
-    a32 = torch.empty_like(aqk32)
-    a16 = torch.empty_like(aqk16)
+    a32 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
+    a16 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
     W = torch.empty_like(q_pack)
     U = torch.empty_like(q_pack)
     solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16]) + [_i(c)]
     mark("solve_start")
-    # One AIV block solves SOLVE_NCHUNK chunks at once (see the kernel header).
-    _launch("kda_solve_wu_kernel", (c + SOLVE_NCHUNK - 1) // SOLVE_NCHUNK, solve_args, stream)
+    # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector
+    # instruction (see the kernel header); the padded chunks are solved too but
+    # land outside the first c.
+    _launch("kda_solve_wu_wide", c_solve // SOLVE_WIDE_NCHUNK, solve_args, stream)
     # The Cube needs the bf16 A_inv the substitution just wrote, so the two
     # launches stay ordered on the stream.
     _launch("kda_solve_wu_cube_kernel", (c + WU_NCHUNK - 1) // WU_NCHUNK,
@@ -314,7 +326,7 @@ def kda_bt16_fwd_ascendc(
             return out_public, final_state
         debug = {"Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
                  "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
-                 "Aqk32": aqk32, "Aqk": aqk16, "L": L, "A32": a32, "A16": a16,
+                 "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
                  "W": W, "U": U, "persistent": True}
         return out_public, final_state, debug
 
@@ -360,7 +372,7 @@ def kda_bt16_fwd_ascendc(
             return out_public, final_state
         debug = {"Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
                  "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
-                 "Aqk32": aqk32, "Aqk": aqk16, "L": L, "A32": a32, "A16": a16,
+                 "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
                  "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
                  "d3": d3, "d4": d4f, "state_s32": s32, "persistent_loop": True}
         return out_public, final_state, debug
@@ -450,7 +462,7 @@ def kda_bt16_fwd_ascendc(
     debug = {
         "Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
         "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
-        "Aqk32": aqk32, "Aqk": aqk16, "L": L, "A32": a32, "A16": a16,
+        "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
         "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
         "d3": d3, "d4": d4, "state_s32": s32,
         "d4_full": d4_full,

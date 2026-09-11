@@ -99,14 +99,17 @@ device, same inputs, output checked against the Triton path):
 
 | shape | `separated` | `persistent_loop` | Triton | `persistent_loop` vs Triton | out err vs Triton | state err |
 |---|---:|---:|---:|---:|---:|---:|
-| `[1,32,2,128]` | 0.394 ms | 0.350 ms | 0.249 ms | 0.71x (Triton wins) | 2.3e-05 | 2.4e-04 |
-| `[2,1024,4,128]` | 1.990 ms | 0.885 ms | 1.217 ms | 1.38x | 4.6e-05 | 4.2e-04 |
-| `[1,1024,32,128]` | 2.402 ms | 1.313 ms | 3.968 ms | 3.02x | 6.1e-05 | 4.9e-04 |
-| `[3,2048,8,128]` | 3.689 ms | 2.107 ms | 6.175 ms | 2.93x | 6.1e-05 | 4.1e-04 |
-| `[2,4096,8,128]` | 6.976 ms | 3.360 ms | 8.576 ms | 2.55x | 6.1e-05 | 2.4e-04 |
-| `[1,8192,32,128]` | 18.159 ms | 9.353 ms | 30.254 ms | 3.23x | 6.1e-05 | 4.1e-04 |
+| `[1,32,2,128]` | 0.403 ms | 0.339 ms | 0.257 ms | 0.76x (Triton wins) | 2.3e-05 | 2.4e-04 |
+| `[2,1024,4,128]` | 2.059 ms | 0.914 ms | 1.230 ms | 1.35x | 4.6e-05 | 4.2e-04 |
+| `[1,1024,32,128]` | 2.344 ms | 1.259 ms | 3.991 ms | 3.17x | 6.1e-05 | 4.9e-04 |
+| `[3,2048,8,128]` | 3.659 ms | 1.961 ms | 6.239 ms | 3.18x | 6.1e-05 | 4.1e-04 |
+| `[2,4096,8,128]` | 6.726 ms | 3.193 ms | 8.653 ms | 2.71x | 6.1e-05 | 2.4e-04 |
+| `[1,8192,32,128]` | 17.340 ms | 8.506 ms | 30.300 ms | 3.56x | 6.1e-05 | 5.5e-04 |
 
-(Re-measured after the three `pre_gram` changes in `docs/ASCENDC_V1_KERNELS.md`
+(Re-measured after the four instruction cuts in the fused kernel and the
+wide solve of `k1_solve_wu_wide.cpp` (`docs/ASCENDC_V1_KERNELS.md`; the solve
+stage alone went 1.47 -> 0.65 ms at `[1,8192,32]`), on top of the three
+`pre_gram` changes
 (fusing preprocess with the Gram build, replacing the per-row scalar loops
 with `Brcb`, then hiding the load/store latencies behind the compute and
 walking several chunks per block): K1 dropped 14.00 -> 9.35 ms at

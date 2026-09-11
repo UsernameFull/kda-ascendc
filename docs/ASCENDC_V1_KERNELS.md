@@ -13,6 +13,7 @@ silently produces wrong numbers, so the contracts are spelled out here.
 | `k1_gram.cpp` | `kda_gram_kernel` | `Aqk32`/`Aqk` bf16 `[c,16,16]`, `L` |
 | `k1_pre_gram.cpp` | `kda_pre_gram_kernel` | everything the two rows above write, in one block per chunk |
 | `k1_solve_wu.cpp` | `kda_solve_wu_kernel` | `A32`/`A16` |
+| `k1_solve_wu_wide.cpp` | `kda_solve_wu_wide` | the same, 32 chunks per vector instruction |
 | `k1_solve_wu_cube.cpp` | `kda_solve_wu_cube_kernel` | `W`, `U` |
 
 The preprocess kernel indexes the packed chunk-major layout, so `api.py` passes
@@ -154,11 +155,12 @@ per-launch and per-stage latency, not by FLOPs:
   *unchanged to the digit* at every shape (`[1,8192,32]`: out 6.10e-05,
   state 4.12e-04; `[2,4096,8]`/`[3,2048,8]`/`[1,1024,32]`: out 6.10e-05).
   In-pipeline profile (`KDA_PROFILE=1`), HEAD -> now:
-  preprocess+gram 1.94 + 2.36 -> `pre_gram` 2.31, solve 3.29 -> 1.46 (AIV
-  2.44 -> 0.97 + Cube 0.90 -> 0.55), K2 incl. `kg_transpose` 5.42 -> 4.71;
-  `total_ms` 13.01 -> 8.48.  Isolated stage times on the current tree
+  preprocess+gram 1.94 + 2.36 -> `pre_gram` 2.29, solve 3.29 -> 0.65 (AIV
+  2.44 -> 0.97 -> 0.10 + Cube 0.90 -> 0.55), K2 incl. `kg_transpose` 5.42 ->
+  4.71; `total_ms` 13.01 -> 7.60.  Isolated stage times on the current tree
   (`/tmp/kdaval/k1_one.py all`, best of 5): preprocess 1.96, gram 1.74,
-  solve AIV 1.01, `kg_transpose` 0.16, solve Cube (NC=4) 0.55 ms; the same
+  solve AIV 1.01 -> 0.10 (wide kernel, `check_solve.py`), `kg_transpose`
+  0.16, solve Cube (NC=4) 0.55 ms; the same
   harness on the *fused* kernel gives 2.34 ms.
   - `k1_gram.cpp` only builds the lower triangle (`rows = i + 1` passed to
     `Mul`/`MulAddDst`/`WholeReduceSum`, 136 row-passes instead of 256), uses
@@ -177,6 +179,40 @@ per-launch and per-stage latency, not by FLOPs:
     scalar solve over 64 chunks.  `A_inv` has to start from the *identity*
     (starting from `I - L` double counts the linear term).  A `Div` variant
     and a batched-but-still-scalar variant were both wrong or no faster.
+  - `k1_solve_wu_wide.cpp` is the same recursion with the *chunk* axis as the
+    vector lane width instead of the 16-element row: one `MulAddDst` updates
+    row `i` of 32 chunks at once, so the 120 steps of the recursion cost 120
+    instructions per 32 chunks instead of 120 per chunk.  The three layout
+    facts it rests on were checked on hardware with a probe kernel
+    (`/tmp/kdaval/probe2.cpp`): `Brcb(dst, src, 2*NC, BrcbRepeatParams(1, 8))`
+    reads one 32B block - eight columns of one chunk - per repeat and writes
+    eight blocks, so block `16*ch + j` of the expansion holds `-L[ch][i][j]`
+    eight times; a binary vector op with `src1BlkStride = 0` then reads that
+    single block for both 32B halves of a 16-lane repeat, i.e. broadcasts one
+    coefficient over exactly the sixteen lanes of one chunk's row, and
+    `src1RepStride = 16` walks the chunks; and
+    `DataCopyParams(NC, 2, 30, 0)` gathers two-block rows 32 blocks apart,
+    turning the chunk-major `L` of GM into the per-row layout `Brcb` wants
+    without any extra GM traffic (2 KB per row of 32 chunks).
+    Measured against the per-chunk kernel, bit-identical on both outputs
+    (`0.000e+00`, every bf16 value equal): NC=8 0.2235 ms, NC=16 0.1285 ms,
+    NC=32 **0.1006 ms** vs 0.9120 ms - 9.1x.  NC=64 does not fit (the four
+    live tiles would need ~190 KB of the 192 KB); what is left at NC=32 is
+    memory traffic, 40 MB per pass (16 MB `L` read, 16 MB fp32 + 8 MB bf16
+    `A_inv` write) against ~370 GB/s, so it sits at the bandwidth floor.
+    In-pipeline this is `solve_ms` 1.47 -> 0.65 ms and `total_ms`
+    8.41 -> 7.60 ms at `[1,8192,32]`.
+    A two-accumulator split of the recursion (to break the 120-deep dependency
+    chain) was *slower* (0.2497 vs 0.2235 ms at NC=8): the chain is not the
+    limit, the per-instruction issue cost is.  That is also why NC=16/32 win
+    even though the grid gets smaller.
+    `api.py` allocates `L`/`A32`/`A16` rounded up to `SOLVE_WIDE_NCHUNK`
+    chunks so that the last group's gather and stores stay inside an
+    allocation; the padded chunks are never read (the debug dict hands out
+    `[:c]` views) and, unlike a `zero_()` of the tail, the padding costs no
+    extra host launch - measured at `[1,32,2]`, where padding a 4-chunk shape
+    out to a 32-chunk block is 7/8 wasted work, the call is still 0.334 ms
+    (`persistent_loop`) against 0.342 ms before.
   - `k1_solve_wu_cube.cpp` keeps 4 chunks in flight (WU_NCHUNK=4, one AIC
     block per 4 chunks): 0.90 -> 0.55 ms, and NC=1 is 0.88 ms, i.e. the win is
     the per-block fixed cost (~1.26 us), not the mmad.  NC>=6 is faster
@@ -269,6 +305,32 @@ per-launch and per-stage latency, not by FLOPs:
       at `[2,1024,4]` (64 blocks) *loses* 16% to wave quantization.  Under 256
       chunks the loop wrapper itself costs ~6% and the policy keeps unroll 1.
       In-pipeline this is `pre_gram` 2.59 -> 2.31 ms, `total_ms` 8.83 -> 8.48.
+    - A last pass deleted four more instructions per chunk, all bit-identical
+      (`0.000e+00` on all 13 outputs): the `Muls(gf, gf, aexp)` +
+      `Muls(gf, gf, -1)` pair folds into one `Muls` with the scalar negated
+      (sign flips are exact), `Sub; Muls(-1)` for `gate_last - gate` becomes
+      one `Sub` with its operands and repeat strides swapped, the A-side
+      triangular mask multiply is a no-op because the Gram loop only writes
+      the lower triangle and `Duplicate` already zeroed the rest, and the
+      dead `MaskS` tile fetch goes with it (`MaskL` has to stay: the K-side
+      loop does write L's diagonal and the mask is what zeroes it).
+      Back-to-back 2.342 -> 2.258 ms at `[1,8192,32]`; in-pipeline
+      `pre_gram` 2.31 -> 2.29 ms, `total_ms` 8.48 -> 8.41.
+      The same round pinned the cost model that motivates counting
+      instructions here: +8 one-repeat `Adds` per chunk cost +0.040 ms
+      (~27 cycles per vector instruction), +8 16-repeat `Mul`s +0.056 ms
+      (~0.6 cycles per extra repeat), +8 one-repeat `Exp` +0.051 ms (the
+      special-function unit is dearer per repeat but not dominant), and a
+      512-instruction loop of 64-lane `Mul`s runs 4.8x slower than the
+      same work in 8 instructions of 16 repeats.  Measured and rejected in
+      the same round: dropping the 15 cumsum and/or the 64 Gram-loop barriers
+      (no change, the vector pipe is in-order so they are free), giving the
+      Gram loop a second product tile so its A and K halves stop serialising
+      on one buffer (no change: issue-limited, not latency-limited), 256B UB
+      padding on `gb`/`redA` (4.5%/4.2% *worse*)/`ga`/`gtb` (neutral), unroll
+      4/16/32 (worse than 8), and moving the Gram to the Cube (24 KB per
+      chunk of extra GM traffic each way for ~4.7k of ~13.7k core cycles, a
+      wash at ~370 GB/s).
     - The fused body is *compiler fragile* and must not be reformatted: the
       same arithmetic written slightly differently trips `aivec error` (mte
       error info `0x8030860ef`, "address for the scalar to access the internal
@@ -319,7 +381,7 @@ per-launch and per-stage latency, not by FLOPs:
   Output and
   state are bit-identical to `separated` (`0.0` / `0.0`) at every shape tested
   and K2 is now one launch instead of 2048. What remains of the pass is K1
-  (`pre_gram` 2.31 + solve 1.46 + `kg_transpose` 0.16 ms, after the K1 retune
+  (`pre_gram` 2.29 + solve 0.65 + `kg_transpose` 0.16 ms, after the K1 retune
   below), so the next lever is no longer the K2 launch count.
   - The loop only became reliable once the AIC keeps a `PipeBarrier<PIPE_ALL>`
     after each stage's `FIX_M` wait, exactly like the per-chunk
