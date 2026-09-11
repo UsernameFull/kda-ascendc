@@ -122,6 +122,12 @@ per-launch and per-stage latency, not by FLOPs:
   1.3 ms. The prep is the part worth attacking (it computes `2^gc` and
   `2^-gc` from scratch even though `preprocess` already materialises the gated
   `Qg`/`Kg`).
+- The Triton reference compiles to a 16384-block MIX K1 (11.09 ms) and a
+  64-block, single-launch K2 that keeps the fp32 state resident for all 512
+  chunks (18.79 ms); both are slower than the `separated` path here (7.53 ms /
+  13.95 ms), see `docs/TRITON_CODEGEN_REVIEW_20260911.md`.  The one place the
+  reference is cheaper is layout: it stores `o` in the public layout, while we
+  pay 0.39 ms of aclnn permute/copy kernels per pass.
 - `persistent_scan_cube` is *not* a persistent kernel: `api.py` remaps the name
   onto the fused per-chunk `kda_k2_mix_all_cube`, which still launches once per
   chunk (512 launches instead of 2048). Measured 2026-09-11 at `[1,8192,32]`:
