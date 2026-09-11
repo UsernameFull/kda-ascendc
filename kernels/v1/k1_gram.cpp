@@ -7,6 +7,12 @@
 // recentred on the chunk mid row, so the exponents stay near zero.
 // One AIV block per (batch, head, chunk); the reduction runs on the vector
 // unit row by row (WholeReduceSum over the contiguous head dimension).
+//
+// Cost notes measured at [1,8192,32]: the two exp2 passes are free (stubbing
+// them changes nothing), the whole reduction step used to cost 0.9 ms because
+// both Gram matrices were built over all 16 columns of every row, and the
+// 16x16 blocks are small enough that a block's fixed cost (~1 us of engine
+// setup plus dispatch) is a third of this kernel's time.
 #include "kernel_operator.h"
 using namespace AscendC;
 
@@ -17,18 +23,17 @@ constexpr float LN2 = 0.6931471805599453f;
 
 // rs[j] = sum_d tile[j, d]; tmp is an N-float scratch tile.
 static __aicore__ inline void RowDot(LocalTensor<float> rs, LocalTensor<float> tmp,
-                                     const LocalTensor<float> tile) {
-    Add(tmp, tile, tile[64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 16));
-    PipeBarrier<PIPE_V>();
-    WholeReduceSum(rs, tmp, 64, M, 1, 1, 16);
+                                     uint8_t rows) {
+    // tmp already holds the sum of the two 64-wide half products.
+    WholeReduceSum(rs, tmp, 64, rows, 1, 1, 16);
 }
 
 // t0[j, 0:64]  = a[0:64]  * b[j, 0:64]
 // t0[j, 64:128]= a[64:128]* b[j, 64:128]
 static __aicore__ inline void RowBroadcastMul(LocalTensor<float> t0, const LocalTensor<float> a,
-                                              const LocalTensor<float> b) {
-    Mul(t0, a, b, 64, M, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
-    Mul(t0[64], a[64], b[64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
+                                              const LocalTensor<float> b, uint8_t rows) {
+    Mul(t0, a, b, 64, rows, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
+    MulAddDst(t0, a[64], b[64], 64, rows, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
 }
 
 extern "C" __global__ __aicore__ void kda_gram_kernel(
@@ -109,16 +114,28 @@ extern "C" __global__ __aicore__ void kda_gram_kernel(
     // Row i of the Gram matrix lands in row i of redA/redK, so the triangular
     // masks are applied with a single elementwise multiply instead of 512
     // scalar SetValue/GetValue pairs per chunk.
+    // Entries above the diagonal of either Gram matrix are never written, and
+    // the mask multiply would turn a stale NaN into a NaN, so clear both tiles.
+    Duplicate(redA, 0.0f, M * M);
+    Duplicate(redK, 0.0f, M * M);
+    PipeBarrier<PIPE_V>();
+
+    // Row i only needs the columns j <= i (both Gram matrices are masked to
+    // that triangle afterwards), so the broadcast multiply and the reduction
+    // run over i+1 rows instead of all 16: sum_i (i+1) = 136 row-passes instead
+    // of 256.  The skipped entries are the ones the masks zero out anyway, so
+    // this changes no arithmetic that reaches the output.
     for (int32_t i = 0; i < M; ++i) {
-        RowBroadcastMul(t0, a[i * D], b);
+        const uint8_t rows = static_cast<uint8_t>(i + 1);
+        RowBroadcastMul(t0, a[i * D], b, rows);
         PipeBarrier<PIPE_V>();
-        RowDot(redA[i * M], ef, t0);
+        RowDot(redA[i * M], t0, rows);
         PipeBarrier<PIPE_V>();
         Muls(tb, k1[i * D], beta.GetValue(i), D);
         PipeBarrier<PIPE_V>();
-        RowBroadcastMul(t0, tb, b);
+        RowBroadcastMul(t0, tb, b, rows);
         PipeBarrier<PIPE_V>();
-        RowDot(redK[i * M], ef, t0);
+        RowDot(redK[i * M], t0, rows);
         PipeBarrier<PIPE_V>();
     }
     Muls(redA, redA, scale, M * M);

@@ -11,6 +11,7 @@ silently produces wrong numbers, so the contracts are spelled out here.
 |---|---|---|
 | `preprocess.cpp` | `kda_preprocess_kernel` | `Qn`/`Kn` (bf16, packed `[c,16,128]`), `Gate`, `Gc`, `Beta`, `Decay`, `Qg`, `Kg`, `Rk`, `Rv` |
 | `k1_gram.cpp` | `kda_gram_kernel` | `Aqk32`/`Aqk` bf16 `[c,16,16]`, `L` |
+| `k1_pre_gram.cpp` | `kda_pre_gram_kernel` | everything the two rows above write, in one block per chunk |
 | `k1_solve_wu.cpp` | `kda_solve_wu_kernel` | `A32`/`A16` |
 | `k1_solve_wu_cube.cpp` | `kda_solve_wu_cube_kernel` | `W`, `U` |
 
@@ -148,6 +149,76 @@ per-launch and per-stage latency, not by FLOPs:
   1.3 ms. The prep is the part worth attacking (it computes `2^gc` and
   `2^-gc` from scratch even though `preprocess` already materialises the gated
   `Qg`/`Kg`).
+- K1 was retuned stage by stage and the pass went 14.00 -> 10.14 ms at
+  `[1,8192,32]` (`separated` 22.62 -> 19.00 ms) with the error against Triton
+  *unchanged to the digit* at every shape (`[1,8192,32]`: out 9.16e-05,
+  state 4.50e-04; `[2,4096,8]`/`[3,2048,8]`/`[1,1024,32]`: out 6.10e-05).
+  In-pipeline profile (`KDA_PROFILE=1`), HEAD -> now:
+  preprocess+gram 1.94 + 2.36 -> `pre_gram` 3.08, solve 3.29 -> 1.46 (AIV
+  2.44 -> 0.97 + Cube 0.90 -> 0.55), K2 incl. `kg_transpose` 5.42 -> 4.71;
+  `total_ms` 13.01 -> 9.26.  Isolated stage times on the current tree
+  (`/tmp/kdaval/k1_one.py all`, best of 5): preprocess 1.96, gram 1.74,
+  solve AIV 1.01, `kg_transpose` 0.16, solve Cube (NC=4) 0.55 ms; the same
+  harness on the *fused* kernel gives 3.11 ms.
+  - `k1_gram.cpp` only builds the lower triangle (`rows = i + 1` passed to
+    `Mul`/`MulAddDst`/`WholeReduceSum`, 136 row-passes instead of 256), uses
+    `MulAddDst` for the second half product (the separate `Add` is gone) and
+    clears `redA`/`redK` with one `Duplicate` each, because an entry above the
+    diagonal is never written and the mask multiply would propagate a stale
+    NaN or not, and the whole stage went 2.36 -> 1.71 ms; the three changes
+    were applied together, so no per-change split is claimed here.
+    Measured and rejected: dropping the in-loop `PipeBarrier<PIPE_V>`s (no
+    change - the vector pipe is issue-bound, not latency-bound) and replacing
+    the second `Exp` with `Reciprocal` (saves 0.05 ms and drifts the output).
+  - `k1_solve_wu.cpp` no longer inverts `L` with a scalar recursion.  It now
+    runs the row recursion `A_inv[i] = e_i - sum_{j<i} L[i][j] * A_inv[j]` on
+    the vector unit (`Axpy(af + i*M, af + j*M, -cij, M)`, one barrier per
+    step), 8 chunks per block: 2.44 -> 0.97 ms, bit-identical to the old
+    scalar solve over 64 chunks.  `A_inv` has to start from the *identity*
+    (starting from `I - L` double counts the linear term).  A `Div` variant
+    and a batched-but-still-scalar variant were both wrong or no faster.
+  - `k1_solve_wu_cube.cpp` keeps 4 chunks in flight (WU_NCHUNK=4, one AIC
+    block per 4 chunks): 0.90 -> 0.55 ms, and NC=1 is 0.88 ms, i.e. the win is
+    the per-block fixed cost (~1.26 us), not the mmad.  NC>=6 is faster
+    (0.33/0.26 ms) but wrong on this hardware: the L0A/L0B slots are indexed
+    `pass*NC + ch` and the L0C/`qc` queue is only `NC` deep, so the mmad of
+    chunk *k* overlaps the L0A/L0B write of chunk *k+1* and L0C is rewritten
+    under a live `Fixpipe`.  Keep NC <= 4.  Each pass must also re-issue its
+    own B load (`Rk` -> `W`, `Rv` -> `U`); an earlier version that loaded both
+    only once dequeued an empty queue for the second pass and produced a `U`
+    that was 100% wrong while `W` stayed correct - `val_k1.py` catches it in
+    one run, `tools/bench_modes_vs_triton.py` did not, because every mode
+    consumes `U` through the same wrong tensor.
+  - `k2_kg_transpose.cpp` (K1-adjacent, it is launched inside the K2 stage)
+    now moves `NCHUNK = 8` chunks per block with one strided
+    `DataCopyParams(M, 1, 7, 0)` gather per 16x16 tile instead of 16 row
+    gathers: 0.72 -> 0.16 ms, bit-identical to `torch.transpose`.
+  - `k1_pre_gram.cpp` fuses stages 1+2 into one AIV block per chunk (`api.py`
+    now launches it instead of `kda_preprocess_kernel` + `kda_gram_kernel`
+    back to back): the Gram half reads `Qn`/`Kn`/`Gc` straight out of UB and
+    the 32 KB/chunk GM round trip is gone.  In-pipeline at `[1,8192,32]`:
+    1.91 + 1.71 = 3.62 -> 3.08 ms; isolated (`/tmp/kdaval/pregram_one.py`,
+    best of 5) 3.675 -> 3.114 ms at `[1,8192,32]` and 1.866 -> 1.591 ms at
+    `[1,4096,32]` (1.18x / 1.17x), bit-identical on all 13 outputs (every
+    ``max(abs(diff))`` exactly `0.000e+00`).  The GM copies of
+    `Qn`/`Kn`/`Gate`/`Gc` are now skipped unless the caller asked for the
+    intermediates, so the fast path never writes them at all.
+    This is the right lever because `preprocess` is DMA/fixed-cost bound, not
+    FLOP bound: measured decomposition of the *pre-fusion* stage - an empty
+    kernel costs 0.22 ms and a no-`Exp` stub 1.91 ms of the 1.96 ms, so the
+    two `Exp` passes are free and the 15-step cumsum is 0.07 ms; ~140 vector
+    instructions per block (~80 of them the per-row `Muls`/`Sub`/`Duplicate`
+    passes) against a ~1 us/block fixed cost is where the rest is.
+    - The fused body is *compiler fragile* and must not be reformatted: the
+      same arithmetic written slightly differently trips `aivec error` (mte
+      error info `0x8030860ef`, "address for the scalar to access the internal
+      buffer of AICore is out of bounds") at runtime, with no compile-time
+      diagnostic from `rtc_compile`.  Confirmed triggers: moving a
+      `PipeBarrier<PIPE_V>`, renaming one of the buffers, and re-wrapping the
+      `TBuf`/`InitBuffer` declaration lists.  Extra unused arguments and
+      unused buffers are fine; the ~236 KB of live UB is not the problem
+      (the same kernel allocates with 10 dummy int args added).  Keep the
+      file's layout.
 - Every returned output used to be scrambled in ``t`` and ``h``:
   ``out_task.view(bh, NV, nt, CHUNK, BV).permute(0, 2, 3, 1, 4)`` keeps
   ``bh = b * H + h`` as one merged dimension through the permute, so the tensor
@@ -188,8 +259,8 @@ per-launch and per-stage latency, not by FLOPs:
   Output and
   state are bit-identical to `separated` (`0.0` / `0.0`) at every shape tested
   and K2 is now one launch instead of 2048. What remains of the pass is K1
-  (preprocess 1.90 + gram 2.36 + solve 3.29 + kg_transpose 0.75 ms), so the
-  next lever is no longer the K2 launch count.
+  (`pre_gram` 3.08 + solve 1.46 + `kg_transpose` 0.16 ms, after the K1 retune
+  below), so the next lever is no longer the K2 launch count.
   - The loop only became reliable once the AIC keeps a `PipeBarrier<PIPE_ALL>`
     after each stage's `FIX_M` wait, exactly like the per-chunk
     `run_d12_aic`: without them the kernel faults with an aicore exception

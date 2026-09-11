@@ -20,6 +20,9 @@ if str(EXT) not in sys.path:
 from kda_ascendc_v1_launcher import launch_argsarray_engine, rtc_compile
 
 CHUNK = 16
+SOLVE_NCHUNK = 8
+KGT_NCHUNK = 8
+WU_NCHUNK = 4
 D = 128
 BV = 64
 NV = 2
@@ -30,8 +33,22 @@ _TRITON_AIV_COMPILED = False
 _LAST_PROFILE: dict[str, object] = {}
 # Triangular 0/1 masks for the intra-chunk Gram kernel, built once per device.
 _GRAM_MASKS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+# Identity tile read by the K1 solve kernel, built once per device.
+_EYE_TILES: dict[torch.device, torch.Tensor] = {}
 _LAUNCH_COUNTS: dict[str, int] = {}
 _LAUNCH_BLOCKS: dict[str, int] = {}
+
+
+def _tri_eye(device: torch.device) -> torch.Tensor:
+    """Identity tile for the K1 solve: A_inv starts from it."""
+    eye = _EYE_TILES.get(device)
+    if eye is None:
+        eye = torch.eye(CHUNK, device=device, dtype=torch.float32).contiguous()
+        # torch_npu does not order every elementwise op against the raw
+        # aclrtLaunchKernel calls, so publish the tile before any kernel reads it.
+        torch.npu.synchronize()
+        _EYE_TILES[device] = eye
+    return eye
 
 
 def _pack_ptrs(xs):
@@ -59,6 +76,7 @@ def _compile_all() -> None:
     sources = [
         ("kernels/v1/preprocess.cpp", "kda_preprocess_kernel"),
         ("kernels/v1/k1_gram.cpp", "kda_gram_kernel"),
+        ("kernels/v1/k1_pre_gram.cpp", "kda_pre_gram_kernel"),
         ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
         ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
         ("kernels/v1/k2_init.cpp", "kda_k2_init_kernel"),
@@ -209,34 +227,40 @@ def kda_bt16_fwd_ascendc(
     decay = torch.empty((c, D), dtype=torch.float32, device=q.device)
     rk = torch.empty_like(q_pack); rv = torch.empty_like(q_pack)
     qg = torch.empty_like(q_pack); kg = torch.empty_like(q_pack)
-    # The preprocess kernel addresses every token in packed ``[c, CHUNK, D]``
-    # order, so the public [B, T, H, D] tensors have to be packed first.
-    pre_args = _pack_ptrs([q_pack, k_pack, v_pack, g_pack, beta_pack,
-                           A_log, bias, qn, kn, gate, gc, beta_out, decay, rk, rv, qg, kg])
-    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound)]
-    mark("pre_start")
-    _launch("kda_preprocess_kernel", c, pre_args, stream)
-    finish("preprocess_ms", "pre_start")
-
     aqk32 = torch.empty((c, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     aqk16 = torch.empty((c, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
     L = torch.empty_like(aqk32)
     mask_s, mask_l = _tri_masks(q.device)
-    gram_args = _pack_ptrs([qn, kn, gc, beta_out, aqk32, aqk16, L, mask_s, mask_l]) + [_i(c), _f(scale)]
-    mark("gram_start")
-    _launch("kda_gram_kernel", c, gram_args, stream)
-    finish("gram_ms", "gram_start")
+    # Stages 1+2 run as one AIV block per chunk ("k1_pre_gram.cpp"): the fused
+    # kernel consumes Qn/Kn/Gc out of UB instead of round-tripping 32 KB per
+    # chunk through GM.  It addresses every token in packed ``[c, CHUNK, D]``
+    # order, so the public [B, T, H, D] tensors have to be packed first, and
+    # it only writes Qn/Kn/Gate/Gc when those pointers are non-null (the
+    # ``return_intermediates`` debug path).
+    keep = return_intermediates
+    pre_args = _pack_ptrs([q_pack, k_pack, v_pack, g_pack, beta_pack,
+                           A_log, bias,
+                           qn if keep else None, kn if keep else None,
+                           gate if keep else None, gc if keep else None,
+                           beta_out, decay, rk, rv, qg, kg,
+                           aqk32, aqk16, L, mask_s, mask_l])
+    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale)]
+    mark("pre_gram_start")
+    _launch("kda_pre_gram_kernel", c, pre_args, stream)
+    finish("pre_gram_ms", "pre_gram_start")
 
     a32 = torch.empty_like(aqk32)
     a16 = torch.empty_like(aqk16)
     W = torch.empty_like(q_pack)
     U = torch.empty_like(q_pack)
-    solve_args = _pack_ptrs([L, a32, a16]) + [_i(c)]
+    solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16]) + [_i(c)]
     mark("solve_start")
-    _launch("kda_solve_wu_kernel", c, solve_args, stream)
+    # One AIV block solves SOLVE_NCHUNK chunks at once (see the kernel header).
+    _launch("kda_solve_wu_kernel", (c + SOLVE_NCHUNK - 1) // SOLVE_NCHUNK, solve_args, stream)
     # The Cube needs the bf16 A_inv the substitution just wrote, so the two
     # launches stay ordered on the stream.
-    _launch("kda_solve_wu_cube_kernel", c, _pack_ptrs([a16, rk, rv, W, U]) + [_i(c)], stream)
+    _launch("kda_solve_wu_cube_kernel", (c + WU_NCHUNK - 1) // WU_NCHUNK,
+            _pack_ptrs([a16, rk, rv, W, U]) + [_i(c)], stream)
     finish("solve_ms", "solve_start")
 
     # Historical name: ``persistent_scan_cube`` has always been served by the
@@ -313,7 +337,8 @@ def kda_bt16_fwd_ascendc(
         h0 = None if initial_state is None else initial_state.view(bh, D, D)
         kg_t = torch.empty((c, D, CHUNK), dtype=torch.bfloat16, device=q.device)
         mark("k2_start")
-        _launch("kda_kg_transpose", c, _pack_ptrs([kg, kg_t]) + [_i(c)], stream)
+        _launch("kda_kg_transpose", (c + KGT_NCHUNK - 1) // KGT_NCHUNK,
+                _pack_ptrs([kg, kg_t]) + [_i(c)], stream)
         _launch("kda_k2_persistent_loop", nblk,
                 _pack_ptrs([U, W, qg, aqk16, kg_t, decay, d1, d2, d3, d4f,
                             out_task, vnew, vnew_t, h0, s32, s16]) +
@@ -364,7 +389,8 @@ def kda_bt16_fwd_ascendc(
     mark("k2_start")
     if needs_kg_t:
         mark("kg_start")
-        _launch("kda_kg_transpose", c, _pack_ptrs([kg, kg_t]) + [_i(c)], stream)
+        _launch("kda_kg_transpose", (c + KGT_NCHUNK - 1) // KGT_NCHUNK,
+                _pack_ptrs([kg, kg_t]) + [_i(c)], stream)
         finish("kg_transpose_ms", "kg_start")
     for chunk in range(nt):
         common = [_i(bh), _i(nt), _i(NV), _i(chunk)]

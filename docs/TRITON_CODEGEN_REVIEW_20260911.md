@@ -99,13 +99,21 @@ device, same inputs, output checked against the Triton path):
 
 | shape | `separated` | `persistent_loop` | Triton | `persistent_loop` vs Triton | out err vs Triton | state err |
 |---|---:|---:|---:|---:|---:|---:|
-| `[1,32,2,128]` | 0.401 ms | 0.349 ms | 0.259 ms | 0.74x (Triton wins) | 2.3e-05 | 2.4e-04 |
-| `[2,1024,4,128]` | 2.102 ms | 1.005 ms | 1.222 ms | 1.22x | 4.6e-05 | 4.2e-04 |
-| `[2,4096,8,128]` | 7.368 ms | 4.392 ms | 8.633 ms | 1.97x | 6.1e-05 | 2.4e-04 |
-| `[1,8192,32,128]` | 22.621 ms | 13.785 ms | 30.288 ms | 2.20x | 6.1e-05 | 4.1e-04 |
+| `[1,32,2,128]` | 0.392 ms | 0.339 ms | 0.250 ms | 0.74x (Triton wins) | 2.3e-05 | 2.4e-04 |
+| `[2,1024,4,128]` | 2.140 ms | 0.919 ms | 1.229 ms | 1.34x | 4.6e-05 | 4.2e-04 |
+| `[1,1024,32,128]` | 2.464 ms | 1.377 ms | 3.993 ms | 2.90x | 6.1e-05 | 2.9e-04 |
+| `[3,2048,8,128]` | 3.856 ms | 2.194 ms | 6.200 ms | 2.83x | 6.1e-05 | 4.4e-04 |
+| `[2,4096,8,128]` | 7.440 ms | 3.561 ms | 8.637 ms | 2.43x | 6.1e-05 | 3.0e-04 |
+| `[1,8192,32,128]` | 19.001 ms | 10.117 ms | 30.333 ms | 3.00x | 6.1e-05 | 5.5e-04 |
 
-Only the smallest shape still favours the reference (0.259 vs 0.349 ms, 26%),
+(Re-measured after the fused `pre_gram` stage in `docs/ASCENDC_V1_KERNELS.md`:
+K1 dropped 14.00 -> 10.14 ms at `[1,8192,32]` and the error against the
+reference stayed identical to the digit at every shape, so only the *times*
+in this table moved.  The first two rows are included because they are the
+cases that still favour the reference or nearly break even.)
+
+Only the smallest shape still favours the reference (0.250 vs 0.339 ms, 26%),
 where the pass is dominated by fixed costs and the device-side chunk loop is
 pure overhead.  Everything else is now AscendC's: at `[1,8192,32]` the
 reference spends 11.09 ms in one 16384-block MIX K1 launch plus 18.79 ms in its
-resident-state K2 launch, against 8.3 ms and 5.29 ms for our K1 and K2.
+resident-state K2 launch, against 5.2 ms and 4.7 ms for our K1 and K2.
