@@ -171,6 +171,24 @@ does not remove either.
    `DataCopy` for 16-column operands instead of `Nd2Nz`; UB `Transpose` for
    16x16 blocks; two-repeat `Mul` for the state update.
 
+Update 2026-09-11: items 1-3 are now implemented in
+`kernels/v1/k2_persistent_loop.cpp` (`k2_mode="persistent_loop"`) and the
+schedule transfers: one launch for all 512 chunks, two heads interleaved per
+block, pre-set `R` flags for the prologue, four flag ids, depth one. It is
+bit-exact against `separated` and takes K2 from `14.03` to `5.29 ms` at
+`[1,8192,32]` (`2.65x`, whole pass `22.55 -> 13.67 ms`). Two notes for anyone
+copying this:
+
+- Item 4 (per-core private ping-pong buffers) was *not* needed for
+  correctness: the loop writes only the bf16 state copy to GM each chunk and
+  the four flags already order every share. The `d1`/`d2`/`d3`/`d4` staging
+  buffers stay global, one region per `(task, chunk)`.
+- The same `PipeBarrier<PIPE_ALL>` rule that item 5's `Fixpipe` note implies
+  applies to the *loop*: without a drain after each stage's `FIX_M` wait the
+  AIC faults intermittently when it reuses `L0A`/`L0B`/`L0C` for the next
+  stage. The barrier is free here (13.67 vs 13.52 ms unbarriered) and
+  load-bearing.
+
 ## 6. What not to borrow
 
 - Their layout handling: five `transpose(1,2).contiguous()` on the inputs and

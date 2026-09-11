@@ -58,6 +58,39 @@ whenever a stage can run ahead. Restarting the persistent line means adopting
 that protocol (plus two interleaved tasks per core), not just looping the
 existing one-chunk kernel.
 
+Update 2026-09-11 (third): the restart happened and it works.  The new mode is
+`k2_mode="persistent_loop"` (`kernels/v1/k2_persistent_loop.cpp`), one
+`KERNEL_TYPE_MIX_AIC_1_2` launch for all `NT` chunks plus the single
+`kg_transpose` staging launch.  Two heads per block (`MAXH = 2`,
+`nblk = ceil(BH/2)`), both AIV subcores running the same four-id ping-pong with
+the prologue absorbed by pre-set `R` flags, fp32 state resident in UB, only the
+bf16 copy in GM per chunk.
+
+| Shape | `separated` whole pass | `persistent_loop` whole pass | `separated` K2 | `persistent_loop` K2 | speedup (K2) |
+|---|---:|---:|---:|---:|---:|
+| `[1,8192,32,128]` | `22.55 ms` | `13.67 ms` | `14.03 ms` | `5.29 ms` | `2.65x` |
+| `[2,4096,8,128]` | `6.92 ms` | `4.50 ms` | `6.85 ms` | `2.29 ms` | `2.99x` |
+
+Output and final state are bit-identical to `separated` (`0.0` / `0.0` maximum
+absolute difference) at `[1,64,2]`, `[1,1024,32]`, `[1,2048,32]`,
+`[1,4096,32]`, `[1,8192,2]` and `[1,8192,32]`, and the mode is covered by
+`tests/test_persistent_loop.py`.  Two findings from the crash hunt are worth
+keeping:
+
+- The AIC must keep a `PipeBarrier<PIPE_ALL>` after each stage's `FIX_M` wait
+  (the same drain the per-chunk `run_d12_aic` needs).  Without it the kernel
+  dies with an aicore exception in about one launch in three at
+  `[1,8192,32]` - `L0A`/`L0B`/`L0C` are reused by the next stage and the
+  `FIX_M` event alone does not order that reuse on this runtime.
+- The four-flag schedule itself is *not* the fragile part: a data-free probe
+  kernel that runs the exact same `nh = 2` ping-pong for 512 iterations on 16
+  blocks is stable and takes 2 ms.  So the deleted loop's stall was not simply
+  "long cross-core loops do not work here".
+
+K2 is no longer the bottleneck of the pass: at `[1,8192,32]` the remaining
+non-K2 time is preprocess `1.90` + gram `2.36` + solve `3.29` +
+`kg_transpose` `0.75` ms, which is where the next pass should look.
+
 Synchronized wall-clock medians on Ascend910_9382:
 
 | Shape | Vector persistent scan | Cube target path | Speedup | Output error | State error |

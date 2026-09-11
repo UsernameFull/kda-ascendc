@@ -39,6 +39,32 @@ with `dstRepStride = 1` the results land contiguously at `rs[i]` (not `rs[i*8]`)
 | `k2_outstate.cpp` | `kda_k2_outstate_kernel` | `BH*NV` | `out_task`, `s32`, `s16` |
 | `k2_outstate_full.cpp` | `kda_k2_outstate_full_kernel` | `BH*NV` | `out_task`, `s32`, `s16` |
 | `k2_mix_d4_outstate.cpp`, `k2_mix_d12_vnew.cpp`, `k2_mix_all_cube.cpp` | MIX kernels | `BH` | same buffers as above |
+| `k2_persistent_loop.cpp` | `kda_k2_persistent_loop` | `ceil(BH/2)` | one launch for all `NT` chunks (see below) |
+
+### `persistent_loop`: the whole K2 recurrence in one launch
+
+`k2_mode="persistent_loop"` runs `d12 -> vnew -> d34 -> outstate` for every
+chunk inside a single `KERNEL_TYPE_MIX_AIC_1_2` launch, so the host-side chunk
+loop in `api.py` collapses to one `kda_kg_transpose` plus one
+`kda_k2_persistent_loop` call. Each block owns up to `MAXH = 2` heads
+(`h = blk, blk + nblk, ...`) and each AIV subcore owns one 64-column value
+tile, so a block has `nh * 2` state tiles in flight and the AIC is never
+blocked behind its own chain:
+
+```
+AIC: [wait R; d12(h); set C1] x nh   then   [wait V; d34(h); set C2] x nh
+AIV: [wait C1; vnew(h); set V] x nh  then   [wait C2; out(h); set R] x nh
+```
+
+Both AIV subcores execute the identical flag sequence (the head is the only
+unit both subcores share; only `iv = GetSubBlockIdx()` differs). Four flag ids
+`0..3` carry the loop, the protocol is depth one and iteration-invariant, and
+the AIV pre-sets `R` `nh` times before the loop so the first chunk needs no
+special case. The fp32 state lives in UB for the whole loop (loaded from `H0`,
+stored to `S32` once at the end); only its bf16 copy `S16` goes to GM each
+chunk for the Cube operands. `api.py` must therefore allocate
+`d4_full` as `[bh,128,128]` (per-head reuse) and pass `nblk` with
+`nblk * MAXH >= bh`, otherwise the head map is not total.
 
 ### d4 layout contract
 
@@ -156,6 +182,27 @@ per-launch and per-stage latency, not by FLOPs:
   with the live `mix_all_cube` path.  See
   `docs/VLLM_ASCEND_KDA_REVIEW_20260911.md` for the cross-core flag rules that
   loop violated and for the schedule to use when it is restarted.
+- The device-side loop is back as `persistent_loop` and it wins: `[1,8192,32]`
+  22.55 -> 13.67 ms for the whole pass and 14.03 -> 5.29 ms for K2 alone
+  (2.65x); `[2,4096,8,128]` 6.92 -> 4.50 ms (K2 6.85 -> 2.29 ms, 2.99x).
+  Output and
+  state are bit-identical to `separated` (`0.0` / `0.0`) at every shape tested
+  and K2 is now one launch instead of 2048. What remains of the pass is K1
+  (preprocess 1.90 + gram 2.36 + solve 3.29 + kg_transpose 0.75 ms), so the
+  next lever is no longer the K2 launch count.
+  - The loop only became reliable once the AIC keeps a `PipeBarrier<PIPE_ALL>`
+    after each stage's `FIX_M` wait, exactly like the per-chunk
+    `run_d12_aic`: without them the kernel faults with an aicore exception
+    (`FIXP`/`MTE`/`CUBE` error registers, PC in the `mix_aic` half) at
+    `[1,8192,32]` in roughly one launch in three, while `[1,64,2]` and
+    `[1,1024,32]` pass. The barriers cost nothing measurable (13.67 vs
+    13.52 ms without them), so they stay.
+  - The flag schedule itself was verified in isolation with a data-free probe
+    kernel (`512` iterations x `16` blocks x `nh = 2`, five launches, 2 ms
+    each) before blaming the protocol: four ids, two heads per block, both AIV
+    subcores setting and waiting the same ids is stable on this runtime. The
+    stall of the deleted loop was not a property of "long cross-core loops" as
+    such.
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column
@@ -180,6 +227,7 @@ per-launch and per-stage latency, not by FLOPs:
 ```bash
 python tools/compile_all_server.py                     # RTC compile of every kernel
 python -m pytest tests/test_persistent_scan.py tests/test_persistent_scan_cube.py
+python -m pytest tests/test_persistent_loop.py           # single-launch device loop
 python tests/test_mix_aic_1_2.py                       # script-style checks
 python tests/test_d12_cube.py
 python tests/test_s15_mix_d12_vnew.py

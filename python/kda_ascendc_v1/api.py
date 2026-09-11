@@ -73,6 +73,7 @@ def _compile_all() -> None:
         ("kernels/v1/k2_mix_d4_outstate.cpp", "kda_k2_mix_d4_outstate"),
         ("kernels/v1/k2_mix_d12_vnew.cpp", "kda_k2_mix_d12_vnew"),
         ("kernels/v1/k2_mix_all_cube.cpp", "kda_k2_mix_all_cube"),
+        ("kernels/v1/k2_persistent_loop.cpp", "kda_k2_persistent_loop"),
         ("kernels/v1/k2_outstate_full.cpp", "kda_k2_outstate_full_kernel"),
         ("kernels/v1/k2_outstate.cpp", "kda_k2_outstate_kernel"),
     ]
@@ -183,7 +184,7 @@ def kda_bt16_fwd_ascendc(
             torch.npu.synchronize()
             prof[name] = (time.perf_counter() - prof[start_name]) * 1e3
     b, t, h = _check_inputs(q, k, v, g, beta, A_log, bias, initial_state)
-    if k2_mode not in {"separated", "cube_separated", "cube_d3_separated", "cube_full_d4", "mix_aic_1_2", "mix_d12_vnew", "persistent", "persistent_scan", "persistent_scan_cube", "triton_aiv"}:
+    if k2_mode not in {"separated", "cube_separated", "cube_d3_separated", "cube_full_d4", "mix_aic_1_2", "mix_d12_vnew", "persistent", "persistent_scan", "persistent_loop", "persistent_scan_cube", "triton_aiv"}:
         raise ValueError("unsupported k2_mode")
     if scale is None:
         scale = D ** -0.5
@@ -284,6 +285,47 @@ def kda_bt16_fwd_ascendc(
                  "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
                  "Aqk32": aqk32, "Aqk": aqk16, "L": L, "A32": a32, "A16": a16,
                  "W": W, "U": U, "persistent": True}
+        return out_public, final_state, debug
+
+    if k2_mode == "persistent_loop":
+        # One device-side chunk loop.  Each block owns up to MAXH=2 heads (both
+        # AIV subcores run the same flag sequence and split the value dim), keeps
+        # its fp32 state in UB across all chunks and never writes S32 until the
+        # end, so the whole recurrence is a single MIX launch.  The block count
+        # must keep the head map total: nblk * MAXH >= bh.
+        want = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
+        nblk = want if 0 < want <= bh else (bh + 1) // 2
+        nblk = max(nblk, (bh + 1) // 2)
+        s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
+        s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
+        d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.float32, device=q.device)
+        d2 = torch.empty_like(d1)
+        d3 = torch.empty_like(d1)
+        d4f = torch.empty((bh, D, D), dtype=torch.float32, device=q.device)
+        out_task = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+        vnew = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+        vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
+        h0 = None if initial_state is None else initial_state.view(bh, D, D)
+        kg_t = torch.empty((c, D, CHUNK), dtype=torch.bfloat16, device=q.device)
+        mark("k2_start")
+        _launch("kda_kg_transpose", c, _pack_ptrs([kg, kg_t]) + [_i(c)], stream)
+        _launch("kda_k2_persistent_loop", nblk,
+                _pack_ptrs([U, W, qg, aqk16, kg_t, decay, d1, d2, d3, d4f,
+                            out_task, vnew, vnew_t, h0, s32, s16]) +
+                [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale)], stream)
+        finish("k2_ms", "k2_start")
+        out_public = out_task.view(b, h, NV, nt, CHUNK, BV).permute(0, 3, 4, 1, 2, 5).contiguous().view(b, t, h, D)
+        final_state = None if not output_final_state else s32.view(bh, NV, BV, D).reshape(b, h, D, D)
+        if profile:
+            prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
+            _LAST_PROFILE = prof
+        if not return_intermediates:
+            return out_public, final_state
+        debug = {"Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
+                 "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
+                 "Aqk32": aqk32, "Aqk": aqk16, "L": L, "A32": a32, "A16": a16,
+                 "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
+                 "d3": d3, "d4": d4f, "state_s32": s32, "persistent_loop": True}
         return out_public, final_state, debug
 
     s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
