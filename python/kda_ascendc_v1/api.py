@@ -293,8 +293,13 @@ def kda_bt16_fwd_ascendc(
         # its fp32 state in UB across all chunks and never writes S32 until the
         # end, so the whole recurrence is a single MIX launch.  The block count
         # must keep the head map total: nblk * MAXH >= bh.
+        # One head per block is ~4% faster than two while the heads still fit in
+        # the AIC count (measured at [2,4096,8]: 4.38 vs 4.55 ms); past that,
+        # two heads per block keep every block resident instead of queueing a
+        # second wave (32 blocks at [1,8192,32] cost 17.2 vs 13.8 ms).
+        aic_cores = 24
         want = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
-        nblk = want if 0 < want <= bh else (bh + 1) // 2
+        nblk = want if 0 < want <= bh else (bh if bh <= aic_cores else (bh + 1) // 2)
         nblk = max(nblk, (bh + 1) // 2)
         s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
         s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)

@@ -69,7 +69,11 @@ bf16 copy in GM per chunk.
 | Shape | `separated` whole pass | `persistent_loop` whole pass | `separated` K2 | `persistent_loop` K2 | speedup (K2) |
 |---|---:|---:|---:|---:|---:|
 | `[1,8192,32,128]` | `22.55 ms` | `13.67 ms` | `14.03 ms` | `5.29 ms` | `2.65x` |
-| `[2,4096,8,128]` | `6.92 ms` | `4.50 ms` | `6.85 ms` | `2.29 ms` | `2.99x` |
+| `[2,4096,8,128]` | `6.92 ms` | `4.38 ms` | `6.85 ms` | `2.29 ms` | `2.99x` |
+
+`nblk` is picked per shape (one head per block while the heads fit in the 24
+AICs, two above), worth ~4% on `[2,4096,8]` and 25% on `[1,8192,32]` relative
+to the wrong choice; `KDA_PERSIST_LOOP_BLOCKS` overrides it.
 
 Output and final state are bit-identical to `separated` (`0.0` / `0.0` maximum
 absolute difference) at `[1,64,2]`, `[1,1024,32]`, `[1,2048,32]`,

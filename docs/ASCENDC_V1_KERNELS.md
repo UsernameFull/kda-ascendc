@@ -203,6 +203,12 @@ per-launch and per-stage latency, not by FLOPs:
     subcores setting and waiting the same ids is stable on this runtime. The
     stall of the deleted loop was not a property of "long cross-core loops" as
     such.
+  - `nblk` is chosen per shape: one head per block while `bh <= 24` (the AIC
+    count) is ~4% faster (`[2,4096,8]` 4.55 -> 4.38 ms), and two heads per
+    block above that, because 32 blocks on 24 AICs queue a second wave
+    (`[1,8192,32]` 13.8 -> 17.2 ms).  `KDA_PERSIST_LOOP_BLOCKS` overrides it
+    for experiments; the kernel requires `nblk * 2 >= bh` or the head map is
+    not total.
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column
