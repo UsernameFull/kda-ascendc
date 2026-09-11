@@ -91,8 +91,13 @@ per-launch and per-stage latency, not by FLOPs:
   is *not* an option. Do not "optimize" the launch loop into a grid-stride
   loop over chunks: a multi-chunk version was measured 12% faster and produced
   stale-state results (2.4e-2 error).
-- 2048 launches alone cost ~5.7 ms (2.8 us each with an empty kernel), so
-  removing a launch is worth more than shaving a few instructions.
+- Launch dispatch is cheap at the block counts the K2 stages use: an empty
+  kernel costs ~2.8 us per launch for 1..256 blocks, so the 256 launches of a
+  `[1,8192,32]` pass only pay ~0.7 ms. The same empty kernel costs 22.9 us per
+  launch at 2048 blocks, i.e. the cost tracks the block count, not the launch
+  count - do not fuse stages to save launches, and measure any launch change
+  with a device event rather than host wall time (host issue is 13.9 ms of the
+  22.6 ms pass, well inside the device time).
 - Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
   result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
   wrong tile (3e-1 error).
