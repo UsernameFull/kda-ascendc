@@ -11,7 +11,8 @@ silently produces wrong numbers, so the contracts are spelled out here.
 |---|---|---|
 | `preprocess.cpp` | `kda_preprocess_kernel` | `Qn`/`Kn` (bf16, packed `[c,16,128]`), `Gate`, `Gc`, `Beta`, `Decay`, `Qg`, `Kg`, `Rk`, `Rv` |
 | `k1_gram.cpp` | `kda_gram_kernel` | `Aqk32`/`Aqk` bf16 `[c,16,16]`, `L` |
-| `k1_solve_wu.cpp` | `kda_solve_wu_kernel` | `A32`/`A16`, `W`, `U` |
+| `k1_solve_wu.cpp` | `kda_solve_wu_kernel` | `A32`/`A16` |
+| `k1_solve_wu_cube.cpp` | `kda_solve_wu_cube_kernel` | `W`, `U` |
 
 The preprocess kernel indexes the packed chunk-major layout, so `api.py` passes
 the `*_pack` tensors (`pack_tokens` / the beta permute), never the public
@@ -70,6 +71,16 @@ in `k2_d34` while the whole kernel only needs 3.4 ms. The 128-wide staging
 tiles (`W`, `Qg`, `S16`) do need `Nd2Nz` - a plain copy there silently loads
 the wrong operand layout (verified: d12 output moves by 7e-2).
 
+The B-operand rule above means a row-major `[16,128]` activation tile cannot be
+fed to `Mmad` directly - the fractal rows must be the n dimension. `Nd2Nz`
+cannot fix this on its own (it only moves whole 32-byte blocks, and swapping
+`dstNzC0Stride`/`dstNzNStride` gave a 3.7 error), but the B1->B2 transposing
+load can: `DataCopy(..., Nd2NzParams(1, 16, 128, 0, 128, 16, 1, 0))` stores the
+tile as eight 16x16 fractals, and `LoadDataWithTranspose(b, lb,
+LoadData2dTransposeParams(0, 8, 1, 0, 0))` transposes each of them into the zN
+operand. `kda_solve_wu_cube_kernel` uses exactly this, so `rk`/`rv` keep their
+natural layout and need no staging transpose.
+
 ### Performance notes
 
 `[1,8192,32]` (16384 chunks, 512 chunk steps x 4 launches) is dominated by
@@ -85,10 +96,11 @@ per-launch and per-stage latency, not by FLOPs:
 - Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
   result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
   wrong tile (3e-1 error).
-- The K1 `solve` kernel is the largest single kernel (~6.5 ms): a scalar
-  forward substitution plus a vector matvec whose per-row scalar broadcasts
-  dominate. Moving `w = A_inv @ rk` / `u = A_inv @ rv` to the Cube is the
-  obvious next step.
+- The K1 `solve` kernel used to be the largest single kernel (~6.5 ms): a
+  scalar forward substitution plus a vector matvec whose per-row scalar
+  broadcasts dominated. `w = A_inv @ rk` / `u = A_inv @ rv` now run on the
+  Cube (`kda_solve_wu_cube_kernel`), which took the stage from 5.9 ms to
+  3.3 ms; `W` is bit-identical to the vector path and `U` moves by 2.4e-4.
 
 ## Verification
 

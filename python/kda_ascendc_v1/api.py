@@ -61,6 +61,7 @@ def _compile_all() -> None:
         ("kernels/v1/preprocess.cpp", "kda_preprocess_kernel"),
         ("kernels/v1/k1_gram.cpp", "kda_gram_kernel"),
         ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
+        ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
         ("kernels/v1/k2_init.cpp", "kda_k2_init_kernel"),
         ("kernels/v1/k2_d12.cpp", "kda_k2_d12_kernel"),
         ("kernels/v1/k2_d12_cube.cpp", "kda_k2_d12_cube_kernel"),
@@ -238,9 +239,12 @@ def kda_bt16_fwd_ascendc(
     a16 = torch.empty_like(aqk16)
     W = torch.empty_like(q_pack)
     U = torch.empty_like(q_pack)
-    solve_args = _pack_ptrs([L, rk, rv, a32, a16, W, U]) + [_i(c)]
+    solve_args = _pack_ptrs([L, a32, a16]) + [_i(c)]
     mark("solve_start")
     _launch("kda_solve_wu_kernel", c, solve_args, stream)
+    # The Cube needs the bf16 A_inv the substitution just wrote, so the two
+    # launches stay ordered on the stream.
+    _launch("kda_solve_wu_cube_kernel", c, _pack_ptrs([a16, rk, rv, W, U]) + [_i(c)], stream)
     finish("solve_ms", "solve_start")
 
     if k2_mode == "persistent_scan_cube":
