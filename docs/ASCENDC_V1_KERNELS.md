@@ -408,6 +408,16 @@ per-launch and per-stage latency, not by FLOPs:
     of the loop moves the pass from 13.67 to 13.66 ms. The 64 tiny MTE ops are
     fully hidden behind the AIC's `d34`, so any replacement would be a rewrite
     for nothing. Measured, reverted, recorded here.
+  - The AIV's `v_new = u - d1` row loop is one instruction instead of sixteen
+    (`Sub(vf, vf[iv*BV], d1, BV, M, BinaryRepeatParams(1, 1, 1, 8, 16, 8))`:
+    the dst and the `d1` operand step by one 64-float row, the `u` operand by
+    one 128-float row).  Unlike the gather above this one is on the critical
+    path: K2 alone 4.666 -> 4.556 ms (three runs each) at `[1,8192,32]`
+    (`KDA_PROFILE=1`), bit-identical output, so `total_ms` 7.60 -> 7.46.
+    Merging the 64 staging `DataCopy`s of the same stage into four strided
+    ones (measured
+    together with it at 4.535 ms) is inside the +/-0.02 ms run-to-run noise of
+    the stage, so it was reverted.
   - A loop needs the *vector* side's WAR drains too, and they are not free to
     skip: every iteration reuses the same UB staging buffers (`ub`/`vf`/`vb`/
     `sc` in stage 2, `d2`/`d3`/`d4`/`dec`/`ob`/`s16` in stage 4) while the

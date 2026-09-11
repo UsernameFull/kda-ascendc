@@ -327,9 +327,11 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 WaitFlag<HardEvent::MTE2_V>(e2v);
                 Cast(vf, ub, RoundMode::CAST_NONE, M * D);
                 PipeBarrier<PIPE_V>();
-                for (int32_t i = 0; i < M; ++i) {
-                    Sub(vf[i * BV], vf[i * D + iv * BV], d1[i * BV], BV);
-                }
+                // v_new = u - d1 for all 16 rows in one instruction: the dst
+                // and the d1 operand step by one 64-float row (8 blocks), the
+                // u operand by one 128-float row of the fp32 tile.
+                Sub(vf, vf[iv * BV], d1, BV, M,
+                    BinaryRepeatParams(1, 1, 1, 8, 16, 8));
                 Cast(vb, vf, RoundMode::CAST_RINT, TILE);
                 PipeBarrier<PIPE_V>();
                 SetFlag<HardEvent::V_MTE2>(evm2);
