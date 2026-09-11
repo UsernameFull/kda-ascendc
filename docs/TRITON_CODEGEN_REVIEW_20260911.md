@@ -57,11 +57,13 @@ Triton pays 18.793 / 512 = **36.7 us**; we pay 13.95 / 512 = **27.2 us**.
 
 ## What is worth borrowing
 
-1. *Nothing structural.* The resident-state design is the whole point of their
-   K2 and it is still 35% slower per chunk than our four-launch chain with GM
-   round-trips.  With the `persistent_scan_cube` deadlock (see
-   `ASCENDC_V1_KERNELS.md`) this closes the "one MIX kernel per sequence"
-   line - do not restart it.
+1. *Nothing structural* - at the time this was written.  Their per-chunk K2
+   was 35% slower than our four-launch chain with GM round-trips, and the one
+   MIX-kernel-per-sequence attempt had deadlocked, so the line looked closed.
+   It is not: the schedule in `VLLM_ASCEND_KDA_REVIEW_20260911.md` restarts it
+   as `k2_mode="persistent_loop"`, which is now the fastest path in the repo
+   and beats this Triton reference end to end at every shape above `[1,32,2]`
+   (see the table at the end of this file).
 2. *Derive the second exponent from the resident tile.* We were re-reading
    `Gc` from GM in `k1_gram.cpp` (`ef` and `t0` both came from `Gc[x0]`).
    Removing the second 8 KB load per chunk measured 2.335 -> 2.334 ms, i.e.
@@ -89,3 +91,21 @@ Triton pays 18.793 / 512 = **36.7 us**; we pay 13.95 / 512 = **27.2 us**.
 exact (output/state delta 0.0) but gives **0.98x** (22.56 ms regular vs
 23.01 ms replay), so the pass is not host-launch-bound and the 2048 launches
 are not the thing to attack.
+
+## End-to-end vs Triton, after `persistent_loop`
+
+`tools/bench_modes_vs_triton.py` (2 warm-ups + 5 timed calls, median, same
+device, same inputs, output checked against the Triton path):
+
+| shape | `separated` | `persistent_loop` | Triton | `persistent_loop` vs Triton | out err vs Triton | state err |
+|---|---:|---:|---:|---:|---:|---:|
+| `[1,32,2,128]` | 0.401 ms | 0.349 ms | 0.259 ms | 0.74x (Triton wins) | 2.3e-05 | 2.4e-04 |
+| `[2,1024,4,128]` | 2.102 ms | 1.005 ms | 1.222 ms | 1.22x | 4.6e-05 | 4.2e-04 |
+| `[2,4096,8,128]` | 7.368 ms | 4.392 ms | 8.633 ms | 1.97x | 6.1e-05 | 2.4e-04 |
+| `[1,8192,32,128]` | 22.621 ms | 13.785 ms | 30.288 ms | 2.20x | 6.1e-05 | 4.1e-04 |
+
+Only the smallest shape still favours the reference (0.259 vs 0.349 ms, 26%),
+where the pass is dominated by fixed costs and the device-side chunk loop is
+pure overhead.  Everything else is now AscendC's: at `[1,8192,32]` the
+reference spends 11.09 ms in one 16384-block MIX K1 launch plus 18.79 ms in its
+resident-state K2 launch, against 8.3 ms and 5.29 ms for our K1 and K2.
