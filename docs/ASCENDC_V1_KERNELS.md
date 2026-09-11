@@ -149,17 +149,17 @@ per-launch and per-stage latency, not by FLOPs:
   1.3 ms. The prep is the part worth attacking (it computes `2^gc` and
   `2^-gc` from scratch even though `preprocess` already materialises the gated
   `Qg`/`Kg`).
-- K1 was retuned stage by stage and the pass went 14.00 -> 10.14 ms at
-  `[1,8192,32]` (`separated` 22.62 -> 19.00 ms) with the error against Triton
+- K1 was retuned stage by stage and the pass went 14.00 -> 9.70 ms at
+  `[1,8192,32]` (`separated` 22.62 -> 18.68 ms) with the error against Triton
   *unchanged to the digit* at every shape (`[1,8192,32]`: out 9.16e-05,
   state 4.50e-04; `[2,4096,8]`/`[3,2048,8]`/`[1,1024,32]`: out 6.10e-05).
   In-pipeline profile (`KDA_PROFILE=1`), HEAD -> now:
-  preprocess+gram 1.94 + 2.36 -> `pre_gram` 3.08, solve 3.29 -> 1.46 (AIV
+  preprocess+gram 1.94 + 2.36 -> `pre_gram` 2.67, solve 3.29 -> 1.46 (AIV
   2.44 -> 0.97 + Cube 0.90 -> 0.55), K2 incl. `kg_transpose` 5.42 -> 4.71;
-  `total_ms` 13.01 -> 9.26.  Isolated stage times on the current tree
+  `total_ms` 13.01 -> 8.83.  Isolated stage times on the current tree
   (`/tmp/kdaval/k1_one.py all`, best of 5): preprocess 1.96, gram 1.74,
   solve AIV 1.01, `kg_transpose` 0.16, solve Cube (NC=4) 0.55 ms; the same
-  harness on the *fused* kernel gives 3.11 ms.
+  harness on the *fused* kernel gives 2.75 ms.
   - `k1_gram.cpp` only builds the lower triangle (`rows = i + 1` passed to
     `Mul`/`MulAddDst`/`WholeReduceSum`, 136 row-passes instead of 256), uses
     `MulAddDst` for the second half product (the separate `Add` is gone) and
@@ -209,6 +209,28 @@ per-launch and per-stage latency, not by FLOPs:
     two `Exp` passes are free and the 15-step cumsum is 0.07 ms; ~140 vector
     instructions per block (~80 of them the per-row `Muls`/`Sub`/`Duplicate`
     passes) against a ~1 us/block fixed cost is where the rest is.
+    - Per-row scalars are broadcast with `Brcb` instead of a 16-iteration
+      `Muls`/`Duplicate` loop that read each scalar back with `GetValue`.
+      `Brcb(dst, src, 2, BrcbRepeatParams(1, 8))` turns the 16 values into a
+      tile where every row owns eight 32B blocks; the consumer then runs 64
+      lanes x 16 repeats with `BinaryRepeatParams(1, 1, 0, 16, 16, 1)` (repeat
+      strides are in 32B blocks, so `src1RepStride = 1` walks one scalar per
+      repeat while `dstRepStride = 16` walks the 128-lane rows), once for the
+      low half and once for the high half of each row.  Applied to the l2 norms
+      (q and k), `beta` (also consumed by the Gram's `K` half, which is now
+      pre-scaled once instead of per row) and the chunk-centred gate, this
+      removes 68 vector instructions and 64 scalar `GetValue` reads per block:
+      3.114 -> 2.679 ms at `[1,8192,32]` and 1.590 -> 1.373 ms at
+      `[1,4096,32]`, bit-identical on all 13 outputs (`0.000e+00`).
+      Two things that do *not* work here: a constant operand in the first
+      position with `src0RepStride = 0` (silently wrong, unlike the
+      `src1RepStride = 0` broadcast the bias add already uses), and
+      `BrcbRepeatParams(8, 64)` for a 64-copies-per-row tile.  The kernel was
+      re-profiled after the change (`msprof --aic-metrics=PipeUtilization`,
+      `/tmp/kdaval/prof_pregram.py`): 3079 -> 2707 us, `aiv_vec_ratio`
+      0.716 -> 0.686, `aiv_scalar_ratio` 0.309 -> 0.223, `aiv_mte2_ratio`
+      0.104 -> 0.119, total AIV cycles 265.6M -> 233.5M, so the win is real
+      issue-bound work and the stage is still VEC bound (69%).
     - The fused body is *compiler fragile* and must not be reformatted: the
       same arithmetic written slightly differently trips `aivec error` (mte
       error info `0x8030860ef`, "address for the scalar to access the internal
@@ -259,7 +281,7 @@ per-launch and per-stage latency, not by FLOPs:
   Output and
   state are bit-identical to `separated` (`0.0` / `0.0`) at every shape tested
   and K2 is now one launch instead of 2048. What remains of the pass is K1
-  (`pre_gram` 3.08 + solve 1.46 + `kg_transpose` 0.16 ms, after the K1 retune
+  (`pre_gram` 2.67 + solve 1.46 + `kg_transpose` 0.16 ms, after the K1 retune
   below), so the next lever is no longer the K2 launch count.
   - The loop only became reliable once the AIC keeps a `PipeBarrier<PIPE_ALL>`
     after each stage's `FIX_M` wait, exactly like the per-chunk

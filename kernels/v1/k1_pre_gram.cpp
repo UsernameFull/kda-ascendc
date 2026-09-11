@@ -16,6 +16,16 @@
 // The GM copies of Qn/Kn/Gate/Gc are debug-only and skipped when the pointer
 // is null ("api.py" passes them only for "return_intermediates").
 //
+// Per-row scalars (the l2 norms, beta, the chunk-centred gate) are broadcast
+// with "Brcb" instead of a 16-iteration "Muls"/"Duplicate" loop: Brcb turns the
+// 16 values into a tile with eight 32B blocks per row, and the consumer then
+// runs 64 lanes x 16 repeats with "src1RepStride = 1" block (i.e. one scalar
+// per repeat; "dstRepStride = 16" blocks walks the 128-lane rows), once for the
+// low half and once for the high half.  That is 3 instructions instead of 16
+// plus the 16 scalar "GetValue" reads, and it is bit-identical (measured
+// max(abs(diff)) = 0.000e+00 on all 13 outputs): 3.114 -> 2.679 ms at
+// [1,8192,32] and 1.590 -> 1.373 ms at [1,4096,32].
+//
 // NOTE: the body below is sensitive to how it is written - an equivalent
 // rewrite that only reformats the buffer declarations or moves the
 // "PipeBarrier<PIPE_V>" after the gate re-centring loop trips an aivec error
@@ -161,11 +171,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     WaitFlag<HardEvent::V_S>(evs);
     Adds(red, red, EPS, M);
     Rsqrt(red, red, M);
-    SetFlag<HardEvent::V_S>(evs);
-    WaitFlag<HardEvent::V_S>(evs);
-    for (int32_t i = 0; i < M; ++i) {
-        Muls(qf[i * D], qf[i * D], red.GetValue(i), D);
-    }
+    PipeBarrier<PIPE_V>();
+    Brcb(red[64], red, 2, BrcbRepeatParams(1, 8));
+    PipeBarrier<PIPE_V>();
+    Mul(qf, qf, red[64], 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(qf[64], qf[64], red[64], 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
     Cast(qnb, qf, RoundMode::CAST_RINT, N);
     PipeBarrier<PIPE_V>();
@@ -185,11 +195,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     WaitFlag<HardEvent::V_S>(evs);
     Adds(red, red, EPS, M);
     Rsqrt(red, red, M);
-    SetFlag<HardEvent::V_S>(evs);
-    WaitFlag<HardEvent::V_S>(evs);
-    for (int32_t i = 0; i < M; ++i) {
-        Muls(kf[i * D], kf[i * D], red.GetValue(i), D);
-    }
+    PipeBarrier<PIPE_V>();
+    Brcb(red[64], red, 2, BrcbRepeatParams(1, 8));
+    PipeBarrier<PIPE_V>();
+    Mul(kf, kf, red[64], 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(kf[64], kf[64], red[64], 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
     Cast(knb, kf, RoundMode::CAST_RINT, N);
     PipeBarrier<PIPE_V>();
@@ -248,9 +258,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     PipeBarrier<PIPE_ALL>();
 
     // ---- gc = gate - gate[mid] ------------------------------------------
-    for (int32_t i = 0; i < M; ++i) {
-        Sub(zz[i * D], gf[i * D], gf[8 * D], D);
-    }
+    Sub(zz, gf, gf[8 * D], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Sub(zz[64], gf[64], gf[8 * D + 64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
     if (pGc != nullptr) {
         SetFlag<HardEvent::V_MTE3>(ev3);
         WaitFlag<HardEvent::V_MTE3>(ev3);
@@ -264,11 +273,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     PipeBarrier<PIPE_V>();
 
     // ---- beta broadcast over the D axis ---------------------------------
-    SetFlag<HardEvent::V_S>(evs);
-    WaitFlag<HardEvent::V_S>(evs);
-    for (int32_t i = 0; i < M; ++i) {
-        Duplicate(bb[i * 64], beta.GetValue(i), 64);
-    }
+    PipeBarrier<PIPE_V>();
+    Brcb(bb, beta, 2, BrcbRepeatParams(1, 8));
     PipeBarrier<PIPE_V>();
 
     // ---- qg = qn * exp2(gate) --------------------------------------------
@@ -280,8 +286,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     // ---- rk = kn * beta * exp2(gate) -------------------------------------
     Mul(t2, kf, ef, N);
     PipeBarrier<PIPE_V>();
-    Mul(t2, t2, bb, 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 8));
-    Mul(t2[64], t2[64], bb, 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 8));
+    Mul(t2, t2, bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(t2[64], t2[64], bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
     Cast(rkb, t2, RoundMode::CAST_RINT, N);
     PipeBarrier<PIPE_V>();
@@ -289,16 +295,16 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     // ---- rv = v * beta ---------------------------------------------------
     Cast(t2, rvb, RoundMode::CAST_NONE, N);
     PipeBarrier<PIPE_V>();
-    Mul(t2, t2, bb, 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 8));
-    Mul(t2[64], t2[64], bb, 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 8));
+    Mul(t2, t2, bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(t2[64], t2[64], bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
     Cast(rvb, t2, RoundMode::CAST_RINT, N);
     PipeBarrier<PIPE_V>();
 
     // ---- kg = kn * exp2(gate_last - gate) --------------------------------
-    for (int32_t i = 0; i < M; ++i) {
-        Sub(t2[i * D], gf[15 * D], gf[i * D], D);
-    }
+    Sub(t2, gf, gf[15 * D], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Sub(t2[64], gf[64], gf[15 * D + 64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Muls(t2, t2, -1.0f, N);
     PipeBarrier<PIPE_V>();
     Muls(t2, t2, LN2, N);
     Exp(t2, t2, N);
@@ -319,6 +325,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     Mul(gk1, kf, gef, N);
     Mul(gb, kf, gefn, N);
     PipeBarrier<PIPE_V>();
+    Mul(gk1, gk1, bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(gk1[64], gk1[64], bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    PipeBarrier<PIPE_V>();
     DataCopy(gmaskS, MaskS[0], DataCopyParams(M, 2, 0, 0));
     DataCopy(gmaskL, MaskL[0], DataCopyParams(M, 2, 0, 0));
     SetFlag<HardEvent::MTE2_V>(e2v);
@@ -332,9 +341,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
         PipeBarrier<PIPE_V>();
         RowDot(redA[i * M], gtb, rows);
         PipeBarrier<PIPE_V>();
-        Muls(gtb, gk1[i * D], beta.GetValue(i), D);
-        PipeBarrier<PIPE_V>();
-        RowBroadcastMul(gtb, gtb, gb, rows);
+        RowBroadcastMul(gtb, gk1[i * D], gb, rows);
         PipeBarrier<PIPE_V>();
         RowDot(redK[i * M], gtb, rows);
         PipeBarrier<PIPE_V>();
