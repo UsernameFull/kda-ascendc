@@ -46,8 +46,17 @@ Update 2026-09-11: the stall is confirmed and the loop was removed. Wiring the
 single-kernel loop into `kda_bt16_fwd_ascendc` and launching it directly never
 returns on this CANN runtime (killed after 150 s at `[1,8192,32]` and after
 100 s at `[1,64,2]`); the public `persistent_scan_cube` mode is served by
-`kda_k2_mix_all_cube` and measures 79.2 ms at `[1,8192,32]` against 22.7 ms for
-`separated`, i.e. today's fastest Cube path is the separated one.
+`kda_k2_mix_all_cube`, which measures 24.8 ms at `[1,8192,32]` after the idiom
+port in `docs/VLLM_ASCEND_KDA_REVIEW_20260911.md`, against 22.7 ms for
+`separated`, i.e. today's fastest Cube path is still the separated one.
+
+Update 2026-09-11 (second): the vllm-ascend review explains why the deleted loop
+stalled and what a correct device-side loop looks like - iteration-invariant
+cross-core protocol, pipeline prologue pushed by pre-set flags, one set/one wait
+per stage per iteration with flag ids <= 7, and `CrossCoreFlagWithReverse<16>`
+whenever a stage can run ahead. Restarting the persistent line means adopting
+that protocol (plus two interleaved tasks per core), not just looping the
+existing one-chunk kernel.
 
 Synchronized wall-clock medians on Ascend910_9382:
 

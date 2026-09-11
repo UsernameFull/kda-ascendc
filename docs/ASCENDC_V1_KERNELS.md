@@ -149,16 +149,23 @@ per-launch and per-stage latency, not by FLOPs:
   pay 0.39 ms of aclnn permute/copy kernels per pass.
 - `persistent_scan_cube` is *not* a persistent kernel: `api.py` remaps the name
   onto the fused per-chunk `kda_k2_mix_all_cube`, which still launches once per
-  chunk (512 launches instead of 2048). Measured 2026-09-11 at `[1,8192,32]`:
-  `mix_all_cube` 79.2 ms against `separated` 22.7 ms, so the fusion is 3.5x
-  *slower* and the 2048 -> 512 launch saving does not pay for the lost
-  per-stage parallelism. A single-kernel MIX loop (`k2_persistent_scan_cube.cpp`)
-  was deleted in the same pass: it deadlocks on this CANN runtime (launching it
-  directly never returns - killed after 150 s at `[1,8192,32]` and after 100 s
-  at `[1,64,2]`, where the public mode needs 79 ms and tens of microseconds
-  respectively), so the earlier "3504 ms -> 79 ms for the mode" note was
-  comparing the dead kernel with the live `mix_all_cube` path, not measuring
-  the same thing. Do not restart this line.
+  chunk (512 launches instead of 2048). A single-kernel MIX loop
+  (`k2_persistent_scan_cube.cpp`) was deleted: it never returned on this CANN
+  runtime (killed after 150 s at `[1,8192,32]` and after 100 s at `[1,64,2]`),
+  so the earlier "3504 ms -> 79 ms for the mode" note compared the dead kernel
+  with the live `mix_all_cube` path.  See
+  `docs/VLLM_ASCEND_KDA_REVIEW_20260911.md` for the cross-core flag rules that
+  loop violated and for the schedule to use when it is restarted.
+- `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
+  `[1,8192,32]`) only because it never got the idioms the separated kernels
+  had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column
+  operands, a fused d34 AIC stage, UB `Transpose` for `v_new^T`, two-repeat
+  `Mul` for the state update) takes the mode to 24.75 ms against `separated`
+  22.67 ms with identical numerics.  Fusion still loses, but by 9% rather than
+  3.5x, and the lesson is that the 2048-launch chain is not launch-bound: per
+  chunk the separated path spends 27 us and the fused path 32 us for a few
+  microseconds of matmul.  `mix_aic_1_2` (36.3 ms) and `mix_d12_vnew` (74.6 ms)
+  still carry per-fractal `Fixpipe` calls and have not been ported.
 - Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
   result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
   wrong tile (3e-1 error).

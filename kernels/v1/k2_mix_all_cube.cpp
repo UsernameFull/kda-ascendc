@@ -68,11 +68,11 @@ static __aicore__ inline void run_d12_aic(
         Mmad(l0c, l0a, l0b, MmadParams(M, N, D, 0, false, true));
         SetFlag<HardEvent::M_FIX>(evmfix);
         WaitFlag<HardEvent::M_FIX>(evmfix);
-        for (int32_t nb = 0; nb < 4; ++nb) {
-            auto ip = FixpipeParamsV220(M, N / 4, 1, N, false);
+        {
+            auto ip = FixpipeParamsV220(N, M, 16, N, false);
             ip.quantPre = QuantMode_t::NoQuant;
             ip.unitFlag = 0;
-            Fixpipe<float, float, CFG_ROW_MAJOR>(D1[o0 + nb * M], l0c[nb * M * (N / 4)], ip);
+            Fixpipe<float, float, CFG_ROW_MAJOR>(D1[o0], l0c, ip);
         }
         SetFlag<HardEvent::FIX_M>(evfixm);
         WaitFlag<HardEvent::FIX_M>(evfixm);
@@ -95,11 +95,11 @@ static __aicore__ inline void run_d12_aic(
         Mmad(l0c, l0a, l0b, MmadParams(M, N, D, 0, false, true));
         SetFlag<HardEvent::M_FIX>(evmfix);
         WaitFlag<HardEvent::M_FIX>(evmfix);
-        for (int32_t nb = 0; nb < 4; ++nb) {
-            auto ip = FixpipeParamsV220(M, N / 4, 1, N, false);
+        {
+            auto ip = FixpipeParamsV220(N, M, 16, N, false);
             ip.quantPre = QuantMode_t::NoQuant;
             ip.unitFlag = 0;
-            Fixpipe<float, float, CFG_ROW_MAJOR>(D2[o0 + nb * M], l0c[nb * M * (N / 4)], ip);
+            Fixpipe<float, float, CFG_ROW_MAJOR>(D2[o0], l0c, ip);
         }
         SetFlag<HardEvent::FIX_M>(evfixm);
         WaitFlag<HardEvent::FIX_M>(evfixm);
@@ -126,11 +126,13 @@ static __aicore__ inline void run_vnew_aiv(
     TPipe pipe;
     TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
     TEventID ev3 = pipe.AllocEventID<HardEvent::V_MTE3>();
-    TBuf<TPosition::VECCALC> uu, ud, uv, ut, uf;
+    TEventID evm2 = pipe.AllocEventID<HardEvent::V_MTE2>();
+    TBuf<TPosition::VECCALC> uu, ud, uv, ut, uf, usc;
     pipe.InitBuffer(uu, M * D * sizeof(bfloat16_t));
     pipe.InitBuffer(ud, TILE * sizeof(float));
     pipe.InitBuffer(uv, TILE * sizeof(bfloat16_t));
     pipe.InitBuffer(ut, TILE * sizeof(bfloat16_t));
+    pipe.InitBuffer(usc, (BV / M) * M * M * sizeof(bfloat16_t));
     // Keep the full U row tile in FP32. The old standalone kernel allocated
     // only TILE floats but cast M*D values into it before slicing the tile.
     pipe.InitBuffer(uf, M * D * sizeof(float));
@@ -138,6 +140,7 @@ static __aicore__ inline void run_vnew_aiv(
     LocalTensor<bfloat16_t> ub = uu.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> vb = uv.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> vt = ut.Get<bfloat16_t>();
+    LocalTensor<bfloat16_t> sc = usc.Get<bfloat16_t>();
     LocalTensor<float> d = ud.Get<float>();
     LocalTensor<float> vf = uf.Get<float>();
     GlobalTensor<bfloat16_t> U, V, Vt;
@@ -160,11 +163,21 @@ static __aicore__ inline void run_vnew_aiv(
     }
     Cast(vb, vf, RoundMode::CAST_RINT, TILE);
     PipeBarrier<PIPE_V>();
-    for (int32_t v = 0; v < BV; ++v) {
-        for (int32_t i = 0; i < M; ++i) {
-            vt.SetValue(v * M + i, vb.GetValue(i * BV + v));
+    // v_new^T via the UB 16x16 transpose unit: gather the four column blocks
+    // of v_new into contiguous 16x16 tiles, transpose, then store 64 rows.
+    SetFlag<HardEvent::V_MTE2>(evm2);
+    WaitFlag<HardEvent::V_MTE2>(evm2);
+    for (int32_t bl = 0; bl < BV / M; ++bl) {
+        for (int32_t r = 0; r < M; ++r) {
+            DataCopy(sc[bl * M * M + r * M], vb[r * BV + bl * M], DataCopyParams(1, 1, 0, 0));
         }
     }
+    SetFlag<HardEvent::MTE2_V>(e2v);
+    WaitFlag<HardEvent::MTE2_V>(e2v);
+    for (int32_t bl = 0; bl < BV / M; ++bl) {
+        AscendC::Transpose(vt[bl * M * M], sc[bl * M * M]);
+    }
+    PipeBarrier<PIPE_V>();
     SetFlag<HardEvent::V_MTE3>(ev3);
     WaitFlag<HardEvent::V_MTE3>(ev3);
     DataCopy(V[out0], vb, DataCopyParams(M, 4, 0, 0));
@@ -172,148 +185,108 @@ static __aicore__ inline void run_vnew_aiv(
     PipeBarrier<PIPE_ALL>();
 }
 
-static __aicore__ inline void run_d3_aic(
-    GM_ADDR pAqk, GM_ADDR pVnewT, GM_ADDR pD3,
-    int32_t BH, int32_t NT, int32_t chunk) {
+// One AIC block stages Aqk, both v_new^T tiles and kg^T once, then issues all
+// ten Mmads (eight 16-row d4 groups plus the two d3 tiles) back to back and
+// drains the M/FIX pipes once.  Like the rest of this kernel it assumes
+// NV == 2 (V == 128 with BV == 64), so the whole d4 tile is 8 16-row groups.
+static __aicore__ inline void run_d34_aic(
+    GM_ADDR pAqk, GM_ADDR pVnewT, GM_ADDR pKgT, GM_ADDR pD3, GM_ADDR pD4,
+    int32_t BH, int32_t NT, int32_t NV, int32_t chunk, int32_t d4_reuse) {
     int32_t bh = GetBlockIdx();
     if (bh >= BH) {
         return;
     }
+    int32_t c = bh * NT + chunk;
     constexpr int32_t N3 = 64;
+    constexpr int32_t NG = 2 * BV / M;          // 16-row groups in the whole d4 tile
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
     TEventID emf = pipe.AllocEventID<HardEvent::M_FIX>();
     TEventID efm = pipe.AllocEventID<HardEvent::FIX_M>();
-    TQue<QuePosition::B1, 1> qa, qb;
+    TQue<QuePosition::B1, 1> qa, qv, qk;
     pipe.InitBuffer(qa, 1, M * K * 2);
-    pipe.InitBuffer(qb, 1, BV * K * 2);
+    pipe.InitBuffer(qv, 1, NV * BV * K * 2);
+    pipe.InitBuffer(qk, 1, D * K * 2);
     TQue<QuePosition::CO1, 1> qc;
-    pipe.InitBuffer(qc, 1, M * D * 4);
+    pipe.InitBuffer(qc, 1, NG * M * N_D4 * 4 + NV * M * N3 * 4);
     LocalTensor<float> cf = qc.AllocTensor<float>();
-    LocalTensor<uint8_t> a8(TPosition::A2, 0, M * K * 2);
-    LocalTensor<uint8_t> b8(TPosition::B2, 0, BV * K * 2);
+    LocalTensor<uint8_t> a8(TPosition::A2, 0, (NG + 1) * M * K * 2);
+    LocalTensor<uint8_t> b8(TPosition::B2, 0, (D + NV * BV) * K * 2);
     LocalTensor<bfloat16_t> a = a8.ReinterpretCast<bfloat16_t>();
     LocalTensor<bfloat16_t> b = b8.ReinterpretCast<bfloat16_t>();
-    GlobalTensor<bfloat16_t> Aqk, Vt;
-    GlobalTensor<float> D3;
+    GlobalTensor<bfloat16_t> Aqk, Vt, Kt;
+    GlobalTensor<float> D3, D4;
     Aqk.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pAqk));
     Vt.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnewT));
-    D3.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD3));
-    int32_t c = bh * NT + chunk;
-    for (int iv = 0; iv < 2; ++iv) {
-        int32_t task = bh * 2 + iv;
-        auto la = qa.AllocTensor<bfloat16_t>();
-        auto lb = qb.AllocTensor<bfloat16_t>();
-        DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K],
-                 Nd2NzParams(1, M, K, 0, K, M, 1, 0));
-        DataCopy(lb, Vt[(static_cast<uint64_t>(task) * NT + chunk) * BV * K],
-                 Nd2NzParams(1, BV, K, 0, K, BV, 1, 0));
-        SetFlag<HardEvent::MTE2_MTE1>(e21);
-        WaitFlag<HardEvent::MTE2_MTE1>(e21);
-        qa.EnQue(la);
-        qb.EnQue(lb);
-        la = qa.DeQue<bfloat16_t>();
-        lb = qb.DeQue<bfloat16_t>();
-        LoadData(a, la, LoadData2dParams(0, 1, 1, 0, 0, false, 0));
-        LoadData(b, lb, LoadData2dParams(0, 4, 1, 0, 0, false, 0));
-        SetFlag<HardEvent::MTE1_M>(e1m);
-        WaitFlag<HardEvent::MTE1_M>(e1m);
-        Mmad(cf, a, b, MmadParams(M, N3, K, 0, false, true));
-        SetFlag<HardEvent::M_FIX>(emf);
-        WaitFlag<HardEvent::M_FIX>(emf);
-        for (int nb = 0; nb < 4; ++nb) {
-            auto ip = FixpipeParamsV220(M, M, 1, N3, false);
-            ip.quantPre = QuantMode_t::NoQuant;
-            ip.unitFlag = 0;
-            Fixpipe<float, float, CFG_ROW_MAJOR>(
-                D3[(static_cast<uint64_t>(task) * NT + chunk) * M * BV + nb * M],
-                cf[nb * 256], ip);
-        }
-        SetFlag<HardEvent::FIX_M>(efm);
-        WaitFlag<HardEvent::FIX_M>(efm);
-        qa.FreeTensor(la);
-        qb.FreeTensor(lb);
-        PipeBarrier<PIPE_ALL>();
-    }
-    qc.FreeTensor(cf);
-}
-
-static __aicore__ inline void run_d4_aic(
-    GM_ADDR pVnewT, GM_ADDR pKgT, GM_ADDR pD4,
-    int32_t BH, int32_t NT, int32_t chunk, int32_t d4_reuse) {
-    int32_t bh = GetBlockIdx();
-    if (bh >= BH) {
-        return;
-    }
-    int32_t c = bh * NT + chunk;
-
-    TPipe pipe;
-    TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
-    TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
-    TEventID emf = pipe.AllocEventID<HardEvent::M_FIX>();
-    TEventID efm = pipe.AllocEventID<HardEvent::FIX_M>();
-
-    TQue<QuePosition::B1, 1> qa, qb;
-    pipe.InitBuffer(qa, 1, M * K * 2);
-    pipe.InitBuffer(qb, 1, D * K * 2);
-    TQue<QuePosition::CO1, 1> qc;
-    pipe.InitBuffer(qc, 1, M * N_D4 * 4);
-
-    LocalTensor<float> cf = qc.AllocTensor<float>();
-    LocalTensor<uint8_t> a8(TPosition::A2, 0, M * K * 2);
-    LocalTensor<uint8_t> b8(TPosition::B2, 0, D * K * 2);
-    LocalTensor<bfloat16_t> a = a8.ReinterpretCast<bfloat16_t>();
-    LocalTensor<bfloat16_t> b = b8.ReinterpretCast<bfloat16_t>();
-
-    GlobalTensor<bfloat16_t> Vt;
-    GlobalTensor<bfloat16_t> Kt;
-    GlobalTensor<float> D4;
-    Vt.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnewT));
     Kt.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pKgT));
+    D3.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD3));
     D4.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD4));
 
-    for (int mb = 0; mb < 8; ++mb) {
-        int iv = mb / 4;
-        int rr = mb % 4;
-        uint64_t ao = (static_cast<uint64_t>(bh * 2 + iv) * NT + chunk) *
-                          64 * M + static_cast<uint64_t>(rr) * M * K;
-        auto la = qa.AllocTensor<bfloat16_t>();
-        auto lb = qb.AllocTensor<bfloat16_t>();
-        DataCopy(la, Vt[ao], Nd2NzParams(1, M, K, 0, K, M, 1, 0));
-        DataCopy(lb, Kt[static_cast<uint64_t>(c) * D * K],
-                 Nd2NzParams(1, D, K, 0, K, D, 1, 0));
-        SetFlag<HardEvent::MTE2_MTE1>(e21);
-        WaitFlag<HardEvent::MTE2_MTE1>(e21);
-        qa.EnQue(la);
-        qb.EnQue(lb);
-        la = qa.DeQue<bfloat16_t>();
-        lb = qb.DeQue<bfloat16_t>();
-        LoadData(a, la, LoadData2dParams(0, 1, 1, 0, 0, false, 0));
-        LoadData(b, lb, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
-        SetFlag<HardEvent::MTE1_M>(e1m);
-        WaitFlag<HardEvent::MTE1_M>(e1m);
-        Mmad(cf, a, b, MmadParams(M, N_D4, K, 0, false, true));
-        SetFlag<HardEvent::M_FIX>(emf);
-        WaitFlag<HardEvent::M_FIX>(emf);
-        uint64_t d4c = d4_reuse != 0 ? static_cast<uint64_t>(bh) : static_cast<uint64_t>(c);
-        for (int nb = 0; nb < 8; ++nb) {
-            auto ip = FixpipeParamsV220(M, M, 1, N_D4, false);
-            ip.quantPre = QuantMode_t::NoQuant;
-            ip.unitFlag = 0;
-            Fixpipe<float, float, CFG_ROW_MAJOR>(
-                D4[d4c * D * D + mb * M * D + nb * M],
-                cf[nb * 256], ip);
-        }
-        SetFlag<HardEvent::FIX_M>(efm);
-        WaitFlag<HardEvent::FIX_M>(efm);
-        qa.FreeTensor(la);
-        qb.FreeTensor(lb);
-        PipeBarrier<PIPE_ALL>();
+    // 16-column operands: the ND layout already is the NZ layout the Cube
+    // wants, so plain burst copies into L1 replace the Nd2Nz descriptors.
+    auto la = qa.AllocTensor<bfloat16_t>();
+    auto lv = qv.AllocTensor<bfloat16_t>();
+    auto lk = qk.AllocTensor<bfloat16_t>();
+    DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
+    for (int32_t iv = 0; iv < NV; ++iv) {
+        int32_t task = bh * NV + iv;
+        DataCopy(lv[iv * BV * K], Vt[(static_cast<uint64_t>(task) * NT + chunk) * BV * K], BV * K);
     }
+    DataCopy(lk, Kt[static_cast<uint64_t>(c) * D * K], D * K);
+    SetFlag<HardEvent::MTE2_MTE1>(e21);
+    WaitFlag<HardEvent::MTE2_MTE1>(e21);
+    qa.EnQue(la);
+    qv.EnQue(lv);
+    qk.EnQue(lk);
+    la = qa.DeQue<bfloat16_t>();
+    lv = qv.DeQue<bfloat16_t>();
+    lk = qk.DeQue<bfloat16_t>();
+
+    LoadData(a, lv, LoadData2dParams(0, NG, 1, 0, 0, false, 0));
+    LoadData(a[NG * M * K], la, LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+    LoadData(b, lk, LoadData2dParams(0, D / M, 1, 0, 0, false, 0));
+    for (int32_t iv = 0; iv < NV; ++iv) {
+        LoadData(b[D * K + iv * BV * K], lv[iv * BV * K], LoadData2dParams(0, BV / M, 1, 0, 0, false, 0));
+    }
+    SetFlag<HardEvent::MTE1_M>(e1m);
+    WaitFlag<HardEvent::MTE1_M>(e1m);
+
+    // d4 = v_new^T @ kg, one 16 x 128 C tile per 16-row group.
+    for (int32_t g = 0; g < NG; ++g) {
+        Mmad(cf[g * M * N_D4], a[g * M * K], b, MmadParams(M, N_D4, K, 0, false, true));
+    }
+    // d3[i][v] = Aqk[i][j] v_new[j][v] for each value tile.
+    for (int32_t iv = 0; iv < NV; ++iv) {
+        Mmad(cf[NG * M * N_D4 + iv * M * N3], a[NG * M * K], b[D * K + iv * BV * K],
+             MmadParams(M, N3, K, 0, false, true));
+    }
+    SetFlag<HardEvent::M_FIX>(emf);
+    WaitFlag<HardEvent::M_FIX>(emf);
+
+    uint64_t d4c = d4_reuse != 0 ? static_cast<uint64_t>(bh) : static_cast<uint64_t>(c);
+    for (int32_t g = 0; g < NG; ++g) {
+        auto ip = FixpipeParamsV220(N_D4, M, 16, N_D4, false);
+        ip.quantPre = QuantMode_t::NoQuant;
+        ip.unitFlag = 0;
+        Fixpipe<float, float, CFG_ROW_MAJOR>(D4[d4c * D * D + static_cast<uint64_t>(g) * M * D],
+                                             cf[g * M * N_D4], ip);
+    }
+    for (int32_t iv = 0; iv < NV; ++iv) {
+        auto ip = FixpipeParamsV220(N3, M, 16, N3, false);
+        ip.quantPre = QuantMode_t::NoQuant;
+        ip.unitFlag = 0;
+        Fixpipe<float, float, CFG_ROW_MAJOR>(
+            D3[(static_cast<uint64_t>(bh * NV + iv) * NT + chunk) * M * BV],
+            cf[NG * M * N_D4 + iv * M * N3], ip);
+    }
+    SetFlag<HardEvent::FIX_M>(efm);
+    WaitFlag<HardEvent::FIX_M>(efm);
+    qa.FreeTensor(la);
+    qv.FreeTensor(lv);
+    qk.FreeTensor(lk);
     qc.FreeTensor(cf);
 }
-
 
 static __aicore__ inline void run_outstate_aiv(
     GM_ADDR pd2, GM_ADDR pd3, GM_ADDR pd4, GM_ADDR pS32, GM_ADDR pS16,
@@ -380,10 +353,11 @@ static __aicore__ inline void run_outstate_aiv(
     Cast(ob, of, RoundMode::CAST_RINT, TILE);
     PipeBarrier<PIPE_V>();
 
-    for (int32_t v = 0; v < BV; ++v) {
-        Mul(s[v * D], s[v * D], dec, D);
-        Add(s[v * D], s[v * D], d4[v * D], D);
-    }
+    // s[v][k] = s[v][k]*dec[k] + d4[v][k] in two strided Mul repeats (the
+    // decay vector is reused with a zero source-repeat stride).
+    Mul(s, s, dec, 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Mul(s[64], s[64], dec[64], 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Add(s, s, d4, BV * D);
     Cast(s16, s, RoundMode::CAST_RINT, BV * D);
     PipeBarrier<PIPE_V>();
 
@@ -410,8 +384,7 @@ extern "C" __global__ __aicore__ void kda_k2_mix_all_cube(
         run_d12_aic(pW, pQg, pS16, pD1, pD2, BH, NT, NV, chunk);
         CrossCoreSetFlag<2, PIPE_FIX>(8);
         CrossCoreWaitFlag(9);
-        run_d3_aic(pAqk, pVnewT, pD3, BH, NT, chunk);
-        run_d4_aic(pVnewT, pKgT, pD4, BH, NT, chunk, d4_reuse);
+        run_d34_aic(pAqk, pVnewT, pKgT, pD3, pD4, BH, NT, NV, chunk, d4_reuse);
         CrossCoreSetFlag<2, PIPE_FIX>(10);
     }
     if ASCEND_IS_AIV {
