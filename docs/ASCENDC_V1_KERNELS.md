@@ -215,6 +215,17 @@ per-launch and per-stage latency, not by FLOPs:
     of the loop moves the pass from 13.67 to 13.66 ms. The 64 tiny MTE ops are
     fully hidden behind the AIC's `d34`, so any replacement would be a rewrite
     for nothing. Measured, reverted, recorded here.
+  - A loop needs the *vector* side's WAR drains too, and they are not free to
+    skip: every iteration reuses the same UB staging buffers (`ub`/`vf`/`vb`/
+    `sc` in stage 2, `d2`/`d3`/`d4`/`dec`/`ob`/`s16` in stage 4) while the
+    previous iteration's reads and MTE3 copies out of them may still be in
+    flight. Without a `PipeBarrier<PIPE_ALL>` after each `CrossCoreWaitFlag`,
+    the *output* drifts by ~6e-3 at `[1,8192,32]` while the state stays
+    bit-identical, and the first launch of a process differs from all later
+    ones (the staging buffers are `torch.empty`). The one-chunk-per-launch
+    kernels can never show this. Cost of the two drains: 13.66 vs 13.67 ms,
+    i.e. nothing, because the `S16`/`Out` MTE3 copies already gate the flag
+    that follows them.
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column

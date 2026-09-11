@@ -314,6 +314,11 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const int32_t task = bh * nv + iv;
                 const int32_t c = bh * NT + chunk;
                 CrossCoreWaitFlag(FL_C1);
+                // The previous iteration's vector work may still be reading the
+                // UB staging buffers (ub/vf/vb/sc) that this iteration loads
+                // into.  A one-chunk-per-launch kernel never sees this WAR
+                // hazard; a loop does.
+                PipeBarrier<PIPE_ALL>();
                 const uint64_t u0 = static_cast<uint64_t>(c) * M * D;
                 const uint64_t out0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
                 DataCopy(ub, U[u0], DataCopyParams(M, 8, 0, 0));
@@ -352,6 +357,10 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const int32_t task = bh * nv + iv;
                 const int32_t c = bh * NT + chunk;
                 CrossCoreWaitFlag(FL_C2);
+                // Same WAR hazard as stage 2: d2/d3/d4/dec, ob and s16 are all
+                // rewritten here while the previous iteration's reads of them
+                // (and its MTE3 copies out of ob/s16) may still be in flight.
+                PipeBarrier<PIPE_ALL>();
                 LocalTensor<float> state = st[s * S_TILE];
                 const uint64_t t0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
                 const uint64_t d4base = static_cast<uint64_t>(bh) * D * D +

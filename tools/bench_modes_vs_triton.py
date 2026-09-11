@@ -26,7 +26,7 @@ D = 128
 WARM = int(os.environ.get('BENCH_WARM', '1'))
 REPS = int(os.environ.get('BENCH_REPS', '3'))
 MODES = ['separated', 'cube_separated', 'cube_full_d4', 'mix_d12_vnew', 'mix_aic_1_2',
-         'persistent', 'persistent_scan', 'triton_aiv']
+         'persistent_scan_cube', 'persistent_loop']
 
 
 def sync():

@@ -47,3 +47,21 @@ def test_persistent_loop_matches_separated(b, t, h):
     state_err = float((state.float() - ref_state.float()).abs().max().cpu())
     assert out_err < 1e-3, out_err
     assert state_err < 1e-4, state_err
+
+
+@pytest.mark.npu
+def test_persistent_loop_is_deterministic_across_launches():
+    """Every iteration reuses the same UB staging buffers, so a missed
+    write-after-read drain shows up as a launch-order-dependent output."""
+    torch.npu.set_device(0)
+    device = torch.device("npu:0")
+    q, k, v, g, beta, a_log, bias, initial_state = _inputs(1, 512, 8, 128, device, seed=240912)
+    kw = dict(A_log=a_log, bias=bias, lower_bound=-1.0,
+              initial_state=initial_state, output_final_state=True)
+    first_out, first_state = kda_bt16_fwd_ascendc(q, k, v, g, beta, k2_mode="persistent_loop", **kw)
+    torch.npu.synchronize()
+    for _ in range(3):
+        out, state = kda_bt16_fwd_ascendc(q, k, v, g, beta, k2_mode="persistent_loop", **kw)
+        torch.npu.synchronize()
+        assert torch.equal(out, first_out)
+        assert torch.equal(state, first_state)
