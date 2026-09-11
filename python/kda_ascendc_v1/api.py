@@ -244,9 +244,16 @@ def kda_bt16_fwd_ascendc(
                            gate if keep else None, gc if keep else None,
                            beta_out, decay, rk, rv, qg, kg,
                            aqk32, aqk16, L, mask_s, mask_l])
-    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale)]
+    # One block walks `pre_unroll` consecutive chunks.  The stage is issue-bound
+    # and pays a fixed per-block setup cost, so unrolling is worth 8-12% from a
+    # few hundred chunks up (measured 2.679 -> 2.342 ms at [1,8192,32]); it is
+    # capped at 8 chunks so at least ~256 blocks stay in flight, and tiny grids
+    # (fewer than 256 chunks) stay at 1 because the loop wrapper itself costs a
+    # few percent there.
+    pre_unroll = 1 if c < 256 else min(8, max(2, c // 512))
+    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll)]
     mark("pre_gram_start")
-    _launch("kda_pre_gram_kernel", c, pre_args, stream)
+    _launch("kda_pre_gram_kernel", (c + pre_unroll - 1) // pre_unroll, pre_args, stream)
     finish("pre_gram_ms", "pre_gram_start")
 
     a32 = torch.empty_like(aqk32)

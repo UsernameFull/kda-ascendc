@@ -39,6 +39,15 @@
 //   * the two "V_S" sync pairs around the l2 norms are dead (nothing reads
 //     those reductions with the scalar unit any more) and cost ~2%.
 //
+// The block walks `unroll` consecutive chunks (the body is byte-identical,
+// just wrapped in the loop) because the whole kernel is issue-bound and every
+// block pays a fixed setup cost worth ~10% of one chunk's work: 2.679 ->
+// 2.342 ms at [1,8192,32] with unroll 8, 0.333 -> 0.308 ms at [1,1024,32]
+// with unroll 4, 0.0953 -> 0.0932 ms at [2,1024,4] with unroll 2, all
+// bit-identical.  Back-to-back-launch measurements (host launch overhead
+// hidden) put the optimum at >= 256 blocks; at chunk counts under 256 the
+// loop wrapper itself costs ~6%, so `api.py` leaves those at unroll 1.
+//
 // NOTE: the body below is sensitive to how it is written - an equivalent
 // rewrite that only reformats the buffer declarations or moves the
 // "PipeBarrier<PIPE_V>" after the gate re-centring loop trips an aivec error
@@ -81,13 +90,10 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     GM_ADDR pQn, GM_ADDR pKn, GM_ADDR pGate, GM_ADDR pGc, GM_ADDR pBetaOut,
     GM_ADDR pDecay, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pQg, GM_ADDR pKg,
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
-    int32_t B, int32_t T, int32_t H, float lower_bound, float scale) {
+    int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const int32_t nt = T / M;
-    const int32_t c = GetBlockIdx();
-    if (c >= B * H * nt) return;
-    const int32_t bh = c / nt;
-    const int32_t head = bh % H;
+    const int32_t nchunk = B * H * nt;
 
     TPipe pipe;
     TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
@@ -167,6 +173,16 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     L.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pL));
     MaskS.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pMaskS));
     MaskL.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pMaskL));
+    // One block walks `unroll` consecutive chunks: the kernel is issue-bound
+    // (~40 cycles per vector instruction) and pays a fixed per-block cost that
+    // is a tenth of a block's work, so amortizing it over 2-8 chunks is worth
+    // 2.68 -> 2.34 ms at [1,8192,32] (unroll 8) with the body unchanged and
+    // bit-identical output.  `api.py` picks the unroll from the chunk count.
+    for (int32_t u = 0; u < unroll; ++u) {
+    const int32_t c = GetBlockIdx() * unroll + u;
+    if (c >= nchunk) break;
+    const int32_t bh = c / nt;
+    const int32_t head = bh % H;
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     const uint64_t x0 = static_cast<uint64_t>(c) * N;
     const uint64_t cm = static_cast<uint64_t>(c) * M;
@@ -389,4 +405,5 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     DataCopy(L[m0], gl32, DataCopyParams(M, 2, 0, 0));
     DataCopy(Aqk16[m0], ga16, DataCopyParams(M, 1, 0, 0));
     PipeBarrier<PIPE_ALL>();
+    }
 }

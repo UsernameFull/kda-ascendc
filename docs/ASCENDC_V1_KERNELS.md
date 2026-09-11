@@ -149,17 +149,17 @@ per-launch and per-stage latency, not by FLOPs:
   1.3 ms. The prep is the part worth attacking (it computes `2^gc` and
   `2^-gc` from scratch even though `preprocess` already materialises the gated
   `Qg`/`Kg`).
-- K1 was retuned stage by stage and the pass went 14.00 -> 9.70 ms at
-  `[1,8192,32]` (`separated` 22.62 -> 18.68 ms) with the error against Triton
-  *unchanged to the digit* at every shape (`[1,8192,32]`: out 9.16e-05,
-  state 4.50e-04; `[2,4096,8]`/`[3,2048,8]`/`[1,1024,32]`: out 6.10e-05).
+- K1 was retuned stage by stage and the pass went 14.00 -> 9.35 ms at
+  `[1,8192,32]` (`separated` 22.62 -> 18.16 ms) with the error against Triton
+  *unchanged to the digit* at every shape (`[1,8192,32]`: out 6.10e-05,
+  state 4.12e-04; `[2,4096,8]`/`[3,2048,8]`/`[1,1024,32]`: out 6.10e-05).
   In-pipeline profile (`KDA_PROFILE=1`), HEAD -> now:
-  preprocess+gram 1.94 + 2.36 -> `pre_gram` 2.67, solve 3.29 -> 1.46 (AIV
+  preprocess+gram 1.94 + 2.36 -> `pre_gram` 2.31, solve 3.29 -> 1.46 (AIV
   2.44 -> 0.97 + Cube 0.90 -> 0.55), K2 incl. `kg_transpose` 5.42 -> 4.71;
-  `total_ms` 13.01 -> 8.83.  Isolated stage times on the current tree
+  `total_ms` 13.01 -> 8.48.  Isolated stage times on the current tree
   (`/tmp/kdaval/k1_one.py all`, best of 5): preprocess 1.96, gram 1.74,
   solve AIV 1.01, `kg_transpose` 0.16, solve Cube (NC=4) 0.55 ms; the same
-  harness on the *fused* kernel gives 2.75 ms.
+  harness on the *fused* kernel gives 2.34 ms.
   - `k1_gram.cpp` only builds the lower triangle (`rows = i + 1` passed to
     `Mul`/`MulAddDst`/`WholeReduceSum`, 136 row-passes instead of 256), uses
     `MulAddDst` for the second half product (the separate `Add` is gone) and
@@ -258,6 +258,17 @@ per-launch and per-stage latency, not by FLOPs:
       only 0.03 ms), and `Muls` for `Rsqrt` (no change).  Removing every
       input `DataCopy` and every store of the pack chains are the two big
       levers that remain: 2.69 -> 2.49 and 2.69 -> 2.39 ms respectively.
+    - One block walks `unroll` consecutive chunks (the body is byte-identical,
+      just wrapped in a runtime-bound loop; `api.py` picks `unroll =
+      clamp(c // 512, 2, 8)`, or 1 below 256 chunks).  Every block pays a fixed
+      setup cost worth ~10% of a chunk's work, and back-to-back launches (host
+      overhead hidden) put the optimum at >= 256 blocks: 2.593 -> 2.342 ms at
+      `[1,8192,32]` (unroll 8, 2048 blocks), 0.333 -> 0.308 ms at
+      `[1,1024,32]` (unroll 4, 512 blocks), 0.0953 -> 0.0932 ms at
+      `[2,1024,4]` (unroll 2, 256 blocks), all bit-identical, while unroll 8
+      at `[2,1024,4]` (64 blocks) *loses* 16% to wave quantization.  Under 256
+      chunks the loop wrapper itself costs ~6% and the policy keeps unroll 1.
+      In-pipeline this is `pre_gram` 2.59 -> 2.31 ms, `total_ms` 8.83 -> 8.48.
     - The fused body is *compiler fragile* and must not be reformatted: the
       same arithmetic written slightly differently trips `aivec error` (mte
       error info `0x8030860ef`, "address for the scalar to access the internal
@@ -308,7 +319,7 @@ per-launch and per-stage latency, not by FLOPs:
   Output and
   state are bit-identical to `separated` (`0.0` / `0.0`) at every shape tested
   and K2 is now one launch instead of 2048. What remains of the pass is K1
-  (`pre_gram` 2.67 + solve 1.46 + `kg_transpose` 0.16 ms, after the K1 retune
+  (`pre_gram` 2.31 + solve 1.46 + `kg_transpose` 0.16 ms, after the K1 retune
   below), so the next lever is no longer the K2 launch count.
   - The loop only became reliable once the AIC keeps a `PipeBarrier<PIPE_ALL>`
     after each stage's `FIX_M` wait, exactly like the per-chunk
