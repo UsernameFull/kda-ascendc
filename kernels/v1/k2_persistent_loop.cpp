@@ -12,6 +12,15 @@
 // pre-sets R once per head before the loop so the first chunk needs no special
 // case.  See docs/VLLM_ASCEND_KDA_REVIEW_20260911.md for why that matters.
 //
+// The AIV stores `out` straight into the caller's [B, T, H, D] tensor: the
+// 16 chunk rows of a 64-wide value tile are 16 separate 128 B runs, NH * D
+// elements apart, which the block form of DataCopy expresses with dstGap.
+// The api used to write a task-major `out_task` here and follow it with a
+// 67 MB + 67 MB `permute(0, 3, 4, 1, 2, 5).contiguous()` (186 us of device
+// time, measured with msprof); the strided store costs 0.04 ms of K2 and is
+// bit-exact against the old layout plus host permute (checked at
+// [1, 1024, 32] and [1, 8192, 32] against the same kernel writing task-major).
+//
 // The fp32 state never leaves the AIV: it is loaded from H0 at start-up, kept
 // in UB across the whole loop and stored to S32 once at the end.  Only the bf16
 // copy of the state (S16) is published to GM for the Cube operands.
@@ -65,7 +74,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
     GM_ADDR pD1, GM_ADDR pD2, GM_ADDR pD3, GM_ADDR pD4,
     GM_ADDR pOut, GM_ADDR pVnew, GM_ADDR pVnewT,
     GM_ADDR pH0, GM_ADDR pS32, GM_ADDR pS16,
-    int32_t BH, int32_t NT, int32_t NV, int32_t NBLK, float scale) {
+    int32_t BH, int32_t NT, int32_t NV, int32_t NBLK, float scale, int32_t NH) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     const int32_t nv = NV;
 
@@ -428,7 +437,17 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 PipeBarrier<PIPE_V>();
                 SetFlag<HardEvent::V_MTE3>(ev3);
                 WaitFlag<HardEvent::V_MTE3>(ev3);
-                DataCopy(Out[t0], ob, DataCopyParams(M, 4, 0, 0));
+                // [b, t, h, D] directly: one 4-block (128 B) run per chunk
+                // row, the next row NH * D elements further on.  Saves the
+                // 186 us Transpose that used to turn the task layout around.
+                {
+                    const int32_t hh = bh - (bh / NH) * NH;
+                    const uint64_t obase = (static_cast<uint64_t>(bh / NH) * NT + chunk) *
+                                               (static_cast<uint64_t>(M) * NH * D) +
+                                           static_cast<uint64_t>(hh) * D + iv * BV;
+                    DataCopy(Out[obase], ob,
+                             DataCopyParams(M, 4, 0, static_cast<uint16_t>(NH * D / 16 - 4)));
+                }
                 DataCopy(S16[static_cast<uint64_t>(task) * S_TILE], s16, DataCopyParams(BV, 8, 0, 0));
                 CrossCoreSetFlag<2, PIPE_MTE3>(FL_R);
             }

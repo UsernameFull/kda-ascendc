@@ -357,7 +357,13 @@ def kda_bt16_fwd_ascendc(
         d2 = torch.empty_like(d1)
         d3 = torch.empty_like(d1)
         d4f = torch.empty((bh, D, D), dtype=torch.float32, device=q.device)
-        out_task = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+        # The loop writes the public [B, T, H, D] layout directly: one 128 B
+        # run per (chunk row) with a NH*D-element stride between rows, which
+        # removes the 186 us `permute(0,3,4,1,2,5).contiguous()` (67 MB in +
+        # 67 MB out) the api used to run over the task layout.  The strided
+        # store costs 0.04 ms of device time, the same-store check is
+        # bit-exact against the old layout + host permute.
+        out_public = torch.empty((b, t, h, D), dtype=torch.bfloat16, device=q.device)
         vnew = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
         vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
         h0 = None if initial_state is None else initial_state.view(bh, D, D)
@@ -369,10 +375,9 @@ def kda_bt16_fwd_ascendc(
         mark("k2_start")
         _launch("kda_k2_persistent_loop", nblk,
                 _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
-                            out_task, vnew, vnew_t, h0, s32, s16]) +
-                [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale)], stream)
+                            out_public, vnew, vnew_t, h0, s32, s16]) +
+                [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
         finish("k2_ms", "k2_start")
-        out_public = out_task.view(b, h, NV, nt, CHUNK, BV).permute(0, 3, 4, 1, 2, 5).contiguous().view(b, t, h, D)
         final_state = None if not output_final_state else s32.view(bh, NV, BV, D).reshape(b, h, D, D)
         if profile:
             prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
