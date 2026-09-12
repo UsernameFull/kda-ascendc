@@ -99,17 +99,18 @@ device, same inputs, output checked against the Triton path):
 
 | shape | `separated` | `persistent_loop` | Triton | `persistent_loop` vs Triton | out err vs Triton | state err |
 |---|---:|---:|---:|---:|---:|---:|
-| `[1,32,2,128]` | 0.409 ms | 0.360 ms | 0.246 ms | 0.68x (Triton wins) | 2.3e-05 | 2.4e-04 |
-| `[2,1024,4,128]` | 2.113 ms | 0.844 ms | 1.219 ms | 1.44x | 4.6e-05 | 4.2e-04 |
-| `[1,1024,32,128]` | 2.283 ms | 1.175 ms | 4.002 ms | 3.41x | 6.1e-05 | 4.0e-04 |
-| `[3,2048,8,128]` | 3.862 ms | 1.915 ms | 6.207 ms | 3.24x | 9.2e-05 | 4.0e-04 |
-| `[2,4096,8,128]` | 7.015 ms | 3.115 ms | 8.644 ms | 2.78x | 6.1e-05 | 3.2e-04 |
-| `[1,8192,32,128]` | 17.333 ms | 8.413 ms | 30.276 ms | 3.60x | 6.1e-05 | 5.5e-04 |
+| `[1,32,2,128]` | 0.415 ms | 0.339 ms | 0.268 ms | 0.79x (Triton wins) | 2.3e-05 | 2.4e-04 |
+| `[2,1024,4,128]` | 1.979 ms | 0.775 ms | 1.208 ms | 1.56x | 4.6e-05 | 4.2e-04 |
+| `[1,1024,32,128]` | 2.265 ms | 1.075 ms | 3.988 ms | 3.71x | 6.1e-05 | 4.1e-04 |
+| `[3,2048,8,128]` | 3.679 ms | 1.739 ms | 6.179 ms | 3.55x | 6.1e-05 | 5.1e-04 |
+| `[2,4096,8,128]` | 7.123 ms | 2.820 ms | 8.616 ms | 3.06x | 6.1e-05 | 2.4e-04 |
+| `[1,8192,32,128]` | 17.293 ms | 7.547 ms | 30.238 ms | **4.01x** | 6.1e-05 | 4.1e-04 |
 
 (Re-measured after the four instruction cuts in the fused kernel, the wide
 solve of `k1_solve_wu_wide.cpp` and the persistent loop's merged `v_new` row
-loop; the solve stage alone went 1.47 -> 0.65 ms at `[1,8192,32]`), on top of
-the three
+loop and merged `d4` tile: the table above is the merged-`d4` run, worth
+8.413 -> 7.547 ms at `[1,8192,32]`, while the solve stage alone went
+1.47 -> 0.65 ms), on top of the three
 `pre_gram` changes
 (fusing preprocess with the Gram build, replacing the per-row scalar loops
 with `Brcb`, then hiding the load/store latencies behind the compute and

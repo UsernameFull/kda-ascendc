@@ -181,24 +181,27 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 }
                 SetFlag<HardEvent::MTE1_M>(e1m);
                 WaitFlag<HardEvent::MTE1_M>(e1m);
-                // L0C and L0B/L0A are free again once the d12 fixpipes retired.
-                for (int32_t g = 0; g < NG; ++g) {
-                    Mmad(cf[g * M * N_D4], l0a[g * M * K], l0b,
-                         MmadParams(M, N_D4, K, 0, false, true));
-                }
+                // L0C, L0A and L0B are free again once the d12 fixpipes
+                // retired (stage 1 ends with an FIX_M wait and a barrier).
+                // One 128 x 128 Mmad and one Fixpipe write the whole d4 tile:
+                // a single Mmad leaves L0C as one contiguous run of 16 x 16 C0
+                // fractals - the walk srcStride = mSize describes - while the
+                // eight 16-row Mmads of the old form wrote one m-major band
+                // per group that no srcStride can read back.  Bit-exact
+                // against the eight-call form (hardware probe + full pass).
+                Mmad(cf, l0a, l0b, MmadParams(NG * M, N_D4, K, 0, false, true));
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     Mmad(cf[NG * M * N_D4 + iv * M * N], l0a[NG * M * K],
                          l0b[D * K + iv * BV * K], MmadParams(M, N, K, 0, false, true));
                 }
                 SetFlag<HardEvent::M_FIX>(emf);
                 WaitFlag<HardEvent::M_FIX>(emf);
-                for (int32_t g = 0; g < NG; ++g) {
-                    auto ip = FixpipeParamsV220(N_D4, M, 16, N_D4, false);
+                {
+                    auto ip = FixpipeParamsV220(N_D4, NG * M, NG * M, N_D4, false);
                     ip.quantPre = QuantMode_t::NoQuant;
                     ip.unitFlag = 0;
                     Fixpipe<float, float, CFG_ROW_MAJOR>(
-                        D4[static_cast<uint64_t>(bh) * D * D + static_cast<uint64_t>(g) * M * D],
-                        cf[g * M * N_D4], ip);
+                        D4[static_cast<uint64_t>(bh) * D * D], cf[0], ip);
                 }
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     auto ip = FixpipeParamsV220(N, M, 16, N, false);

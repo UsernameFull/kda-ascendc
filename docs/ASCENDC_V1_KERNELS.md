@@ -422,6 +422,20 @@ per-launch and per-stage latency, not by FLOPs:
     (`[1,8192,32]` 13.8 -> 17.2 ms).  `KDA_PERSIST_LOOP_BLOCKS` overrides it
     for experiments; the kernel requires `nblk * 2 >= bh` or the head map is
     not total.
+  - The `d4` store is one `128 x 128` `Mmad` plus one `Fixpipe` per head and
+    chunk instead of eight `16 x 128` pairs.  A `Fixpipe` whose `mSize`
+    exceeds 16 walks L0C as one contiguous run of `16 x 16` C0 fractals, which
+    is exactly the layout a *single* `Mmad` writes, so `srcStride = mSize` is
+    the rule describing that walk; the eight `Mmad`s of the old form each
+    wrote their own m-major band of the same region, and no `srcStride` can
+    read that back (a probe kernel - one-, two-, four-band and single-`Mmad`
+    dumps against the eight-call reference - is bit-exact only for the
+    single-`Mmad` form).  Worth 8.41 -> 7.51 ms end to end at `[1,8192,32]`
+    (median of 30 interleaved runs: 7.58/8.42/8.36 per round before,
+    7.51/7.50/7.54 after) even though the isolated device time barely moves
+    (`msprof` op summary: K2 3.59 -> 3.53 ms): the eight-call form falls into a
+    second mode where `k2_ms` sits at 4.5-4.7 ms instead of 3.7 ms and the
+    merge removes it.  Output and state stay bit-identical (`0.000e+00`).
   - The AIV's `v_new^T` build (64 one-block `DataCopy` gathers + four 16x16
     `Transpose`s per head and chunk) looks like the obvious next target and is
     *not* worth attacking: stubbing the gather, the transpose and the store out
@@ -461,7 +475,9 @@ per-launch and per-stage latency, not by FLOPs:
   still carry per-fractal `Fixpipe` calls and have not been ported.
 - Each 16-row `Fixpipe` is ~6 us per launch; batch per tile, but check the
   result - a single 64x128 `Fixpipe` with `srcStride = 16` silently produced a
-  wrong tile (3e-1 error).
+  wrong tile (3e-1 error).  The reason is now known: a merged tile is walked as
+  contiguous C0 fractals, i.e. `srcStride = mSize`, so the 16-row stride is
+  only right when `mSize == 16`.  See the `d4` note under `persistent_loop`.
 - The K1 `solve` kernel used to be the largest single kernel (~6.5 ms): a
   scalar forward substitution plus a vector matvec whose per-row scalar
   broadcasts dominated. `w = A_inv @ rk` / `u = A_inv @ rv` now run on the
