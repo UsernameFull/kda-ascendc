@@ -730,6 +730,29 @@ per-launch and per-stage latency, not by FLOPs:
   wrong tile (3e-1 error).  The reason is now known: a merged tile is walked as
   contiguous C0 fractals, i.e. `srcStride = mSize`, so the 16-row stride is
   only right when `mSize == 16`.  See the `d4` note under `persistent_loop`.
+- 2026-09-12: the "moving the Gram to the Cube is a wash at ~370 GB/s"
+  argument above is wrong about the cost side, even though its conclusion may
+  still hold for a different reason.  `pre_gram`'s MTE pipes are nearly idle
+  (msprof: `aiv_mte2_ratio 0.066`, `aiv_vec_ratio 0.845`), so extra GM stores
+  are almost free: adding `k` dummy 4 KB `DataCopy(Qn[...], qnb, ...)` stores
+  per chunk and timing 10 back-to-back launches at `[1,8192,32]`
+  (`/tmp/kdaval/prestore.py`, MIN, distinct addresses) gives 2.212 ms at
+  `k = 0`, 2.227 at 1, 2.259 at 6, 2.301 at 12 and 2.350 at 18 - i.e. the
+  24 KB per chunk a `ga/gk1/gb` publish needs costs **0.047 ms**, not the
+  ~2 ms an 800 MB round trip at 370 GB/s would suggest.  The marginal store
+  is still ~8 ns at `k = 18` (1.2 GB of extra traffic in 2.35 ms), so the
+  traffic is not what limits this.  What does limit it is the handshake: the
+  AIV would have to wait for the AIC's `redA`/`redK` before its mask/cast
+  stores every chunk (2 cross-core hops, ~0.47 us each when nothing else
+  runs, see the `persistent_loop` notes), and a naive (non-pipelined) split
+  pays ~0.16 ms of exposed latency per core per pass against the ~0.75 ms the
+  Gram loop costs on the AIV.  A software-pipelined split - the AIV publishes
+  chunk `u+1`'s operands while the AIC finishes chunk `u`, and the wait sits
+  just before the mask step - is the one shape that could bank the ~0.5 ms.
+  Worth building; measured with `kda_solve_wu_cube` as the per-chunk AIC
+  throughput reference (682 chunks per AIC core in 0.53 ms = 0.78 us/chunk
+  for 2 loads, 2 `Mmad`s and 2 `Fixpipe`s, so the Gram's 2 `Mmad`s fit under
+  the AIV's ~1.5 ms even at 683 chunks per core).
 - The K1 `solve` kernel used to be the largest single kernel (~6.5 ms): a
   scalar forward substitution plus a vector matvec whose per-row scalar
   broadcasts dominated. `w = A_inv @ rk` / `u = A_inv @ rv` now run on the
