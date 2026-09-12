@@ -545,6 +545,51 @@ per-launch and per-stage latency, not by FLOPs:
     (~6 us per chunk at `nh = 2`, 3.2 ms over 512 chunks) with all of the work
     hidden inside it - which is why removing work, flags or traffic changes
     almost nothing, and why the loop is at the limit of this structure.
+  - Dropping the four-phase protocol to two (`flag_now.py` `KINDS=2p`, same
+    probe, `NT = 512, NBLK = 16, NH = 2`) costs 0.960 ms against 1.887: the
+    handshake count, not the work, is what the loop spends.  But a two-phase
+    *algorithm* needs the AIC to produce both `out = (Qg*scale - Aqk@W) @ S16^T
+    + Aqk@u` and `d4 = u^T@kg - S16@(W^T@kg)` from `S16` alone, i.e. a
+    `P = W^T@kg` operand of 128x128 bf16 (32 KB per chunk-head).  A Cube
+    result cannot re-enter a Cube matmul as an operand on this part - there is
+    no on-chip L0C -> L0A/L0B route, which is exactly why the current design
+    sends `v_new^T` through GM *and the AIV* - so `P` would have to be built
+    by a Cube kernel, stored and re-read: 1 GB of traffic per `[1,8192,32]`
+    pass for 0.93 ms of handshakes.  Dropped; the four hops stay.
+  - The handshake itself cannot be made cheaper on this board.  The FFTS
+    arrive mode is the only knob: `CrossCoreSetFlag<0, ...>` (inter) and
+    `<1, ...>` (subblock) both *hang* the probe - only mode 2 (block) reaches
+    the waiting core - and the cheap intra-block path
+    (`set_intra_block`/`wait_intra_block`, the `modeId == 4` branch of
+    `NotifyEventImpl`) is compiled only for `__NPU_ARCH__ == 3510`.  This part
+    is `NpuArch 2201` with `cube_vector_combine = split`
+    (`data/platform_config/Ascend910_9382.ini`), i.e. the AIC is not coupled
+    to its two AIVs, so every handshake goes `ffts_cross_core_sync` ->
+    `wait_flag_dev`.  `msprof --aic-metrics=PipeUtilization` puts the same
+    wall in pipe terms: `aiv_scalar_ratio 0.898` against `aiv_vec_ratio 0.406`
+    (AIV ScalarBound, i.e. blocked in the waits) and `aic_fixpipe_ratio 0.45`,
+    `aic_mte2_ratio 0.32` with `cube_utilization 65%`.
+  - Every AIV-side change is free and every AIC-side drain is not: deleting
+    the AIV's entire stage-2 phase is worth 3.183 -> 3.156 and stage-4
+    3.147 (both 3.103), so the AIV has ~0.1 us per chunk-head of issue to
+    give.  The AIC's two `PipeBarrier<PIPE_ALL>()` are the one drain that was
+    avoidable: the hazard they cover is "stage 1's `Mmad`s are still reading
+    L0A/L0B when stage 3's `LoadData` rewrites them" (the L0C WAR is already
+    covered by the `FIX_M` pair), so `PipeBarrier<PIPE_M>` - drain the Mmad
+    pipe only, not the `Fixpipe` writes to GM - is enough: K2 3.184 -> 3.031 ms
+    (MIN of 7; medians 3.195 -> 3.044) with the pytest gate green, and the
+    e2e pass at `[1,8192,32]` 6.336 -> 6.236 ms (4.86x Triton 30.29).  The
+    textbook `SetFlag/WaitFlag<HardEvent::M_MTE1>` form of the same dependency
+    *deadlocks* the launch when it is loop-carried (wait in stage 3 for the
+    event stage 1 set, one iteration back), so the pipe barrier is the form
+    that works here.
+  - The opposite direction is a trap: dropping *both* the hand-rolled
+    `MTE2_MTE1` event and the depth-one queue's `EnQue`/`DeQue` (they drain the
+    same load twice) is worth 3.213 -> 3.031 ms - the same as the `PIPE_M`
+    change - but it leaves `MTE1` free to read L1 before `MTE2` has written
+    it: `tests/test_persistent_loop.py` reports 6.9e-3 `out_err` and non-finite
+    output on two of three shapes.  Reverted; either drain alone is worth
+    0.00 ms, so exactly one of the two must stay.
   - Measured and rejected: coalescing those four per-head flag phases into one
     per chunk (guard each wait with `s == 0` and each set with
     `s == nh - 1`, the natural reading of "the unit of the protocol is a

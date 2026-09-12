@@ -167,9 +167,12 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 qw.FreeTensor(lw);
                 qg.FreeTensor(lg);
                 qs.FreeTensor(ls);
-                // L0A/L0B/L0C are reused by the next stage on this same core;
-                // the FIX_M event alone is not enough on this runtime.
-                PipeBarrier<PIPE_ALL>();
+                // L0A/L0B/L0C are reused by the next stage on this same core,
+                // and the FIX_M event only covers L0C.  The L0A/L0B WAR is an
+                // Mmad-read vs LoadData-write hazard, so draining the Mmad pipe
+                // is enough: a full PIPE_ALL drain also waits for the d1/d2
+                // Fixpipe writes to reach GM, which is worth 0.15 ms of K2.
+                PipeBarrier<PIPE_M>();
                 CrossCoreSetFlag<2, PIPE_FIX>(FL_C1);
             }
             // ---- stage 3: d3 = Aqk @ v_new, d4 = v_new^T @ kg for every head
@@ -240,7 +243,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 qa.FreeTensor(la);
                 qv.FreeTensor(lv);
                 qk.FreeTensor(lk);
-                PipeBarrier<PIPE_ALL>();
+                PipeBarrier<PIPE_M>();
                 CrossCoreSetFlag<2, PIPE_FIX>(FL_C2);
             }
         }
