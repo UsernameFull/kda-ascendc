@@ -155,9 +155,9 @@ per-launch and per-stage latency, not by FLOPs:
   *unchanged to the digit* at every shape (`[1,8192,32]`: out 6.10e-05,
   state 4.12e-04; `[2,4096,8]`/`[3,2048,8]`/`[1,1024,32]`: out 6.10e-05).
   In-pipeline profile (`KDA_PROFILE=1`), HEAD -> now:
-  preprocess+gram 1.94 + 2.36 -> `pre_gram` 2.29, solve 3.29 -> 0.65 (AIV
+  preprocess+gram 1.94 + 2.36 -> `pre_gram` 2.24, solve 3.29 -> 0.65 (AIV
   2.44 -> 0.97 -> 0.10 + Cube 0.90 -> 0.55), K2 incl. `kg_transpose` 5.42 ->
-  4.71; `total_ms` 13.01 -> 7.60.  Isolated stage times on the current tree
+  4.71; `total_ms` 13.01 -> 7.43.  Isolated stage times on the current tree
   (`/tmp/kdaval/k1_one.py all`, best of 5): preprocess 1.96, gram 1.74,
   solve AIV 1.01 -> 0.10 (wide kernel, `check_solve.py`), `kg_transpose`
   0.16, solve Cube (NC=4) 0.55 ms; the same
@@ -331,6 +331,26 @@ per-launch and per-stage latency, not by FLOPs:
       4/16/32 (worse than 8), and moving the Gram to the Cube (24 KB per
       chunk of extra GM traffic each way for ~4.7k of ~13.7k core cycles, a
       wash at ~370 GB/s).
+    - The one `PipeBarrier<PIPE_ALL>` left on the fused fast path guards the
+      `Decay` store, because `t2` is reused by the `qg` product a few
+      instructions later; that needs only the MTE3->V half of the barrier
+      (`SetFlag<HardEvent::MTE3_V>` after the copy, `WaitFlag<HardEvent::MTE3_V>`
+      before the `Mul` that overwrites the tile).  Back-to-back 2.259 ->
+      2.209 ms at `[1,8192,32]` (R=10, unroll 8, bit-identical on all 13
+      outputs); in-pipeline `pre_gram` 2.285 -> 2.237 ms, `total_ms` 7.463 ->
+      7.433.  Measured and *not* shippable: deleting the tail
+      `PipeBarrier<PIPE_ALL>` as well is worth another 0.125 ms (2.259 ->
+      2.134 ms) but leaves the next chunk's `Q`/`K`/`V` loads racing the
+      previous chunk's `Qn`/`Kn`/`Rv`/`Aqk32`/`L`/`Aqk16` stores, and every
+      safe formulation of that sync hung the device on the *first* launch:
+      loop-carried `MTE3->MTE2` flags, and loop-carried `MTE3->V` flags waited
+      either at the top of the body or at the first write to a stored tile,
+      with or without the MTE3->MTE2 pair.  The same pattern runs in a toy
+      micro-kernel, the compiled code is the same size, and in-body flag pairs
+      (the `Decay` one above) work, so this is a property of the loop-carried
+      flag on this runtime rather than of the direction; the way to collect
+      that 0.125 ms is to make the loads and the stores stop sharing UB (a
+      double-buffered `TQue`), not to look for another flag.
     - The fused body is *compiler fragile* and must not be reformatted: the
       same arithmetic written slightly differently trips `aivec error` (mte
       error info `0x8030860ef`, "address for the scalar to access the internal

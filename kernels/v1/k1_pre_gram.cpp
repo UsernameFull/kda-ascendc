@@ -63,6 +63,23 @@
 //     "MaskS" tile no longer has to be fetched.  "MaskL" has to stay, because
 //     the K-side loop does write L's diagonal and the mask is what zeroes it.
 //
+// The one "PipeBarrier<PIPE_ALL>" left on the fast path (the "Gate"/"Gc" ones
+// only run when the caller asks for intermediates) guards the "Decay" store:
+// "t2" is reused by the "qg" product a few instructions later, so only the
+// MTE3->V half of it is needed - "SetFlag<HardEvent::MTE3_V>" after the copy,
+// "WaitFlag<HardEvent::MTE3_V>" before the "Mul" that overwrites the tile.
+// 2.259 -> 2.209 ms at [1,8192,32] (R=10, unroll 8, bit-identical), and
+// in-pipeline "pre_gram" 2.285 -> 2.237 ms of a 7.463 -> 7.433 ms pass.
+//
+// The tail "PipeBarrier<PIPE_ALL>" is the bigger prize (deleting it is 2.134
+// ms) but it has no flag formulation that survives this runtime: a
+// loop-carried "SetFlag"/"WaitFlag" pair - MTE3->MTE2, or MTE3->V waited at
+// the top of the body or at the first stored-tile write - hangs the *first*
+// launch, even though the same pattern runs in a toy micro-kernel, the
+// in-body pairs above are fine and the compiled code is the same size.  That
+// one needs the loads and the stores to stop sharing UB, i.e. a double
+// buffered TQue, not a flag.  See docs/ASCENDC_V1_KERNELS.md.
+//
 // Cost model from probes on this kernel (+8 instructions per chunk, launch
 // time at [1,8192,32]): +0.040 ms for 8 one-repeat "Adds" => ~27 cycles per
 // vector instruction, +0.056 ms for 8 "Mul"s with 16 repeats => ~0.6 cycles
@@ -138,6 +155,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     TEventID e2vs = pipe.AllocEventID<HardEvent::MTE2_V>();
     TEventID ev3 = pipe.AllocEventID<HardEvent::V_MTE3>();
     TEventID evs = pipe.AllocEventID<HardEvent::V_S>();
+    TEventID e3d = pipe.AllocEventID<HardEvent::MTE3_V>();
     TBuf<TPosition::VECCALC> bQf, bKf, bT0, bT2, bEf, bRed,
         bQnb, bKnb, bRkb, bRvb, bQgb, bKgb, bBias, bBeta, bBb, bAlog, bZz,
         bGef, bGefn, bGa, bGk1, bGb, bRedA, bRedK, bGmaskS, bGmaskL, bGtb, bGa32, bGl32, bGa16;
@@ -324,7 +342,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     SetFlag<HardEvent::V_MTE3>(ev3);
     WaitFlag<HardEvent::V_MTE3>(ev3);
     DataCopy(Decay[static_cast<uint64_t>(c) * D], t2, DataCopyParams(1, 16, 0, 0));
-    PipeBarrier<PIPE_ALL>();
+    // "t2" is reused by the qg product below, so this one store needs an
+    // MTE3->V flag instead of a full PIPE_ALL.
+    SetFlag<HardEvent::MTE3_V>(e3d);
 
     // ---- gc = gate - gate[mid] ------------------------------------------
     Sub(zz, gf, gf[8 * D], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
@@ -347,6 +367,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     PipeBarrier<PIPE_V>();
 
     // ---- qg = qn * exp2(gate) --------------------------------------------
+    WaitFlag<HardEvent::MTE3_V>(e3d);
     Mul(t2, qf, ef, N);
     PipeBarrier<PIPE_V>();
     Cast(qgb, t2, RoundMode::CAST_RINT, N);
