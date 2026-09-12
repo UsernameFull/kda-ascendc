@@ -559,6 +559,20 @@ per-launch and per-stage latency, not by FLOPs:
     whole story - 16 blocks on 24 AICs leaves 8 AICs idle by construction
     (`bh = 32` cannot be split into 24 equal, head-sized pieces), and 32
     blocks queue a second wave that costs 2x.
+  - The phase-removal bound: deleting the AIV's *entire* stage-2 phase - every
+    `DataCopy`, `Cast`, `Sub`, the 64 gathers, the four `Transpose`s and both
+    stores, with the `FL_C1`/`FL_V` handshake left in place so the protocol
+    stays honest - is worth 3.193 -> 3.166 ms of K2 (MIN over two interleaved
+    pairs of 12 samples; medians 3.223 -> 3.214), i.e. ~1%.  That is the
+    *upper bound* on moving `v_new = u - d1` onto the Cube to cut the four-phase
+    protocol down to two cross-core hops (AIC[v_new, d3, d4] -> AIV[state] ->
+    AIC): making the phase free cannot buy more than 0.03 ms, and the move
+    itself would lengthen the AIC's serial chain, add a `v_new^T` GM round trip
+    for the `d4` operand and a per-chunk selector operand for the `u` term.
+    Analysed and dropped; the four measured constituents of the loop are each
+    worth <= 0.2 ms (d4 round trip 0.12, S16 round trip 0.18, stage-1 `Mmad`s
+    0.10, stage-3 `Mmad`s 0.04), so the loop's floor for this structure is
+    ~2.7-2.8 ms, not the ~1 ms the bare flag probe might suggest.
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column
