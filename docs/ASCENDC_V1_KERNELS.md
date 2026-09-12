@@ -439,6 +439,16 @@ per-launch and per-stage latency, not by FLOPs:
   and K2 is now one launch instead of 2048. What remains of the pass is K1
   (`pre_gram` 2.29 + solve 0.65 + `kg_transpose` 0.16 ms, after the K1 retune
   below), so the next lever is no longer the K2 launch count.
+  - Current per-launch split at `[1,8192,32]` (`/tmp/kdaval/pipe_split.py`,
+    host marks around one synced launch, MIN of 5): `pre_gram` 2.204 ms
+    (grid 2048) + `solve_wu_wide` 0.124 (512) + `solve_wu_cube` 0.542 (4096) +
+    `kg_transpose` 0.161 (2048) + `k2_loop` 3.188 (16) = 6.22 ms.  Two of the
+    five launches are pure layout/glue for ~0.7 ms; `solve_wu_cube` is the one
+    that is much slower than its traffic (282 MB, ~0.24 ms at this machine's
+    1178 GB/s r+w): raising its `KDA_WU_NCHUNK` from 4 to 8 to halve the grid
+    was tried and *rejected* - `b8` is `2*NC*D*K*2` = 64 KB at NC=8, i.e.
+    exactly L0B, and the launch then dies with an aicore timeout
+    (`/tmp/kdaval/nc_probe.py`).
   - The loop only became reliable once the AIC keeps a `PipeBarrier<PIPE_ALL>`
     after each stage's `FIX_M` wait, exactly like the per-chunk
     `run_d12_aic`: without them the kernel faults with an aicore exception
@@ -511,6 +521,35 @@ per-launch and per-stage latency, not by FLOPs:
     The same trick on `d4` buys 0.115 ms of K2 but was *rejected*: `d4` lands
     in the fp32 state recurrence, where bf16 rounding costs 1.15e-4 of state
     error against the 1e-4 pytest bound (probe `/tmp/kdaval/k2d4b.py`).
+  - What the loop's remaining 3.2 ms is *not*: arithmetic, flags, or bytes.
+    Ablations on the loop at `[1,8192,32]` (`KDA_VARIANT=... python
+    /tmp/kdaval/k2cyc.py`, K2 MIN of 12 samples): stock 3.326; stage-1 `Mmad`s
+    removed 3.230; the whole stage-3 `d4` `Mmad` removed 3.286; the state
+    update replaced by a copy 3.309; **every** `CrossCoreSetFlag`/
+    `CrossCoreWaitFlag` removed 3.410 (i.e. no change); the `d4` GM round trip
+    (write *and* read) removed 3.202; the bf16-state round trip (`S16` store
+    and load) removed 3.143.  A data-free probe with the identical 4-phase
+    schedule (`/tmp/kdaval/flagprobe.cpp`, 512 chunks x 16 blocks) costs
+    0.94 ms at `nh = 1`, 1.91 ms at `nh = 2` and 3.80 ms at `nh = 4`, so each
+    extra set/wait pair per chunk is worth ~0.9 us *when nothing else runs*.
+    Together that says the chunk time is the 4-phase AIC<->AIV round trip
+    (~6 us per chunk at `nh = 2`, 3.2 ms over 512 chunks) with all of the work
+    hidden inside it - which is why removing work, flags or traffic changes
+    almost nothing, and why the loop is at the limit of this structure.
+  - Measured and rejected: coalescing those four per-head flag phases into one
+    per chunk (guard each wait with `s == 0` and each set with
+    `s == nh - 1`, the natural reading of "the unit of the protocol is a
+    head").  The flag-op count halves but K2 goes 3.19 -> 5.84 ms, because the
+    per-head flags are exactly what lets head 1's stage-1 `Mmad`s run while
+    head 0's stage-2 vector work is still in flight; serialising the heads
+    costs ~2.6 ms.  Inter-head overlap is worth far more than the flag ops.
+  - Head-to-block mapping is at its floor too: one block walks 512 chunks no
+    matter how the heads are spread, and the per-chunk cost barely moves with
+    `nh` (6.3 us at `nh = 2` vs 5.9 us at `nh = 1`), so `nblk = bh` up to the
+    24-AIC count and `nblk = bh / 2` above it (the `nblk` note above) is the
+    whole story - 16 blocks on 24 AICs leaves 8 AICs idle by construction
+    (`bh = 32` cannot be split into 24 equal, head-sized pieces), and 32
+    blocks queue a second wave that costs 2x.
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column
