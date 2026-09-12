@@ -573,6 +573,64 @@ per-launch and per-stage latency, not by FLOPs:
     worth <= 0.2 ms (d4 round trip 0.12, S16 round trip 0.18, stage-1 `Mmad`s
     0.10, stage-3 `Mmad`s 0.04), so the loop's floor for this structure is
     ~2.7-2.8 ms, not the ~1 ms the bare flag probe might suggest.
+  - Fusing the AIV-only `pre_gram` *into* the loop's AIV is now ruled out by
+    measurement, not by intuition: an added vector instruction costs ~13 ns of
+    loop wall time per (head, chunk) region wherever it is put.  Probes that
+    append `n` unrolled one-repeat `Muls` - eight *independent* destination
+    tiles, so this is issue cost and not a dependency chain - to the AIV's
+    stage-2 body (`/tmp/kdaval/k2slack4.py`) or its stage-4 body
+    (`/tmp/kdaval/k2slack3.py`) and time K2 alone at `[1,8192,32]` give
+    3.174 -> 3.167 ms for `n = 0` in *either* place, +1.57 ms at `n = 128`,
+    +6.8 at 512 and +27.8 at 2048 (12.5-13.8 ns per instruction per region,
+    1024 regions per block).  The asymmetry with the removal direction is the
+    point: deleting the AIV's whole stage-2 phase - every `DataCopy`, `Cast`,
+    `Sub`, the 64 gathers, the four `Transpose`s and both stores, handshake
+    kept - is worth 0.006 ms, because that phase hides completely behind the
+    AIC's stage-1.  So the AIV's issue is a shared, *additive* resource on the
+    loop's critical path even while the stock work is not the bottleneck.
+    `pre_gram` needs ~450 instructions per chunk (its own cost model: 13.7k
+    core cycles per chunk, 16384 chunks over 48 AIVs, 2.21 ms), which would add
+    ~5-6 us to a 6.3 us chunk, i.e. ~+3 ms - more than the 2.21 ms the stage
+    costs as its own launch.  The structural argument is worse than the timing
+    one: the loop needs `U`/`W`, which are the *outputs* of the WY solve over
+    `L`, so folding the producer in also means folding the AIV wide solve and
+    the Cube solve into the same kernel; the only shape that satisfies that
+    dependency is a three-engine software pipeline inside one block, and the
+    per-chunk AIV budget above already rules it out.  (Its UB budget does not
+    fit either without deliberate reuse: the loop's AIV `TBuf`s are 154.5 KB
+    and `pre_gram`'s another 125.1 KB, i.e. 279.6 KB against the 256 KB UB, so
+    declaring both - `/tmp/kdaval/ub_probe.cpp`
+    - faults; the fold would have to hand-place `pre_gram`'s temporaries into
+    the loop's dead buffers.)
+  - Overlapping the producer with the loop across streams does not survive
+    contact with the real dependency.  `pre_gram` ‖ `k2_loop` from two streams
+    is worth 5.398 -> 4.314 ms when both are *whole-sequence* launches
+    (`/tmp/kdaval/co_k2.py`, MIN of 5, stable) - but that schedule reads `U`/`W`
+    the producer has not written yet.  Making it legal means cutting the
+    sequence into `seg` time segments, giving each its own producer chain
+    (`pre_gram` -> wide -> Cube, 2.9 ms of device time in 12 launches) on a
+    second stream and chaining the loop's fp32 state through `s32` (the loop
+    reads `pH0` at start-up and stores `S32` at the end, so chaining is exact).
+    Implemented in `api.py` behind `KDA_LOOP_SEG` - `pre_gram` grew `c0`/`nts`
+    so one segment is one launch and every packed output stays head-contiguous
+    - and *bit-exact* against the single-launch path at every `seg` tested, it
+    is worth 6.369 -> 6.313 ms at `seg = 4` and 6.539 at `seg = 8` (MIN of 6,
+    `[1,8192,32]`): ~1%, i.e. launch overhead.  Dropping the segment handshake
+    altogether (illegal - the loop may read a segment's `U`/`W` before it
+    exists - and only measured because the buffers still hold the previous
+    call's data) reaches just 5.94 ms at `seg = 4`, so the device is not
+    willing to run producer and loop concurrently at this granularity in the
+    first place: the 1.08 ms the whole-kernel pair shows is gone as soon as the
+    producer is cut into per-segment launches that the loop must wait for.
+    Interleaved/phase-batched submission orders, the loop on the caller's
+    stream or on its own, and a head-grouped split (8 groups x 4 heads x 2
+    blocks on 8 streams, also bit-exact, `/tmp/kdaval/hseg.py`) all land in
+    0.96-1.02x of the sequential pass.  Reverted; the loop stays one launch.
+  - Batching the WU Cube solve's `LoadData`/`Mmad`/`Fixpipe` phases across the
+    `WU_NCHUNK` chunks of a block (one `L0A`/`L0B` slot per chunk, one `Mmad`
+    per pass instead of per chunk) hangs the launch with an aicore timeout at
+    `[1,8192,32]` (`/tmp/kdaval/wu_var.py`), so the serialisation there
+    (0.116 us per chunk of a 0.538 ms stage) is not available for free either.
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column
