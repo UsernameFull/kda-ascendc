@@ -361,12 +361,14 @@ def kda_bt16_fwd_ascendc(
         vnew = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
         vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
         h0 = None if initial_state is None else initial_state.view(bh, D, D)
-        kg_t = torch.empty((c, D, CHUNK), dtype=torch.bfloat16, device=q.device)
+        # kg goes to the loop in its public [c, CHUNK, D] layout: the AIC loads
+        # it into L1 with Nd2Nz and transposes each 16x16 fractal on the way
+        # into L0B (LoadDataWithTranspose), which is what kg_t fed and what
+        # kda_kg_transpose built.  Dropping that launch saves its 0.16 ms of
+        # device time (and the 67 MB round trip) per pass.
         mark("k2_start")
-        _launch("kda_kg_transpose", (c + KGT_NCHUNK - 1) // KGT_NCHUNK,
-                _pack_ptrs([kg, kg_t]) + [_i(c)], stream)
         _launch("kda_k2_persistent_loop", nblk,
-                _pack_ptrs([U, W, qg, aqk16, kg_t, decay, d1, d2, d3, d4f,
+                _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
                             out_task, vnew, vnew_t, h0, s32, s16]) +
                 [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale)], stream)
         finish("k2_ms", "k2_start")

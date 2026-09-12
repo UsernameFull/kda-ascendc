@@ -440,15 +440,24 @@ per-launch and per-stage latency, not by FLOPs:
   (`pre_gram` 2.29 + solve 0.65 + `kg_transpose` 0.16 ms, after the K1 retune
   below), so the next lever is no longer the K2 launch count.
   - Current per-launch split at `[1,8192,32]` (`/tmp/kdaval/pipe_split.py`,
-    host marks around one synced launch, MIN of 5): `pre_gram` 2.204 ms
-    (grid 2048) + `solve_wu_wide` 0.124 (512) + `solve_wu_cube` 0.542 (4096) +
-    `kg_transpose` 0.161 (2048) + `k2_loop` 3.188 (16) = 6.22 ms.  Two of the
-    five launches are pure layout/glue for ~0.7 ms; `solve_wu_cube` is the one
-    that is much slower than its traffic (282 MB, ~0.24 ms at this machine's
-    1178 GB/s r+w): raising its `KDA_WU_NCHUNK` from 4 to 8 to halve the grid
-    was tried and *rejected* - `b8` is `2*NC*D*K*2` = 64 KB at NC=8, i.e.
-    exactly L0B, and the launch then dies with an aicore timeout
-    (`/tmp/kdaval/nc_probe.py`).
+    host marks around one synced launch, MIN/MED of 5): `pre_gram` 2.213/2.214
+    (grid 2048) + `solve_wu_wide` 0.123/0.128 (512) + `solve_wu_cube`
+    0.538/0.540 (4096) + `k2_loop` 3.187/3.203 (16) = 6.06 ms over four
+    launches.  `solve_wu_cube` is the one stage that is much slower than its
+    traffic (282 MB, ~0.24 ms at this machine's 1178 GB/s r+w): raising its
+    `KDA_WU_NCHUNK` from 4 to 8 to halve the grid was tried and *rejected* -
+    `b8` is `2*NC*D*K*2` = 64 KB at NC=8, i.e. exactly L0B, and the launch then
+    dies with an aicore timeout (`/tmp/kdaval/nc_probe.py`).
+  - `kg` now reaches the loop in its public `[c, CHUNK, D]` layout and the AIC
+    transposes each 16x16 fractal on the way into L0B (`Nd2NzParams` +
+    `LoadDataWithTranspose` - the idiom `kda_solve_wu_cube` already uses for
+    `rk`/`rv`), so `kda_kg_transpose` is no longer launched for this mode and
+    its 67 MB read + 67 MB write are gone.  The pass goes 6.53 -> 6.39 ms at
+    `[1,8192,32]` (two interleaved pairs, 8 reps each: medians 6.528/6.540
+    before, 6.386/6.405 after; mins 6.495/6.478 before, 6.345/6.369 after) and
+    `k2_ms` - which used to include the transpose launch - goes 3.33 -> 3.18 ms.
+    Output and state stay bit-exact against `separated`
+    (`tests/test_persistent_loop.py`, plot in `/tmp/kdaval/k2q.py`).
   - The loop only became reliable once the AIC keeps a `PipeBarrier<PIPE_ALL>`
     after each stage's `FIX_M` wait, exactly like the per-chunk
     `run_d12_aic`: without them the kernel faults with an aicore exception

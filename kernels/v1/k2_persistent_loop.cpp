@@ -180,7 +180,8 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 auto lv = qv.AllocTensor<bfloat16_t>();
                 auto lk = qk.AllocTensor<bfloat16_t>();
                 DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
-                DataCopy(lk, Kt[static_cast<uint64_t>(c) * D * K], D * K);
+                DataCopy(lk, Kt[static_cast<uint64_t>(c) * M * D],
+                         Nd2NzParams(1, M, D, 0, D, M, 1, 0));
                 CrossCoreWaitFlag(FL_V);
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     const int32_t task = bh * nv + iv;
@@ -197,7 +198,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 lk = qk.DeQue<bfloat16_t>();
                 LoadData(l0a, lv, LoadData2dParams(0, NG, 1, 0, 0, false, 0));
                 LoadData(l0a[NG * M * K], la, LoadData2dParams(0, 1, 1, 0, 0, false, 0));
-                LoadData(l0b, lk, LoadData2dParams(0, D / M, 1, 0, 0, false, 0));
+                LoadDataWithTranspose(l0b, lk, LoadData2dTransposeParams(0, D / M, 1, 0, 0));
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     LoadData(l0b[D * K + iv * BV * K], lv[iv * BV * K],
                              LoadData2dParams(0, BV / M, 1, 0, 0, false, 0));
