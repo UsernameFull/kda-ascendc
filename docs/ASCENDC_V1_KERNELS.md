@@ -499,6 +499,18 @@ per-launch and per-stage latency, not by FLOPs:
     kernels can never show this. Cost of the two drains: 13.66 vs 13.67 ms,
     i.e. nothing, because the `S16`/`Out` MTE3 copies already gate the flag
     that follows them.
+  - `D1`/`D2`/`D3` now cross to the AIV as bf16 - the fixpipe quantises
+    (`quantPre = F322BF16`) and the AIV widens each tile back with one `Cast` -
+    instead of as fp32.  All three only carry stage-1/3 Cube results to the
+    vector side, every accumulation there is still fp32 (`v_new = u - d1`,
+    `out = d2 * scale + d3`) and the state never leaves fp32, so the rounding
+    is harmless: the mode-vs-mode pytest gate reads out 1.5e-5 (bound 1e-3) and
+    state 1.4e-7 (bound 1e-4; it was bit-exact before).  K2 3.42 -> 3.33 ms and
+    the whole pass 6.63 -> 6.51 ms at `[1,8192,32]` (interleaved A/B against
+    HEAD, 3 rounds x 8 reps: medians 6.627 -> 6.505, mins 6.558 -> 6.461).
+    The same trick on `d4` buys 0.115 ms of K2 but was *rejected*: `d4` lands
+    in the fp32 state recurrence, where bf16 rounding costs 1.15e-4 of state
+    error against the 1e-4 pytest bound (probe `/tmp/kdaval/k2d4b.py`).
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column

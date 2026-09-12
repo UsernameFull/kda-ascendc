@@ -27,6 +27,16 @@
 // that costs, not any single load.  The WAR `PipeBarrier<PIPE_ALL>` of stages 2
 // and 4 must stay *before* the hoisted load (it orders the previous
 // iteration's vector reads against the UB staging buffers).
+//
+// D1/D2/D3 cross to the AIV as bf16: the fixpipe quantises fp32 -> bf16 and the
+// AIV widens each tile back with one Cast.  Those three tiles only carry the
+// stage-1/3 Cube results over to the vector side, and both consumers survive
+// the rounding - the state stays fp32 and every accumulation (v_new = u - d1,
+// out = d2 * scale + d3) is still fp32.  Before the change the pass was
+// bit-exact against the separated path; after it the pytest gate reads
+// out_err 1.5e-5 (< 1e-3) and state_err 1.4e-7 (< 1e-4).  K2 at [1,8192,32]
+// goes 3.423 -> 3.326 ms (MIN of 3 rounds x 4 reps in one process, median
+// 3.466 -> 3.352), so the half-width tiles are worth ~3%.
 #include "kernel_operator.h"
 using namespace AscendC;
 
@@ -67,16 +77,17 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         if (nh == 0) return;
 
         GlobalTensor<bfloat16_t> W, Qg, Aqk, Vt, Kt, S16;
-        GlobalTensor<float> D1, D2, D3, D4;
+        GlobalTensor<float> D4;
+        GlobalTensor<bfloat16_t> D1, D2, D3;
         W.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pW));
         Qg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pQg));
         Aqk.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pAqk));
         Vt.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnewT));
         Kt.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pKgT));
         S16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pS16));
-        D1.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD1));
-        D2.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD2));
-        D3.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD3));
+        D1.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pD1));
+        D2.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pD2));
+        D3.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pD3));
         D4.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD4));
 
         TPipe pipe;
@@ -143,13 +154,13 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                     const uint64_t o0 = static_cast<uint64_t>(bh * nv + iv) * NT * TILE +
                                         static_cast<uint64_t>(chunk) * TILE;
                     auto ip1 = FixpipeParamsV220(N, M, 16, N, false);
-                    ip1.quantPre = QuantMode_t::NoQuant;
+                    ip1.quantPre = QuantMode_t::F322BF16;
                     ip1.unitFlag = 0;
-                    Fixpipe<float, float, CFG_ROW_MAJOR>(D1[o0], cf[iv * M * N], ip1);
+                    Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(D1[o0], cf[iv * M * N], ip1);
                     auto ip2 = FixpipeParamsV220(N, M, 16, N, false);
-                    ip2.quantPre = QuantMode_t::NoQuant;
+                    ip2.quantPre = QuantMode_t::F322BF16;
                     ip2.unitFlag = 0;
-                    Fixpipe<float, float, CFG_ROW_MAJOR>(D2[o0], cf[(nv + iv) * M * N], ip2);
+                    Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(D2[o0], cf[(nv + iv) * M * N], ip2);
                 }
                 SetFlag<HardEvent::FIX_M>(efm);
                 WaitFlag<HardEvent::FIX_M>(efm);
@@ -217,9 +228,9 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 }
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     auto ip = FixpipeParamsV220(N, M, 16, N, false);
-                    ip.quantPre = QuantMode_t::NoQuant;
                     ip.unitFlag = 0;
-                    Fixpipe<float, float, CFG_ROW_MAJOR>(
+                    ip.quantPre = QuantMode_t::F322BF16;
+                    Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(
                         D3[(static_cast<uint64_t>(bh * nv + iv) * NT + chunk) * TILE],
                         cf[NG * M * N_D4 + iv * M * N], ip);
                 }
@@ -249,14 +260,15 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         if (nh == 0) return;
 
         GlobalTensor<bfloat16_t> U, V, Vt, S16, Out;
-        GlobalTensor<float> D1, D2, D3, D4, Decay, H0, S32;
+        GlobalTensor<float> D4, Decay, H0, S32;
+        GlobalTensor<bfloat16_t> D1, D2, D3;
         U.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pU));
         V.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnew));
         Vt.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pVnewT));
         S16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pS16));
-        D1.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD1));
-        D2.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD2));
-        D3.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD3));
+        D1.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pD1));
+        D2.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pD2));
+        D3.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pD3));
         D4.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pD4));
         Decay.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pDecay));
         Out.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pOut));
@@ -268,31 +280,38 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         TEventID ev3 = pipe.AllocEventID<HardEvent::V_MTE3>();
         TEventID evm2 = pipe.AllocEventID<HardEvent::V_MTE2>();
         TBuf<TPosition::VECCALC> uu, ud1, uv, ut, uf, usc, uo, uof, ud2, ud3, ud4, udec, us, us16;
+        TBuf<TPosition::VECCALC> ud1f, ud2f, ud3f;
         pipe.InitBuffer(uu, M * D * sizeof(bfloat16_t));
-        pipe.InitBuffer(ud1, TILE * sizeof(float));
+        pipe.InitBuffer(ud1, TILE * sizeof(bfloat16_t));
+        pipe.InitBuffer(ud1f, TILE * sizeof(float));
         pipe.InitBuffer(uv, TILE * sizeof(bfloat16_t));
         pipe.InitBuffer(ut, TILE * sizeof(bfloat16_t));
         pipe.InitBuffer(uf, M * D * sizeof(float));
         pipe.InitBuffer(usc, (BV / M) * M * M * sizeof(bfloat16_t));
         pipe.InitBuffer(uo, TILE * sizeof(bfloat16_t));
         pipe.InitBuffer(uof, TILE * sizeof(float));
-        pipe.InitBuffer(ud2, TILE * sizeof(float));
-        pipe.InitBuffer(ud3, TILE * sizeof(float));
+        pipe.InitBuffer(ud2, TILE * sizeof(bfloat16_t));
+        pipe.InitBuffer(ud2f, TILE * sizeof(float));
+        pipe.InitBuffer(ud3, TILE * sizeof(bfloat16_t));
+        pipe.InitBuffer(ud3f, TILE * sizeof(float));
         pipe.InitBuffer(ud4, S_TILE * sizeof(float));
         pipe.InitBuffer(udec, D * sizeof(float));
         pipe.InitBuffer(us, MAXH * S_TILE * sizeof(float));
         pipe.InitBuffer(us16, S_TILE * sizeof(bfloat16_t));
 
         LocalTensor<bfloat16_t> ub = uu.Get<bfloat16_t>();
-        LocalTensor<float> d1 = ud1.Get<float>();
+        LocalTensor<bfloat16_t> d1 = ud1.Get<bfloat16_t>();
+        LocalTensor<float> d1f = ud1f.Get<float>();
         LocalTensor<bfloat16_t> vb = uv.Get<bfloat16_t>();
         LocalTensor<bfloat16_t> vt = ut.Get<bfloat16_t>();
         LocalTensor<float> vf = uf.Get<float>();
         LocalTensor<bfloat16_t> sc = usc.Get<bfloat16_t>();
         LocalTensor<bfloat16_t> ob = uo.Get<bfloat16_t>();
         LocalTensor<float> of = uof.Get<float>();
-        LocalTensor<float> d2 = ud2.Get<float>();
-        LocalTensor<float> d3 = ud3.Get<float>();
+        LocalTensor<bfloat16_t> d2 = ud2.Get<bfloat16_t>();
+        LocalTensor<float> d2f = ud2f.Get<float>();
+        LocalTensor<bfloat16_t> d3 = ud3.Get<bfloat16_t>();
+        LocalTensor<float> d3f = ud3f.Get<float>();
         LocalTensor<float> d4 = ud4.Get<float>();
         LocalTensor<float> dec = udec.Get<float>();
         LocalTensor<float> st = us.Get<float>();
@@ -337,15 +356,16 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const uint64_t out0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
                 DataCopy(ub, U[u0], DataCopyParams(M, 8, 0, 0));
                 CrossCoreWaitFlag(FL_C1);
-                DataCopy(d1, D1[out0], DataCopyParams(M, 8, 0, 0));
+                DataCopy(d1, D1[out0], DataCopyParams(M, 4, 0, 0));
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
                 Cast(vf, ub, RoundMode::CAST_NONE, M * D);
+                Cast(d1f, d1, RoundMode::CAST_NONE, TILE);
                 PipeBarrier<PIPE_V>();
                 // v_new = u - d1 for all 16 rows in one instruction: the dst
                 // and the d1 operand step by one 64-float row (8 blocks), the
                 // u operand by one 128-float row of the fp32 tile.
-                Sub(vf, vf[iv * BV], d1, BV, M,
+                Sub(vf, vf[iv * BV], d1f, BV, M,
                     BinaryRepeatParams(1, 1, 1, 8, 16, 8));
                 Cast(vb, vf, RoundMode::CAST_RINT, TILE);
                 PipeBarrier<PIPE_V>();
@@ -381,17 +401,19 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const uint64_t t0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
                 const uint64_t d4base = static_cast<uint64_t>(bh) * D * D +
                                         static_cast<uint64_t>(iv) * BV * D;
-                DataCopy(d2, D2[t0], DataCopyParams(M, 8, 0, 0));
+                DataCopy(d2, D2[t0], DataCopyParams(M, 4, 0, 0));
                 DataCopy(dec, Decay[static_cast<uint64_t>(c) * D], DataCopyParams(1, 16, 0, 0));
                 CrossCoreWaitFlag(FL_C2);
-                DataCopy(d3, D3[t0], DataCopyParams(M, 8, 0, 0));
+                DataCopy(d3, D3[t0], DataCopyParams(M, 4, 0, 0));
                 DataCopy(d4, D4[d4base], DataCopyParams(BV, 16, 0, 0));
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
                 // out = d2 * scale + d3 is accumulated in fp32 and only then
                 // rounded to bf16, exactly like the separated outstate kernel.
-                Muls(of, d2, scale, TILE);
-                Add(of, of, d3, TILE);
+                Cast(d2f, d2, RoundMode::CAST_NONE, TILE);
+                Muls(of, d2f, scale, TILE);
+                Cast(d3f, d3, RoundMode::CAST_NONE, TILE);
+                Add(of, of, d3f, TILE);
                 Cast(ob, of, RoundMode::CAST_RINT, TILE);
                 PipeBarrier<PIPE_V>();
                 Mul(state, state, dec, 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
