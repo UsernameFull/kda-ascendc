@@ -11,14 +11,18 @@ silently produces wrong numbers, so the contracts are spelled out here.
 |---|---|---|
 | `preprocess.cpp` | `kda_preprocess_kernel` | `Qn`/`Kn` (bf16, packed `[c,16,128]`), `Gate`, `Gc`, `Beta`, `Decay`, `Qg`, `Kg`, `Rk`, `Rv` |
 | `k1_gram.cpp` | `kda_gram_kernel` | `Aqk32`/`Aqk` bf16 `[c,16,16]`, `L` |
-| `k1_pre_gram.cpp` | `kda_pre_gram_kernel` | everything the two rows above write, in one block per chunk |
+| `k1_pre_gram.cpp` | `kda_pre_gram_kernel` | everything the two rows above write, in one block per chunk; reads `q`/`k`/`v`/`g` in the public `[B,T,H,D]` layout |
 | `k1_solve_wu.cpp` | `kda_solve_wu_kernel` | `A32`/`A16` |
 | `k1_solve_wu_wide.cpp` | `kda_solve_wu_wide` | the same, 32 chunks per vector instruction |
 | `k1_solve_wu_cube.cpp` | `kda_solve_wu_cube_kernel` | `W`, `U` |
 
 The preprocess kernel indexes the packed chunk-major layout, so `api.py` passes
 the `*_pack` tensors (`pack_tokens` / the beta permute), never the public
-`[B,T,H,D]` views.
+`[B,T,H,D]` views.  `kda_pre_gram_kernel` is the exception: it reads
+`q`/`k`/`v`/`g` out of the public layout with a byte-strided `DataCopyPad`
+(`xRowBytes = H*D*2 - D*2`, `gRowBytes = H*D*4 - D*4`), which is what lets
+`api.py` skip `pack_tokens` for the four stage-1 inputs; everything it writes
+is still packed.
 
 Row reductions inside these kernels use the tested idiom
 `Add(tmp, tile, tile[64], 64, M, BinaryRepeatParams(1,1,1,16,16,16))` followed by
@@ -229,6 +233,19 @@ per-launch and per-stage latency, not by FLOPs:
     now moves `NCHUNK = 8` chunks per block with one strided
     `DataCopyParams(M, 1, 7, 0)` gather per 16x16 tile instead of 16 row
     gathers: 0.72 -> 0.16 ms, bit-identical to `torch.transpose`.
+  - `k1_pre_gram.cpp` reads its four stage-1 inputs (`q`/`k`/`v`/`g`) straight
+    out of the public `[B, T, H, D]` layout, so `api.py` no longer calls
+    `pack_tokens` on them at all.  One token is `D` contiguous elements and
+    consecutive tokens of a chunk sit `H*D` elements apart, which is exactly the
+    gather `DataCopyPad`'s byte-stride form expresses; a `DataCopy` block/stride
+    load of the same gather silently drops most of the bursts on this part (see
+    the note above).  End to end at `[1,8192,32]`: 7.482 -> 6.926 ms (median of
+    5, same process settings: 7.461 min before, 6.861 after), i.e. the pack's
+    1.07 GB round trip is gone and only the read side of it remains; at
+    `[2,1024,4]` 0.814 -> 0.762 ms.  `out`, `state` and all thirteen
+    intermediates stay bit-identical (`0.000e+00` on every one, two shapes).
+    The `[c, M, D]` addressing of everything downstream is unchanged, so
+    `pbQn`/`Kn`/`Gate`/`Gc`/`Decay`/`Aqk`/`L` and the K2 layout still hold.
   - `k1_pre_gram.cpp` fuses stages 1+2 into one AIV block per chunk (`api.py`
     now launches it instead of `kda_preprocess_kernel` + `kda_gram_kernel`
     back to back): the Gram half reads `Qn`/`Kn`/`Gc` straight out of UB and
@@ -376,10 +393,19 @@ per-launch and per-stage latency, not by FLOPs:
   and reverted.  Storing ``o`` straight into ``[B, T, H, D]`` from the outstate
   kernel turns each 16x64 tile into 16 rows of 128 B at an 8 KB stride and cost
   3.8 ms over the 512 launches (k2 stage 14.0 -> 17.8 ms) against the 0.11 ms
-  the host permute costs.  Reading the public layout in ``preprocess`` removes
-  the four ``pack_tokens`` copies (0.26 ms) but adds ~0.15 ms of strided load
-  to the stage and the remainder is inside the +/-0.5 ms run-to-run noise of
-  this device, so it was reverted too.
+  the host permute costs.  The other one - reading the public layout instead of
+  the packed ``[c, M, D]`` copies - was retried later and *did* pay off, but
+  only through ``DataCopyPad``: see the ``pack_tokens`` note under K1.
+- ``DataCopy``'s block/stride form cannot read a strided GM source on this part
+  (910_9382 / CANN 9.1.0).  A probe kernel that gathers 16 rows of 256 B with a
+  non-zero ``srcStride`` (``DataCopyParams(16, 8, 40, 0)``, ``gap=8`` in
+  ``/tmp/kdaval/probe_stride4.py``) returns rows 0-3 correct, row 4 stale, rows
+  5-7 correct and rows 8-15 untouched - i.e. some half of the bursts never
+  lands, and the larger the gap the fewer rows arrive (``gap=40`` writes rows
+  0-2 of 16).  ``DataCopyPad`` with the byte-unit ``DataCopyExtParams(16, 256,
+  gap_bytes, 0, 0)`` reads the identical gather correctly for every gap tested,
+  so the strided input path uses that form.  Worth checking before any future
+  strided-row load.
 - The Triton reference compiles to a 16384-block MIX K1 (11.09 ms) and a
   64-block, single-launch K2 that keeps the fp32 state resident for all 512
   chunks (18.79 ms); both are slower than the `separated` path here (7.53 ms /

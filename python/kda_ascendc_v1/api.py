@@ -217,18 +217,24 @@ def kda_bt16_fwd_ascendc(
         bias = bias.contiguous()
     if initial_state is not None:
         initial_state = initial_state.contiguous()
-    q_pack, k_pack, v_pack, g_pack = [pack_tokens(x) for x in (q, k, v, g)]
+    # The four stage-1 inputs are no longer packed: pre_gram reads them out of
+    # the public [B, T, H, D] layout with a byte-strided DataCopyPad, which
+    # removes a 1.07 GB copy round trip per call (~0.6 ms at [1,8192,32]).  The
+    # block/stride form of DataCopy cannot express that gather on this part.
+    qk_row_bytes = h * D * 2 - D * 2
+    g_row_bytes = h * D * 4 - D * 4
     beta_pack = beta.view(b, nt, CHUNK, h).permute(0, 3, 1, 2).contiguous().view(c, CHUNK)
     stream = torch_npu.npu.current_stream().npu_stream
     _compile_all()
 
-    qn = torch.empty_like(q_pack); kn = torch.empty_like(k_pack)
+    qn = torch.empty((c, CHUNK, D), dtype=torch.bfloat16, device=q.device)
+    kn = torch.empty_like(qn)
     gate = torch.empty((c, CHUNK, D), dtype=torch.float32, device=q.device)
     gc = torch.empty_like(gate)
     beta_out = torch.empty((c, CHUNK), dtype=torch.float32, device=q.device)
     decay = torch.empty((c, D), dtype=torch.float32, device=q.device)
-    rk = torch.empty_like(q_pack); rv = torch.empty_like(q_pack)
-    qg = torch.empty_like(q_pack); kg = torch.empty_like(q_pack)
+    rk = torch.empty_like(qn); rv = torch.empty_like(qn)
+    qg = torch.empty_like(qn); kg = torch.empty_like(qn)
     aqk32 = torch.empty((c, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     aqk16 = torch.empty((c, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
     # The wide solve kernel rounds the chunk count up to SOLVE_WIDE_NCHUNK and
@@ -248,7 +254,7 @@ def kda_bt16_fwd_ascendc(
     # it only writes Qn/Kn/Gate/Gc when those pointers are non-null (the
     # ``return_intermediates`` debug path).
     keep = return_intermediates
-    pre_args = _pack_ptrs([q_pack, k_pack, v_pack, g_pack, beta_pack,
+    pre_args = _pack_ptrs([q, k, v, g, beta_pack,
                            A_log, bias,
                            qn if keep else None, kn if keep else None,
                            gate if keep else None, gc if keep else None,
@@ -261,15 +267,16 @@ def kda_bt16_fwd_ascendc(
     # (fewer than 256 chunks) stay at 1 because the loop wrapper itself costs a
     # few percent there.
     pre_unroll = 1 if c < 256 else min(8, max(2, c // 512))
-    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll)]
+    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
+                 _i(qk_row_bytes), _i(g_row_bytes)]
     mark("pre_gram_start")
     _launch("kda_pre_gram_kernel", (c + pre_unroll - 1) // pre_unroll, pre_args, stream)
     finish("pre_gram_ms", "pre_gram_start")
 
     a32 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     a16 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
-    W = torch.empty_like(q_pack)
-    U = torch.empty_like(q_pack)
+    W = torch.empty_like(qn)
+    U = torch.empty_like(qn)
     solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16]) + [_i(c)]
     mark("solve_start")
     # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector

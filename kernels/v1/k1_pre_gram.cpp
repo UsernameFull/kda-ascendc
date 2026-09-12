@@ -141,9 +141,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     GM_ADDR pQn, GM_ADDR pKn, GM_ADDR pGate, GM_ADDR pGc, GM_ADDR pBetaOut,
     GM_ADDR pDecay, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pQg, GM_ADDR pKg,
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
-    int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll) {
+    int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
+    int32_t xRowBytes, int32_t gRowBytes) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const int32_t nt = T / M;
+    const DataCopyPadExtParams<bfloat16_t> padNop(false, 0, 0, 0);
+    const DataCopyPadExtParams<float> padNopF(false, 0, 0, 0);
     const int32_t nchunk = B * H * nt;
 
     TPipe pipe;
@@ -238,14 +241,28 @@ extern "C" __global__ __aicore__ void kda_pre_gram_kernel(
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     const uint64_t x0 = static_cast<uint64_t>(c) * N;
     const uint64_t cm = static_cast<uint64_t>(c) * M;
+    // The four stage-1 inputs are read straight out of the public [B, T, H, D]
+    // layout instead of a packed [c, M, D] copy: one token is D contiguous
+    // elements and consecutive tokens of a chunk sit H*D elements apart, so a
+    // strided DataCopy replaces the pack (which cost a 0.67 ms round trip of
+    // 1.07 GB at [1,8192,32]).  The downstream buffers keep the packed order.
+    const int32_t b = bh / H;
+    const int32_t ck = c - bh * nt;
+    const uint64_t xb = (static_cast<uint64_t>(b) * T + static_cast<uint64_t>(ck) * M) *
+                            static_cast<uint64_t>(H) * D +
+                        static_cast<uint64_t>(head) * D;
 
-    DataCopy(qnb, Q[x0], DataCopyParams(M, 8, 0, 0));
+    // The block/stride form of DataCopy is broken for a strided GM source on
+    // this part (halves the bursts land unwritten, probe
+    // /tmp/kdaval/probe_stride4.py); DataCopyPad's byte-stride form reads the
+    // same gather correctly, so the four stage-1 inputs use it.
+    DataCopyPad(qnb, Q[xb], DataCopyExtParams(M, D * 2, xRowBytes, 0, 0), padNop);
     SetFlag<HardEvent::MTE2_V>(e2vq);
-    DataCopy(knb, K[x0], DataCopyParams(M, 8, 0, 0));
+    DataCopyPad(knb, K[xb], DataCopyExtParams(M, D * 2, xRowBytes, 0, 0), padNop);
     SetFlag<HardEvent::MTE2_V>(e2vk);
-    DataCopy(gf, G[x0], DataCopyParams(M, 16, 0, 0));
+    DataCopyPad(gf, G[xb], DataCopyExtParams(M, D * 4, gRowBytes, 0, 0), padNopF);
     SetFlag<HardEvent::MTE2_V>(e2vg);
-    DataCopy(rvb, V[x0], DataCopyParams(M, 8, 0, 0));
+    DataCopyPad(rvb, V[xb], DataCopyExtParams(M, D * 2, xRowBytes, 0, 0), padNop);
     SetFlag<HardEvent::MTE2_V>(e2vv);
     DataCopy(alog, Alog[head], 8);
     DataCopy(beta, Beta[cm], DataCopyParams(1, 2, 0, 0));
