@@ -62,6 +62,16 @@ AIC: [wait R; d12(h); set C1] x nh   then   [wait V; d34(h); set C2] x nh
 AIV: [wait C1; vnew(h); set V] x nh  then   [wait C2; out(h); set R] x nh
 ```
 
+Each stage now starts its flag-independent MTE2 loads *before* the
+`CrossCoreWaitFlag` that guards the state-dependent tiles: W/Qg in stage 1,
+`Aqk`/`Kg^T` in stage 3, `U` in stage 2, `D2`/`Decay` in stage 4. Hoisting all
+four is worth 3.74 -> 3.44 ms of K2 at `[1,8192,32]` (3 rounds x 3 reps,
+medians 3.786 -> 3.460, bit-identical outputs) while any single hoist is only
+0.05-0.08 ms, so what costs is the serialisation behind the flag, not the
+individual load. The `PipeBarrier<PIPE_ALL>` of stages 2/4 must stay *before*
+the hoisted load, since that barrier is what orders the previous iteration's
+vector reads against the UB staging buffers.
+
 Both AIV subcores execute the identical flag sequence (the head is the only
 unit both subcores share; only `iv = GetSubBlockIdx()` differs). Four flag ids
 `0..3` carry the loop, the protocol is depth one and iteration-invariant, and

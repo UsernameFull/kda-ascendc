@@ -15,6 +15,18 @@
 // The fp32 state never leaves the AIV: it is loaded from H0 at start-up, kept
 // in UB across the whole loop and stored to S32 once at the end.  Only the bf16
 // copy of the state (S16) is published to GM for the Cube operands.
+//
+// Each stage issues the loads that do not depend on its cross-core flag
+// *before* the wait: the two MTE2 reads of W/Qg in stage 1, the flag-free Aqk
+// and Kg^T reads in stage 3, U in stage 2 and D2/Decay in stage 4.  The waits
+// they precede only guard the state-dependent tiles (S16, Vt, D1, D3/D4), so
+// the earlier of the two loads is always private to this core.  Hoisting all
+// four stages is worth 3.74 -> 3.44 ms of K2 at [1,8192,32] (3 rounds x 3
+// reps, R=3, medians 3.786 -> 3.460, bit-identical outputs); each hoist on its
+// own only buys 0.05-0.08 ms, so it is the *serialisation* behind the flag
+// that costs, not any single load.  The WAR `PipeBarrier<PIPE_ALL>` of stages 2
+// and 4 must stay *before* the hoisted load (it orders the previous
+// iteration's vector reads against the UB staging buffers).
 #include "kernel_operator.h"
 using namespace AscendC;
 
@@ -92,13 +104,13 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
             // ---- stage 1: d1 = W @ S16^T, d2 = Qg @ S16^T for every head
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
-                CrossCoreWaitFlag(FL_R);
                 const uint64_t a0 = static_cast<uint64_t>(bh * NT + chunk) * M * D;
                 auto lw = qw.AllocTensor<bfloat16_t>();
                 auto lg = qg.AllocTensor<bfloat16_t>();
                 auto ls = qs.AllocTensor<bfloat16_t>();
                 DataCopy(lw, W[a0], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
                 DataCopy(lg, Qg[a0], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
+                CrossCoreWaitFlag(FL_R);
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     const uint64_t s0 = static_cast<uint64_t>(bh * nv + iv) * BV * D;
                     DataCopy(ls[iv * BV * D], S16[s0], Nd2NzParams(1, BV, D, 0, D, BV, 1, 0));
@@ -153,17 +165,17 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
             for (int32_t s = 0; s < nh; ++s) {
                 const int32_t bh = heads[s];
                 const int32_t c = bh * NT + chunk;
-                CrossCoreWaitFlag(FL_V);
                 auto la = qa.AllocTensor<bfloat16_t>();
                 auto lv = qv.AllocTensor<bfloat16_t>();
                 auto lk = qk.AllocTensor<bfloat16_t>();
                 DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
+                DataCopy(lk, Kt[static_cast<uint64_t>(c) * D * K], D * K);
+                CrossCoreWaitFlag(FL_V);
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     const int32_t task = bh * nv + iv;
                     DataCopy(lv[iv * BV * K],
                              Vt[(static_cast<uint64_t>(task) * NT + chunk) * BV * K], BV * K);
                 }
-                DataCopy(lk, Kt[static_cast<uint64_t>(c) * D * K], D * K);
                 SetFlag<HardEvent::MTE2_MTE1>(e21);
                 WaitFlag<HardEvent::MTE2_MTE1>(e21);
                 qa.EnQue(la);
@@ -316,7 +328,6 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const int32_t bh = heads[s];
                 const int32_t task = bh * nv + iv;
                 const int32_t c = bh * NT + chunk;
-                CrossCoreWaitFlag(FL_C1);
                 // The previous iteration's vector work may still be reading the
                 // UB staging buffers (ub/vf/vb/sc) that this iteration loads
                 // into.  A one-chunk-per-launch kernel never sees this WAR
@@ -325,6 +336,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const uint64_t u0 = static_cast<uint64_t>(c) * M * D;
                 const uint64_t out0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
                 DataCopy(ub, U[u0], DataCopyParams(M, 8, 0, 0));
+                CrossCoreWaitFlag(FL_C1);
                 DataCopy(d1, D1[out0], DataCopyParams(M, 8, 0, 0));
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
@@ -361,7 +373,6 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const int32_t bh = heads[s];
                 const int32_t task = bh * nv + iv;
                 const int32_t c = bh * NT + chunk;
-                CrossCoreWaitFlag(FL_C2);
                 // Same WAR hazard as stage 2: d2/d3/d4/dec, ob and s16 are all
                 // rewritten here while the previous iteration's reads of them
                 // (and its MTE3 copies out of ob/s16) may still be in flight.
@@ -371,9 +382,10 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const uint64_t d4base = static_cast<uint64_t>(bh) * D * D +
                                         static_cast<uint64_t>(iv) * BV * D;
                 DataCopy(d2, D2[t0], DataCopyParams(M, 8, 0, 0));
+                DataCopy(dec, Decay[static_cast<uint64_t>(c) * D], DataCopyParams(1, 16, 0, 0));
+                CrossCoreWaitFlag(FL_C2);
                 DataCopy(d3, D3[t0], DataCopyParams(M, 8, 0, 0));
                 DataCopy(d4, D4[d4base], DataCopyParams(BV, 16, 0, 0));
-                DataCopy(dec, Decay[static_cast<uint64_t>(c) * D], DataCopyParams(1, 16, 0, 0));
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
                 // out = d2 * scale + d3 is accumulated in fp32 and only then
