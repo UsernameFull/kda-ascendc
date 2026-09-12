@@ -676,6 +676,45 @@ per-launch and per-stage latency, not by FLOPs:
     per pass instead of per chunk) hangs the launch with an aicore timeout at
     `[1,8192,32]` (`/tmp/kdaval/wu_var.py`), so the serialisation there
     (0.116 us per chunk of a 0.538 ms stage) is not available for free either.
+  - 2026-09-12: `out` is now stored straight into the caller's `[B, T, H, D]`
+    tensor - one 128 B run per chunk row, `dstGap = NH*D/16 - 4` - instead of a
+    task-major buffer that `api.py` turned around with
+    `permute(0,3,4,1,2,5).contiguous()`.  That Transpose was 186 us of device
+    time over 67 MB in + 67 MB out (`msprof` api timeline, the largest fixed
+    cost of the call after the kernels themselves); the strided store costs
+    0.04 ms of K2 (3.036 -> 3.073, MIN of 7) and is bit-exact against the old
+    layout plus host permute at `[1,1024,32]` and `[1,8192,32]`
+    (`/tmp/kdaval/k2os.py`).  End to end at `[1,8192,32]` 6.236 -> 6.039 ms
+    (BENCH_REPS=3 medians, Triton 30.27 => 5.01x); the smaller shapes move the
+    same way (`[2,1024,4]` 0.670 -> 0.650, `[2,4096,8]` 2.456 -> 2.410).
+  - The protocol cost is per flag *instruction*, not per dependency hop - but
+    only while nothing else runs.  `/tmp/kdaval/flag2.py` (the loop's schedule,
+    `NT = 512, NBLK = 32, NH = 2`, no data) costs 3.709 ms with the four
+    per-head phases, 1.862 ms for the same four phases with one set/wait per
+    phase, and 0.947 ms for one phase.  So halving the phases and halving the
+    ops are worth exactly the same in a data-free probe, and *both* are losses
+    in the real loop (the per-head coalescing above: 3.03 -> 3.74-3.83 ms on
+    the same counter, merge V alone 3.79) because the per-head chain is what
+    overlaps the two heads' engines.
+  - Coalescing the per-head ops is not merely slower, it is unsafe: the merged
+    form faults with `L0B read/write conflict ... in the MTE` on an AIC core
+    unless the AIC's per-head `PipeBarrier<PIPE_M>` goes back to `PIPE_ALL`
+    (which costs 4.71 ms); an `M_MTE1` event pair in its place costs 7.96 ms.
+    The barrier was never covering the AIC's L0B WAR by itself - the flag ops
+    are also a scheduling wall the compiler cannot move `LoadData` across.
+  - K2 is latency bound, not traffic bound.  Removing one stage at a time
+    (`/tmp/kdaval/k2multi.py`, MIN of 7, `[1,8192,32]`): stock 3.070, `no_s1`
+    3.027, `no_s3` 3.050, `no_d4` 2.987, `no_s16` 2.971, `no_vvts` 3.057,
+    `no_d123` 3.001, `no_d123load` 3.016 - every constituent is worth <= 0.10 ms
+    of a 3.07 ms loop.  A plain 134 MB `copy_` runs at ~1.1 TB/s on this part
+    (`/tmp/kdaval/bwtest.py`) while K2 moves ~1.3 GB in 3.03 ms (~430 GB/s), so
+    bandwidth is not what the loop waits on.
+  - Two more drains that look free are not: publishing `FL_R`/`FL_V` *before*
+    the `Out`/`v_new` store (only `S16`/`v_new^T` are consumed) is 3.061 ms
+    against 3.07, and narrowing the AIV's two per-head `PipeBarrier<PIPE_ALL>`
+    WAR drains to `V_MTE2` (plus `MTE3_V` in stage 4) is 3.038 ms against
+    3.061 - both inside the noise, and deleting them outright is not an option
+    (the AIC then faults with `L0A read/write conflict`), so the drain stays.
 - `mix_all_cube` was 3.5x *slower* than `separated` (79.2 vs 22.7 ms at
   `[1,8192,32]`) only because it never got the idioms the separated kernels
   had.  Porting them (one `Fixpipe` per tile, burst loads for 16-column
