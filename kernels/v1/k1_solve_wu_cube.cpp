@@ -30,12 +30,15 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
     TEventID emf = pipe.AllocEventID<HardEvent::M_FIX>();
-    TEventID efm = pipe.AllocEventID<HardEvent::FIX_M>();
     TQue<QuePosition::B1, NC> qa, qb;
     pipe.InitBuffer(qa, NC, M * K * 2);
     pipe.InitBuffer(qb, NC, D * K * 2);
-    TQue<QuePosition::CO1, NC> qc;
-    pipe.InitBuffer(qc, NC, M * D * 4);
+    // One L0C slot per (pass, chunk) unit: 2 * NC * 8 KB = 64 KB of the 128 KB
+    // L0C.  Slots are never reused inside a block, so no FIX_M -> M ordering is
+    // needed between a Fixpipe and the next Mmad; with the old NC-deep queue
+    // the two passes shared slots and that drain cost 0.14 ms of the 1.94 ms
+    // stage (removing it is bit-identical: d_out 0.00e+00).
+    LocalTensor<float> cfall(TPosition::CO1, 0, 2 * NC * M * D);
     LocalTensor<uint8_t> a8(TPosition::A2, 0, 2 * NC * M * K * 2);
     LocalTensor<uint8_t> b8(TPosition::B2, 0, 2 * NC * D * K * 2);
     GlobalTensor<bfloat16_t> A16, Rk, Rv, W, U;
@@ -78,7 +81,7 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
             LoadDataWithTranspose(b, lb, LoadData2dTransposeParams(0, 8, 1, 0, 0));
             SetFlag<HardEvent::MTE1_M>(e1m);
             WaitFlag<HardEvent::MTE1_M>(e1m);
-            LocalTensor<float> cf = qc.AllocTensor<float>();
+            LocalTensor<float> cf = cfall[slot * M * D];
             Mmad(cf, a, b, MmadParams(M, D, K, 0, false, true));
             SetFlag<HardEvent::M_FIX>(emf);
             WaitFlag<HardEvent::M_FIX>(emf);
@@ -90,9 +93,6 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
             } else {
                 Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(U[static_cast<uint64_t>(c0 + ch) * M * D], cf, ip);
             }
-            SetFlag<HardEvent::FIX_M>(efm);
-            WaitFlag<HardEvent::FIX_M>(efm);
-            qc.FreeTensor(cf);
             qa.FreeTensor(la);
             qb.FreeTensor(lb);
         }

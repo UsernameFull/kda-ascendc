@@ -236,7 +236,10 @@ flag 有效、粗化反而慢（粗化丢失 head 间重叠，且换不出 phase
      operand 8 KB×2 = 80 KB > 64 KB，**不可行**）。除非 state 走 bf16（T3.1/P5），
      否则 AIC 侧先卡死。
 - 另外：`kda_solve_wu_cube_kernel` 1.61 ms / 12288 block = **512 波**，每 unit
-  786 ns（~20 条指令 + 3 次 drain），而它的真实算力只有 0.02 ms；block 固定成本
-  1.26 µs + 每 chunk ~0.45 µs。这是 K2 之外最值得动的单点（流水化 + 每 block
-  多 chunk，预估 1.6 → 0.6–1.0 ms）。`NC` 加深会被 AIC 的 `TQue<B1, N≥4>` 上限挡住，
-  必须改成手工 ping-pong L1。
+  393 ns（~20 条指令 + 3 次 drain），而它的真实算力只有 0.02 ms。这是 K2 之外
+  最值得动的单点。已落地的部分：给每个 (pass, chunk) 一个独立 L0C 槽
+  （`cfall`，2*NC*8 KB = 64 KB）后，`Fixpipe → Mmad` 的 `FIX_M` drain 不再需要，
+  1.946 → 1.772 ms 且 **bit-identical**（d_out/d_state 都是 0.00e+00）。
+  剩下的两个 drain（`MTE1_M`、`M_FIX`）删掉会 fault（实测 507015），要拿它们
+  必须真做软件流水（`NC` 加深会被 AIC 的 `TQue<B1, N≥4>` 上限挡住，
+  必须改成手工 ping-pong L1），预估还能拿 0.4–0.8 ms。
