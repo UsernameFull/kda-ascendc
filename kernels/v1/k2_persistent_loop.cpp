@@ -58,7 +58,7 @@ constexpr int32_t N_D4 = 128;
 constexpr int32_t TILE = M * BV;
 constexpr int32_t S_TILE = BV * D;
 constexpr int32_t NG = 2 * BV / M;   // 16-row groups in the whole d4 tile
-constexpr int32_t MAXH = 2;          // heads owned by one block
+constexpr int32_t MAXH = 4;          // heads owned by one block (UB: 32 KB of fp32 state each)
 // L0A holds W and Qg side by side (2*M*D bf16) and is then reused by d34's
 // NG+1 16-column operands, so the raw allocation is whichever is larger.
 constexpr int32_t L0A_ELEMS =
@@ -295,43 +295,49 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
         TEventID ev3 = pipe.AllocEventID<HardEvent::V_MTE3>();
         TEventID evm2 = pipe.AllocEventID<HardEvent::V_MTE2>();
-        TBuf<TPosition::VECCALC> uu, ud1, uv, ut, uf, usc, uo, uof, ud2, ud3, ud4, udec, us, us16;
-        TBuf<TPosition::VECCALC> ud1f, ud2f, ud3f;
+        TEventID e3v = pipe.AllocEventID<HardEvent::MTE3_V>();
+        // UB budget.  The fp32 state is 32 KB per head and all MAXH of them
+        // stay resident for the whole loop, so at MAXH = 4 (the head count
+        // that makes [1,8192,96] a single wave of 24 blocks) the staging has to
+        // fit in the ~64 KB left of this part's 192 KB UB (probe: 96 KB of
+        // state plus 90.5 KB of staging passes, 112 KB of state does not).  The
+        // d4 tile is therefore walked in two 32-row halves (ud4h) and so is the
+        // bf16 state publish (us16h), the three fp32 widens share ux, the fp32
+        // output tile is uf (the widened u, dead after stage 2) and the bf16
+        // output tile is ud1 (d1, also dead after stage 2): 54.5 KB of staging
+        // plus the 128 KB of state.
+        TBuf<TPosition::VECCALC> uu, ud1, uv, ut, uf, usc, ud2, ud3, ud4h, udec, us, us16h, ux;
         pipe.InitBuffer(uu, M * D * sizeof(bfloat16_t));
         pipe.InitBuffer(ud1, TILE * sizeof(bfloat16_t));
-        pipe.InitBuffer(ud1f, TILE * sizeof(float));
+        pipe.InitBuffer(ux, TILE * sizeof(float));
         pipe.InitBuffer(uv, TILE * sizeof(bfloat16_t));
         pipe.InitBuffer(ut, TILE * sizeof(bfloat16_t));
         pipe.InitBuffer(uf, M * D * sizeof(float));
         pipe.InitBuffer(usc, (BV / M) * M * M * sizeof(bfloat16_t));
-        pipe.InitBuffer(uo, TILE * sizeof(bfloat16_t));
-        pipe.InitBuffer(uof, TILE * sizeof(float));
         pipe.InitBuffer(ud2, TILE * sizeof(bfloat16_t));
-        pipe.InitBuffer(ud2f, TILE * sizeof(float));
         pipe.InitBuffer(ud3, TILE * sizeof(bfloat16_t));
-        pipe.InitBuffer(ud3f, TILE * sizeof(float));
-        pipe.InitBuffer(ud4, S_TILE * sizeof(float));
+        pipe.InitBuffer(ud4h, (S_TILE / 2) * sizeof(float));
         pipe.InitBuffer(udec, D * sizeof(float));
         pipe.InitBuffer(us, MAXH * S_TILE * sizeof(float));
-        pipe.InitBuffer(us16, S_TILE * sizeof(bfloat16_t));
+        pipe.InitBuffer(us16h, (S_TILE / 2) * sizeof(bfloat16_t));
 
         LocalTensor<bfloat16_t> ub = uu.Get<bfloat16_t>();
         LocalTensor<bfloat16_t> d1 = ud1.Get<bfloat16_t>();
-        LocalTensor<float> d1f = ud1f.Get<float>();
+        LocalTensor<float> d1f = ux.Get<float>();
         LocalTensor<bfloat16_t> vb = uv.Get<bfloat16_t>();
         LocalTensor<bfloat16_t> vt = ut.Get<bfloat16_t>();
         LocalTensor<float> vf = uf.Get<float>();
         LocalTensor<bfloat16_t> sc = usc.Get<bfloat16_t>();
-        LocalTensor<bfloat16_t> ob = uo.Get<bfloat16_t>();
-        LocalTensor<float> of = uof.Get<float>();
+        LocalTensor<bfloat16_t> ob = ud1.Get<bfloat16_t>();
+        LocalTensor<float> of = uf.Get<float>();
         LocalTensor<bfloat16_t> d2 = ud2.Get<bfloat16_t>();
-        LocalTensor<float> d2f = ud2f.Get<float>();
+        LocalTensor<float> d2f = ux.Get<float>();
         LocalTensor<bfloat16_t> d3 = ud3.Get<bfloat16_t>();
-        LocalTensor<float> d3f = ud3f.Get<float>();
-        LocalTensor<float> d4 = ud4.Get<float>();
+        LocalTensor<float> d3f = ux.Get<float>();
+        LocalTensor<float> d4 = ud4h.Get<float>();
         LocalTensor<float> dec = udec.Get<float>();
         LocalTensor<float> st = us.Get<float>();
-        LocalTensor<bfloat16_t> s16 = us16.Get<bfloat16_t>();
+        LocalTensor<bfloat16_t> s16 = us16h.Get<bfloat16_t>();
 
         // ---- start-up: bring the fp32 state on chip, publish the bf16 copy
         for (int32_t s = 0; s < nh; ++s) {
@@ -346,11 +352,26 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
             }
-            Cast(s16, state, RoundMode::CAST_RINT, S_TILE);
-            PipeBarrier<PIPE_V>();
-            SetFlag<HardEvent::V_MTE3>(ev3);
-            WaitFlag<HardEvent::V_MTE3>(ev3);
-            DataCopy(S16[static_cast<uint64_t>(task) * S_TILE], s16, DataCopyParams(BV, 8, 0, 0));
+            // Published in two halves: a full S_TILE bf16 buffer on top of the
+            // fp32 state does not fit at MAXH = 4.  The second half's Cast
+            // rewrites s16 while the first half's MTE3 copy may still be
+            // reading it, so the two halves are separated by an MTE3 drain
+            // (exactly the hazard the in-loop publish guards the same way).
+            for (int32_t hf = 0; hf < 2; ++hf) {
+                // NB: PipeBarrier<PIPE_MTE3> does NOT order a later V-pipe
+                // Cast after an MTE3 read of the same buffer (measured: the
+                // snapshot comes out wrong and out_err jumps 7.6e-06 ->
+                // 2.9e-03 at [1,16,2]).  A global barrier does.
+                if (hf == 1) PipeBarrier<PIPE_ALL>();
+                LocalTensor<float> sh = state[hf * (S_TILE / 2)];
+                Cast(s16, sh, RoundMode::CAST_RINT, S_TILE / 2);
+                PipeBarrier<PIPE_V>();
+                SetFlag<HardEvent::V_MTE3>(ev3);
+                WaitFlag<HardEvent::V_MTE3>(ev3);
+                DataCopy(S16[static_cast<uint64_t>(task) * S_TILE + hf * (BV / 2) * D], s16,
+                         DataCopyParams(BV / 2, 8, 0, 0));
+            }
+
             PipeBarrier<PIPE_ALL>();
         }
         for (int32_t s = 0; s < nh; ++s) {
@@ -421,7 +442,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 DataCopy(dec, Decay[static_cast<uint64_t>(c) * D], DataCopyParams(1, 16, 0, 0));
                 CrossCoreWaitFlag(FL_C2);
                 DataCopy(d3, D3[t0], DataCopyParams(M, 4, 0, 0));
-                DataCopy(d4, D4[d4base], DataCopyParams(BV, 16, 0, 0));
+                DataCopy(d4, D4[d4base], DataCopyParams(BV / 2, 16, 0, 0));
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
                 // out = d2 * scale + d3 is accumulated in fp32 and only then
@@ -432,26 +453,54 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 Add(of, of, d3f, TILE);
                 Cast(ob, of, RoundMode::CAST_RINT, TILE);
                 PipeBarrier<PIPE_V>();
-                Mul(state, state, dec, 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-                Mul(state[64], state[64], dec[64], 64, BV, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-                Add(state, state, d4, S_TILE);
-                PipeBarrier<PIPE_V>();
-                Cast(s16, state, RoundMode::CAST_RINT, S_TILE);
-                PipeBarrier<PIPE_V>();
-                SetFlag<HardEvent::V_MTE3>(ev3);
-                WaitFlag<HardEvent::V_MTE3>(ev3);
-                // [b, t, h, D] directly: one 4-block (128 B) run per chunk
-                // row, the next row NH * D elements further on.  Saves the
-                // 186 us Transpose that used to turn the task layout around.
-                {
-                    const int32_t hh = bh - (bh / NH) * NH;
-                    const uint64_t obase = (static_cast<uint64_t>(bh / NH) * NT + chunk) *
-                                               (static_cast<uint64_t>(M) * NH * D) +
-                                           static_cast<uint64_t>(hh) * D + iv * BV;
-                    DataCopy(Out[obase], ob,
-                             DataCopyParams(M, 4, 0, static_cast<uint16_t>(NH * D / 16 - 4)));
+                // The state recurrence walks the tile in two 32-row halves so
+                // that half a tile of staging is enough: the second half's load
+                // and its MTE2->V wait hide behind the first half's vector work.
+                for (int32_t hf = 0; hf < 2; ++hf) {
+                    if (hf == 1) {
+                        WaitFlag<HardEvent::MTE2_V>(e2v);
+                        // The first half's S16 store has to have read s16
+                        // before this half's Cast rewrites it.  That is an
+                        // MTE3 -> V dependency across pipes, which a
+                        // PipeBarrier<PIPE_MTE3> does NOT provide (it only
+                        // orders MTE3 against MTE3 - measured on the start-up
+                        // publish: the snapshot came out wrong and out_err
+                        // went 7.6e-06 -> 2.9e-03), so it needs the event pair.
+                        WaitFlag<HardEvent::MTE3_V>(e3v);
+                    }
+                    LocalTensor<float> sh = state[hf * (S_TILE / 2)];
+                    Mul(sh, sh, dec, 64, BV / 2, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+                    Mul(sh[64], sh[64], dec[64], 64, BV / 2, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+                    Add(sh, sh, d4, S_TILE / 2);
+                    PipeBarrier<PIPE_V>();
+                    Cast(s16, sh, RoundMode::CAST_RINT, S_TILE / 2);
+                    PipeBarrier<PIPE_V>();
+                    SetFlag<HardEvent::V_MTE3>(ev3);
+                    WaitFlag<HardEvent::V_MTE3>(ev3);
+                    if (hf == 0) {
+                        // [b, t, h, D] directly: one 4-block (128 B) run per
+                        // chunk row, the next row NH * D elements further on.
+                        // Saves the 186 us Transpose that used to turn the task
+                        // layout around.
+                        const int32_t hh = bh - (bh / NH) * NH;
+                        const uint64_t obase = (static_cast<uint64_t>(bh / NH) * NT + chunk) *
+                                                   (static_cast<uint64_t>(M) * NH * D) +
+                                               static_cast<uint64_t>(hh) * D + iv * BV;
+                        DataCopy(Out[obase], ob,
+                                 DataCopyParams(M, 4, 0, static_cast<uint16_t>(NH * D / 16 - 4)));
+                    }
+                    DataCopy(S16[static_cast<uint64_t>(task) * S_TILE + hf * (BV / 2) * D], s16,
+                             DataCopyParams(BV / 2, 8, 0, 0));
+                    if (hf == 0) {
+                        // ... and release the buffer for the second half once
+                        // this store has actually read it.
+                        SetFlag<HardEvent::MTE3_V>(e3v);
+                        SetFlag<HardEvent::V_MTE2>(evm2);
+                        WaitFlag<HardEvent::V_MTE2>(evm2);
+                        DataCopy(d4, D4[d4base + (BV / 2) * D], DataCopyParams(BV / 2, 16, 0, 0));
+                        SetFlag<HardEvent::MTE2_V>(e2v);
+                    }
                 }
-                DataCopy(S16[static_cast<uint64_t>(task) * S_TILE], s16, DataCopyParams(BV, 8, 0, 0));
                 CrossCoreSetFlag<2, PIPE_MTE3>(FL_R);
             }
         }

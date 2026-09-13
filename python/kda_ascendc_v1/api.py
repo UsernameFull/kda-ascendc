@@ -355,7 +355,7 @@ def kda_bt16_fwd_ascendc(
         return out_public, final_state, debug
 
     if k2_mode == "persistent_loop":
-        # One device-side chunk loop.  Each block owns up to MAXH=2 heads (both
+        # One device-side chunk loop.  Each block owns up to MAXH=4 heads (both
         # AIV subcores run the same flag sequence and split the value dim), keeps
         # its fp32 state in UB across all chunks and never writes S32 until the
         # end, so the whole recurrence is a single MIX launch.  The block count
@@ -365,9 +365,20 @@ def kda_bt16_fwd_ascendc(
         # two heads per block keep every block resident instead of queueing a
         # second wave (32 blocks at [1,8192,32] cost 17.2 vs 13.8 ms).
         aic_cores = 24
+        # Heads per block.  The kernel keeps up to MAXH=4 heads resident and one
+        # block per AIC is all the parallelism this part has, so ask for as few
+        # blocks as the head count allows while still filling all 24 AICs - a
+        # second wave costs a whole pass over the chunks.  Measured at
+        # [1,8192,96,128]: 4 heads/block 6.53-6.56 ms against 6.71-6.88 for
+        # 2 heads/block (MIN of 3 in-process rounds, 3 rounds each), so the
+        # auto value is ceil(bh / 24) capped at the kernel's MAXH.
+        maxh_env = os.environ.get("KDA_PERSIST_LOOP_MAXH")
+        maxh = (max(1, min(4, int(maxh_env))) if maxh_env
+                else max(1, min(4, (bh + aic_cores - 1) // aic_cores)))
         want = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
-        nblk = want if 0 < want <= bh else (bh if bh <= aic_cores else (bh + 1) // 2)
-        nblk = max(nblk, (bh + 1) // 2)
+        nblk = want if 0 < want <= bh else (bh if bh <= aic_cores
+                                           else (bh + maxh - 1) // maxh)
+        nblk = max(nblk, (bh + maxh - 1) // maxh)
         s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
         s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
         d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.float32, device=q.device)
