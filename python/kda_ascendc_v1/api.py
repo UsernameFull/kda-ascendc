@@ -78,6 +78,7 @@ def _compile_all() -> None:
         ("kernels/v1/preprocess.cpp", "kda_preprocess_kernel"),
         ("kernels/v1/k1_gram.cpp", "kda_gram_kernel"),
         ("kernels/v1/k1_pre_gram.cpp", "kda_pre_gram_kernel"),
+        ("kernels/v1/k1_pre_gram_mix.cpp", "kda_pre_gram_mix"),
         ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
         ("kernels/v1/k1_solve_wu_wide.cpp", "kda_solve_wu_wide"),
         ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
@@ -254,12 +255,11 @@ def kda_bt16_fwd_ascendc(
     # it only writes Qn/Kn/Gate/Gc when those pointers are non-null (the
     # ``return_intermediates`` debug path).
     keep = return_intermediates
-    pre_args = _pack_ptrs([q, k, v, g, beta_pack,
-                           A_log, bias,
-                           qn if keep else None, kn if keep else None,
-                           gate if keep else None, gc if keep else None,
-                           beta_out, decay, rk, rv, qg, kg,
-                           aqk32, aqk16, L, mask_s, mask_l])
+    pre_head = [q, k, v, g, beta_pack, A_log, bias,
+                qn if keep else None, kn if keep else None,
+                gate if keep else None, gc if keep else None,
+                beta_out, decay, rk, rv, qg, kg]
+    pre_tail = [aqk32, aqk16, L, mask_s, mask_l]
     # One block walks `pre_unroll` consecutive chunks.  The stage is issue-bound
     # and pays a fixed per-block setup cost, so unrolling is worth 8-12% from a
     # few hundred chunks up (measured 2.679 -> 2.342 ms at [1,8192,32]); it is
@@ -267,10 +267,27 @@ def kda_bt16_fwd_ascendc(
     # (fewer than 256 chunks) stay at 1 because the loop wrapper itself costs a
     # few percent there.
     pre_unroll = 1 if c < 256 else min(8, max(2, c // 512))
-    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
-                 _i(qk_row_bytes), _i(g_row_bytes)]
     mark("pre_gram_start")
-    _launch("kda_pre_gram_kernel", (c + pre_unroll - 1) // pre_unroll, pre_args, stream)
+    if os.environ.get("KDA_PRE_GRAM", "mix") == "aiv":
+        pre_args = _pack_ptrs(pre_head + pre_tail)
+        pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
+                     _i(qk_row_bytes), _i(g_row_bytes)]
+        _launch("kda_pre_gram_kernel", (c + pre_unroll - 1) // pre_unroll, pre_args, stream)
+    else:
+        # The two intra-chunk Grams run on the paired Cube: the AIVs publish
+        # ga/gk1/gb in bf16 (12 KB per chunk) and the AIC does both 16x16x128
+        # Mmads per step.  The Gram half is 1.05 ms of the vector-only block's
+        # 2.21 ms and the vector pipe is the bottleneck of the whole stage, so
+        # the Cube's work is hidden behind the AIV's remaining ~3.3 us per chunk
+        # (see kernels/v1/k1_pre_gram_mix.cpp).
+        gram_ops = torch.empty((3, c, CHUNK, D), dtype=torch.bfloat16, device=q.device)
+        pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2]] + pre_tail)
+        pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
+                     _i(qk_row_bytes), _i(g_row_bytes)]
+        # One MIX block pairs an AIC with two AIV subcores, so it covers
+        # 2 * pre_unroll chunks.
+        _launch("kda_pre_gram_mix", (c + 2 * pre_unroll - 1) // (2 * pre_unroll),
+                pre_args, stream)
     finish("pre_gram_ms", "pre_gram_start")
 
     a32 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
