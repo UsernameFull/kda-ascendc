@@ -1,0 +1,199 @@
+# AscendC v1 重构方案（`[1,8192,96,128]`）
+
+日期：2026-09-13　基线：`3115ead`（e2e 14.82 ms）　设备：Ascend 910B3 / CANN 9.1
+
+对照：FLA `chunk_kda` 在 FLA 的 H100/H200 CI 上是 2.722 ms；FLA 的 triton-ascend
+后端在本机同一 shape 上是 54.4 ms（chunk32）/ 69.6 ms（chunk64）。我们 14.82 ms
+对 FLA-NPU 领先 3.7x，对 FLA-H100 落后 5.4x。本文只规划本仓库 AscendC 路径。
+
+## 0. 摘要
+
+| 阶段 | 目标 | 改动性质 | 前提 |
+|---|---:|---|---|
+| 现状 | **14.82 ms** | — | 437eaff + 3115ead |
+| T0 | 修 3 个已知故障 | bugfix | — |
+| T1 | **10–11 ms** | 结构不变（3 段），把 AIV 的工作搬走、把 launch 合掉 | T0 |
+| T2 | **6–8 ms** | 结构改变：K2 单波化 + 两侧指令瘦身 | T1 + P2/P3 探针 |
+| T3 | **3–4 ms** | 算法级：Cube 常驻 state / 分段两趟扫描 | T2 + 新代数 |
+
+四条硬边界（实测）：
+
+| 边界 | 数值 | 依据 |
+|---|---:|---|
+| HBM 拷贝带宽 / elementwise | 1165 / 1070–1113 GB/s | `/tmp/roof.py` |
+| Cube bf16 | 301 TFLOPS @8192³（265 @4096³） | 同上 |
+| 现数据流搬运量 ~5.8 GB | **5.0 ms** | 逐 kernel 流量累加 |
+| 算法 FLOPs ~93 GFLOP | **0.31 ms** | 现在实际只有 ~6 TFLOPS（2%） |
+| 理想数据流（q/k/v/g/beta/o 各一次 ~1.0 GB） | **0.95 ms** | 下界参考 |
+
+结论：14.82 ms 既不是算力受限也不是带宽受限，而是 **AIV 指令发射 + 跨核协同时延受限**。
+因此所有收益都来自"减少 AIV 指令数"或"减少每 chunk 的跨核往返"，
+换算法（更少 FLOPs）基本没有收益空间；换数据流（少搬内存）只有 ~1 倍空间。
+
+## 1. 现状分解
+
+`KDA_PROFILE=1`（MIN of 5，`KDA_PRE_GRAM=aiv`）：
+
+| stage | kernel | launch | 网格 | ms |
+|---|---|---|---:|---:|
+| K1 融合 | `kda_pre_gram_kernel` | 1 | 6144 blocks × 8 chunk | 6.53 |
+| K1 求解 | `kda_solve_wu_wide` + `kda_solve_wu_cube_kernel` | 2 | 1536 + 12288 | 1.90 |
+| K2 递推 | `kda_k2_persistent_loop` | 1 | 48 blocks = 24 AIC × **2 波** | 6.42 |
+
+后续每条杠杆都要引用这些实测数字：
+
+- **K1**：每 chunk 固定 133 ns 发射成本（与 H 无关，`[1,1024,4]` 0.46 ms → `[1,8192,96]` 6.53 ms）；
+  MTE 管道几乎空闲（`aiv_mte2_ratio` 0.066）而 vec 0.845；每 chunk 61 KB 流量 → 3.0 GB，
+  实际 ~300 GB/s（带宽的 26%）。Gram 循环占单 block 2.21 ms 里的 1.05 ms（47%）。
+- **K2**：每 chunk-step 6.3 µs（nh=2 = 2 个 head），合每 head-chunk **3.15 µs**；
+  同一结构在 `[1,8192,32]` 上 nh=1 是 5.9 µs/step，说明 heads/block 的摊销是真实的
+  （1 波 512 步的地板 ~2.7–2.8 ms）。data-free 协议探针：4-phase 7.2 µs/step、
+  2-phase 3.6、1-phase 1.85；但把某个 phase *整个删掉* 只值 ~1%（阶段被另一侧掩盖）。
+- **solve**：`wide` 已到带宽地板（370 GB/s，40 MB/pass）；Cube 部分 NC≤4 是硬约束
+  （L0A/L0B 槽位索引 `pass*NC + ch`，L0C/`qc` 队列只有 NC 深）。
+
+## 2. 杠杆清单（按证据强度排序）
+
+| # | 杠杆 | 预期 | 证据 |
+|---|---|---|---|
+| L1 | K1 的 Gram 上配对 Cube（mix） | 6.53 → ~4.0 | 已实现（437eaff）：Gram 47% of block、publish 只值 0.047 ms、AIC 参考吞吐 0.78 µs/chunk |
+| L2 | solve 两次 launch 合成一个 MIX，a16 不再落 GM | 1.90 → 1.2–1.4 | `[1,8192,32]` 隔离测数：wide 0.10 ms、Cube 0.55 ms（NC≤4 上限）；H=96 时 a16 写+读 50 MB |
+| L3 | K1 AIV 指令瘦身（prep 复用 Qg/Kg、少一次 exp2、合并 reduce） | 6.53 → 5.6–6.0 | 450 指令/chunk 的发射成本模型；`pre_gram` 的每指令 ~27 cycle |
+| L4 | K2 AIV 瘦身（state 更新用 `MulAddDst`、S16 发布合并、gather 合并） | -0.5–0.8 ms | 每 head-chunk 3.15 µs 里 state 的 64+64 repeat 是最大单项 |
+| L5 | K2 单波化（MAXH=4 / nblk=24） | 6.42 → 3.5–3.8 | 96 头 / 24 AIC 必须 2 波；nh=2 的 AIV TBuf 154.5 KB / 192 KB，需 UB diet |
+| L6 | 分段两趟扫描（T 方向并行 + 段仿射传播） | 见 §5 | 需要新代数；Cube 只多 0.7 ms 的活 |
+| L7 | Cube 常驻 state（decay 折进 Q/K operand） | 见 §5 | 未验证，需要 P4 探针 |
+
+## 3. T0：先修三个已知故障（0.5–1 天）
+
+1. **`KDA_PRE_GRAM=mix`（437eaff，当前默认）在 `[1,8192,96,128]` 与 `[1,8192,32,128]`
+   不返回**（507014 超时两次后 >500 s 挂死）。修不好之前默认值退回 `aiv`（一行），
+   mix 改显式 opt-in。
+   - 先做 shape 二分：`[1,256,96]`、`[1,1024,96]`、`[1,2048,96]`、`[1,8192,64]`、
+     `[1,8192,96]`，把断点定到 "H 相关" 还是 "grid 大小相关"。
+   - 可疑点：AIV 双 subcore 的 2-deep ring 在长网格下的 WAR；`FL_DONE` 的
+     1 set / 2 wait 广播语义；AIC 侧 `PipeBarrier<PIPE_ALL>` 的位置（对照
+     `k2_persistent_loop` 的结论：缺它 1/3 概率 aicore exception）；
+     `pre_unroll=8` 时一个 block 16 chunk 的流水深度。
+2. **`persistent_loop` 的 507015**（本 shape 约 1/3 概率）——不是性能问题，但污染所有
+   benchmark 与 CI 结果。
+3. **Triton `kda_bt16_fwd` 在 H=96, T≥2048 的 K1 挂死**（grid ≥12288）：修，或在
+   `kda_bt16_fwd` 的 docstring / README 里明确不支持该 shape。
+
+T0 完成判据：`KDA_PRE_GRAM=aiv` 路径 20 次连续 e2e 无 fault；`pytest -q` 全绿；
+`benchmarks/bench_fla_compare.py --shape 1,8192,96,128` 复现 14.8 ± 0.3 ms。
+
+## 4. T1：结构不变，10–11 ms（1–2 周）
+
+三条并行、互不阻塞的改动，每条独立提交 + 独立测数：
+
+### T1.1 落地 mix（L1）
+- 修 T0.1 的挂死；在小 shape 上先跑 `pytest` + 与 `aiv` 路径逐输出比对
+  （`return_intermediates` 的 13 个输出，期望除 Aqk/L 的 rounding 外 bit-identical）。
+- 目标：`pre_gram_ms` 6.53 → 4.0–4.5；`aiv_vec_ratio` 0.845 → ~0.45，
+  AIC 保持 <30% duty。
+- 失败模式记录：一旦发现某个 shape 挂死，先查 ring 深度和 `FL_DONE` 广播，
+  再查 AIC 的 `PipeBarrier`。
+
+### T1.2 solve 融合（L2）
+- 新的 MIX kernel：AIV 做 `wide` 递归（32 chunk/lane），AIC 做 `W`/`U` 的 Mmad，
+  两者在同一 block 里流水；`a16` 只走 GM 0.5 KB/chunk（或 L1），`a32` 只在
+  debug 时写。
+- 约束：NC ≤ 4（L0A/L0B 槽位索引）；每个 pass 必须重新发自己的 B load（`Rk`/`Rv`）。
+- 目标：`solve_ms` 1.90 → 1.2–1.4。
+
+### T1.3 K1 指令瘦身（L3）
+- 复用 `Qg`/`Kg`（`preprocess` 已物化 gated 值）而不是重算 `2^gc`/`2^-gc`；
+  把两次 row-reduce 合并；检查 `PipeBarrier` 的实际必要性（向量管道 in-order，
+  之前测过删掉无收益，但 **发射槽位** 才是成本）。
+- 目标：6.53 → 5.6–6.0（与 T1.1 叠加后 3.5–4.0）。
+
+T1 完成判据：e2e ≤ 11 ms，`out_err < 1e-3`、`state_err < 1e-4`（`tests/test_persistent_loop.py`
+的门禁口径），并在 `[1,8192,32]` 上确认无回归（历史数字 13.67 ms 全 pass）。
+
+## 5. T2：结构改变，6–8 ms（3–6 周）
+
+T2 的两个必要条件是 **K1+solve ≤ 3.5 ms** 且 **K2 ≤ 3.3 ms**，对应两条主攻线：
+
+### T2.1 K2 单波化（L5）
+96 头 / 24 AIC，`MAXH=2` 时 48 block = 2 波，K2 就是 2 × 3.2 ms。若 `MAXH=4`
+（nblk=24，1 波），同样 512 步 → **3.5–3.8 ms**（每 step 从 6.3 µs 涨到 ~7 µs，估；
+这条必须先有 P2 的 step 分解）。
+拦路的是 UB：nh=2 时 AIV TBuf 已 154.5 KB / 192 KB（`us` 64 KB + staging 90 KB）。
+需要 UB diet，按代价从低到高：
+1. `us16`（32 KB）不常驻，改成每步复用 `d2f/d3f` 的临时区；
+2. staging 缓冲（`uu/uv/ut/uo/ud1` 各 2 KB，`uof/ud1f/...` 各 4 KB）合并复用；
+3. 实在不够就把 fp32 state 分两半处理（半个 64 KB 在 UB，另一半在 L1/UB 临时区）。
+前置探针 P3（`/tmp/kdaval/ub_probe.cpp` 的扩展版）先验证 4 份 state + staging 能声明。
+
+### T2.2 两侧指令瘦身（L4 + L3 的延长线）
+- K2：state 更新 `state = state*decay + d4` 现在是 64 `Mul` + 64 `Add`（或等价），
+  换 `MulAddDst`（64 条）并把 S16 的 cast/store 合并到同一次遍历；每 head-chunk
+  省 ~0.3–0.5 µs → 0.6–1.0 ms。
+- K1：把 per-row 的 `Brcb` + 多次 broadcast 合并；确认哪些 `PipeBarrier` 可以
+  换成事件对。
+- 目标：K1+solve ~3.2–3.5，K2 ~3.0–3.3。
+
+### T2.3 已否决的融合路线（不要再试）
+- **不要在 loop 的 AIV 里融合 `pre_gram`**：AIV 的发射是共享、可加的临界资源，
+  每指令 ~13 ns/(head,chunk)，`pre_gram` 的 ~450 指令/chunk 会加 ~5–6 µs 到
+  6.3 µs 的 step 上（≈ +3 ms > 它作为独立 launch 的 2.21 ms），UB 也不够
+  （154.5 + 125.1 KB > 192 KB）。
+- **不要用两 stream 分段 overlap**：合法版本（s32 串接）只值 ~1%。
+- **不要合并 phase / 合并 per-head ops**：data-free 探针看好，实机更慢
+  （per-head coalescing 3.03 → 3.74–3.83 ms）且要退回 `PIPE_ALL` 才不 fault。
+
+## 6. T3：算法级，3–4 ms（research，先探针后代数）
+
+真正把 3 ms 变可能的是把 **AIV 每 chunk 的指令数** 压到接近 0，两条候选：
+
+### T3.1 Cube 常驻 state（L7）
+`S ← decay⊙S + d4` 是 128×128 fp32 的整块读改写（每 head-chunk 8192 元素），
+是 K2 里最大单项。若把 decay 折进 operand（KDA 的累积 T 矩阵已经在 K1 里算过
+同类量），state 就只剩 Mmad 累加，可以留在 L0C/L1 不出片。需要先做的探针：
+- P4：`Fixpipe` 能否直接写 L1 / 下一 chunk 能否把 L1 上的 fp32 当 A/B operand
+  （非转置、128 宽需要 `Nd2Nz`）；若不行，则"state 只走 L0C→UB→L1"是否仍比现在便宜。
+- P5：把 state 放 bf16（每 head 32 KB）是否精度可接受（`state_err < 1e-4` 要重新验）。
+
+### T3.2 分段两趟扫描（L6）
+把 T 切成 `seg` 段，第一趟每段以 `S_in = 0` 算出段内输出与段的仿射传播算子
+（段内 chunk 变换的复合，128×128 矩阵），第二趟把 `S_in` 传下去并修正输出
+（`out += q @ (M_seg S_in)`）。Cube 代价：每 head 约 2×(512/seg) 次 128×128×128
+Mmad、共 ~200 GFLOP → 0.7 ms @301 TFLOPS，可接受；换来的是把"每 AIC 2048 个串行
+head-chunk step"压成 2048/seg + 传播。
+前提：每 step 的成本必须已经降到通讯主导（否则 step 数不变、总时间不变）。
+
+T3 完成判据：`[1,8192,96,128]` e2e ≤ 4 ms，精度门禁不变，且 `[1,2048,96]`、
+`[1,8192,32]` 不回归。
+
+## 7. 验证与门禁（每个 milestone 都要过）
+
+1. `pytest -q`（`test_persistent_loop.py` 的 `out_err < 1e-3` / `state_err < 1e-4`）。
+2. 与上一版逐输出比对：纯搬运/重构要求 **bit-identical**，数值路径变化要求
+   `out_err` 不劣化且记录绝对值。
+3. `KDA_PROFILE=1` 的 stage 分解（MIN of 5，同一进程）。
+4. `benchmarks/bench_fla_compare.py --shape 1,8192,96,128 --json` 记录 e2e 与 FLA 对照。
+5. 连续 20 次 e2e 无 507014/507015 fault。
+6. 每个改动把数字写进对应 doc（仓库惯例：一行 commit body + 一节 doc）。
+
+## 8. 已知坑 / 风险
+
+- CANN 9.1 的跨核 loop：flag id ≤ 7、协议迭代不变、prologue 用 pre-set flag；
+  loop-carried `SetFlag/WaitFlag` 会挂（`k1_pre_gram_mix.cpp` 与
+  `docs/VLLM_ASCEND_KDA_REVIEW_20260911.md` 都有记录）。
+- AIC 侧每个 stage 后必须 `PipeBarrier<PIPE_ALL>`（`FIX_M` 不覆盖 L0A/L0B/L0C 复用）。
+- `k1_pre_gram_mix.cpp` 对写法敏感：重排 buffer 声明或移动某个 `PipeBarrier<PIPE_V>`
+  会触发 aivec error（mte 0x8030860ef）。
+- `MIX` 内核里 AIV/AIC 的 UB 预算必须实测声明（`ub_probe`），不要靠推算。
+- 本 shape 上 `persistent_loop` 有 1/3 概率 fault：任何性能结论都要先看 fault 计数。
+
+## 9. 探针清单（先测后改，1–2 天量级）
+
+| # | 探针 | 回答什么 | 现状 |
+|---|---|---|---|
+| P1 | mix kernel 的 `msprof` | AIC/AIV 各自的 duty 与 stall | 有（mix 已带 msprof 结论） |
+| P2 | K2 每 step 成本分解（在各 stage 追加 N 条 dummy 指令） | 6.3 µs 里 AIV/AIC/握手各占多少 | 技术已有（`k2slack3/4.py`），未做该 shape |
+| P3 | UB 预算（4 份 state + staging） | MAXH=4 是否可声明 | `ub_probe.cpp` 可改 |
+| P4 | `Fixpipe` L0C→L1 / state 不出片 | T3.1 是否可行 | 无 |
+| P5 | bf16 state 的精度 | 是否能用半精度 state 换 UB | 无 |
+| P6 | shape 二分：mix 挂死点 | T0.1 的定位 | 无 |
