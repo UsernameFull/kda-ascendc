@@ -179,9 +179,12 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 // L0A/L0B/L0C are reused by the next stage on this same core,
                 // and the FIX_M event only covers L0C.  The L0A/L0B WAR is an
                 // Mmad-read vs LoadData-write hazard, so draining the Mmad pipe
-                // is enough: a full PIPE_ALL drain also waits for the d1/d2
-                // Fixpipe writes to reach GM, which is worth 0.15 ms of K2.
-                PipeBarrier<PIPE_M>();
+                // looks like enough - but narrowing the drain to PIPE_M faults
+                // this kernel with an aicore exception (MTE/FIXP 0x363c,
+                // CUBE_ERR 0xaf0200ab) about one launch in ten at [1,8192,32]
+                // and one in three at [1,8192,96], so the wide drain has to
+                // stay.  The narrowed form is worth ~0.15 ms of K2.
+                PipeBarrier<PIPE_ALL>();
                 CrossCoreSetFlag<2, PIPE_FIX>(FL_C1);
             }
             // ---- stage 3: d3 = Aqk @ v_new, d4 = v_new^T @ kg for every head
@@ -252,7 +255,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 qa.FreeTensor(la);
                 qv.FreeTensor(lv);
                 qk.FreeTensor(lk);
-                PipeBarrier<PIPE_M>();
+                PipeBarrier<PIPE_ALL>();
                 CrossCoreSetFlag<2, PIPE_FIX>(FL_C2);
             }
         }

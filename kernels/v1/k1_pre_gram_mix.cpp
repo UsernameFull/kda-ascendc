@@ -120,10 +120,11 @@
 //     MmadParams(16,16,128), is the transposed operand (probe in
 //     /tmp/kdaval/cubeprobe);
 //   * a software pipeline so the cross-core round trip is off the critical
-//     path.  The AIV publishes chunk u and only then turns to chunk u-1's Gram,
-//     so the Cube has a whole chunk of vector work to answer in; the AIC is
-//     paired with two AIVs (MIX_AIC_1_2) and computes both subcores' Grams per
-//     step, which leaves it at ~25% duty.  The Aqk32/L slots double as the
+//     path.  The AIV masks chunk u-1's Gram (which the Cube finished while it
+//     computed chunk u) and only then publishes chunk u, so the Cube has a
+//     whole chunk of vector work to answer in; the AIC is paired with two AIVs
+//     (MIX_AIC_1_2) and computes both subcores' Grams per step, which leaves it
+//     at ~25% duty.  The Aqk32/L slots double as the
 //     Cube->AIV channel (2 KB read + 2 KB write per chunk) so no new buffer is
 //     needed for the Gram results; the mask, the scale and the bf16 cast stay
 //     on the AIV.
@@ -133,8 +134,8 @@
 // only difference is the operand rounding - measured end to end through the
 // whole KDA pipeline in docs/ASCENDC_V1_KERNELS.md.
 //
-// The AIV publishes through a two-deep UB ring: the slot written for chunk u+2
-// was last read by the Cube for chunk u, and the DONE wait for chunk u-1 sits
+// The AIV publishes through a two-deep UB ring: the slot written for chunk u
+// was last read by the Cube at step u-2, and the DONE wait for chunk u-1 sits
 // between them, so the WAR is covered by the handshake rather than by an extra
 // loop-carried flag (those hang in this runtime, see the note below).
 //
@@ -153,18 +154,24 @@ constexpr int32_t N = M * D;
 constexpr float RCP_LN2 = 1.4426950216f;
 constexpr float LN2 = 0.6931471805599453f;
 constexpr float EPS = 1e-6f;
-// Cross-core flag channels (mode 2 = this AIC and all of its AIVs).  The two
-// AIVs of a group each need their own AIV->AIC channel: a flagId is a single
-// hardware bit that the AIVs' sets share, so one channel per flagId can only
-// carry one producer's count.  With a single channel the AIC's wait at step u
-// was satisfied by whichever AIV published first and the other half of the
-// step read GM before its producer had written it - the 256-chunk shape
-// tolerated that (the two AIVs stay in step when the grid is short) but the
-// 16384-chunk one drifted to 2e-2 of absolute error on the Gram and hung once
-// the AIC tried to consume two sets per step from one bit.
-constexpr uint16_t FL_READY0 = 8;   // AIV subcore 0 -> AIC: chunk (2u) is in GM
-constexpr uint16_t FL_READY1 = 10;  // AIV subcore 1 -> AIC: chunk (2u+1) is in GM
-constexpr uint16_t FL_DONE = 9;     // AIC -> both AIVs: chunk's raw Gram is in GM
+// Cross-core flag channels (mode 2 = this AIC and its two AIVs).  The
+// AIV->AIC direction is an *AND over the group's subcores*: a wait on the AIC
+// is satisfied only once both AIVs have set that flagId, and it consumes both
+// bits at once (probe /tmp/miniflag.cpp: one subcore setting, or two channels
+// with one set each, never satisfies a wait; both setting the same id always
+// does).  So a per-subcore channel cannot carry a step, and an AIC that waits
+// twice per step instead of once deadlocks.  Both subcores therefore set one
+// shared READY per step and the AIC waits it once.  The flag is also a level,
+// not a count: the publish has to sit *after* the previous step's DONE wait,
+// otherwise a subcore that runs a step ahead donates its next set to the
+// current wait, the pairing drifts one step per chunk and the long shapes hang
+// (which is what the original version did).
+// A mode-2 AIV->AIC flag fires only when *both* subcores of the group have set
+// it (a per-subcore channel can never be satisfied by one producer alone, and
+// the flag is a level rather than a count), so the handshake uses one shared
+// channel per step with both subcores setting it, and the AIC waits it once.
+constexpr uint16_t FL_READY = 8;    // both AIVs -> AIC: step u's operands are in GM
+constexpr uint16_t FL_DONE = 9;     // AIC -> both AIVs: step u's raw Gram is in GM
 
 // Row-wise sum of a [M, D] fp32 tile: rs[i] holds sum_d tile[i, d].
 // The first Add halves every row in place (strided repeats keep each row's
@@ -245,8 +252,10 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
         // because the AIV that is about to publish step u+1 must first pass
         // the FL_DONE of step u's Gram, which this AIC can only send after it
         // has consumed that AIV's step-u flag.
-        CrossCoreWaitFlag(FL_READY0);
-        CrossCoreWaitFlag(FL_READY1);
+        // One shared channel: both AIV subcores set it once per step, and a
+        // mode-2 AIV->AIC flag only fires when *both* of them have (see the
+        // header note), so this is the only channel that can carry a step.
+        CrossCoreWaitFlag(FL_READY);
         // Both subcores clamp an out-of-range chunk to the last one, so the
         // pair stays in step; the duplicate work is idempotent.
         int32_t c0 = base + 2 * u;
@@ -673,7 +682,16 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Cast(pgk, gk1, RoundMode::CAST_RINT, N);
     Cast(pgb, gb, RoundMode::CAST_RINT, N);
     PipeBarrier<PIPE_V>();
+    // ---- previous chunk's Gram: mask, scale, round, store -----------------
+    if (cprev >= 0) {
+        post_gram(ga32, gl32, ga16, gmaskS, gmaskL, Aqk32, L, Aqk16, cprev, scale, e2vs, ev3);
+    }
     // ---- publish + hand off ---------------------------------------------
+    // The publish sits *after* the previous step's DONE wait so that at most
+    // one publication per subcore is outstanding: the flag is a level, not a
+    // count, so a subcore that runs a step ahead would otherwise donate its
+    // next set to the current wait and the pairings would drift (which is what
+    // hangs the long shapes).
     SetFlag<HardEvent::V_MTE3>(ev3);
     WaitFlag<HardEvent::V_MTE3>(ev3);
     DataCopy(Ga[x0], pga, DataCopyParams(M, 8, 0, 0));
@@ -681,11 +699,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     DataCopy(Gb[x0], pgb, DataCopyParams(M, 8, 0, 0));
     if (pQn != nullptr) DataCopy(Qn[x0], qnb, DataCopyParams(M, 8, 0, 0));
     if (pKn != nullptr) DataCopy(Kn[x0], knb, DataCopyParams(M, 8, 0, 0));
-    CrossCoreSetFlag<2, PIPE_MTE3>(sub == 0 ? FL_READY0 : FL_READY1);
-    // ---- previous chunk's Gram: mask, scale, round, store -----------------
-    if (cprev >= 0) {
-        post_gram(ga32, gl32, ga16, gmaskS, gmaskL, Aqk32, L, Aqk16, cprev, scale, e2vs, ev3);
-    }
+    CrossCoreSetFlag<2, PIPE_MTE3>(FL_READY);
     cprev = c;
     PipeBarrier<PIPE_ALL>();
     }
