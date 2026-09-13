@@ -104,6 +104,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
         TEventID emf = pipe.AllocEventID<HardEvent::M_FIX>();
         TEventID efm = pipe.AllocEventID<HardEvent::FIX_M>();
+        TEventID em1 = pipe.AllocEventID<HardEvent::M_MTE1>();
         TQue<QuePosition::B1, 1> qw, qg, qs, qa, qv, qk;
         pipe.InitBuffer(qw, 1, M * D * 2);
         pipe.InitBuffer(qg, 1, M * D * 2);
@@ -176,15 +177,20 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 qw.FreeTensor(lw);
                 qg.FreeTensor(lg);
                 qs.FreeTensor(ls);
-                // L0A/L0B/L0C are reused by the next stage on this same core,
-                // and the FIX_M event only covers L0C.  The L0A/L0B WAR is an
-                // Mmad-read vs LoadData-write hazard, so draining the Mmad pipe
-                // looks like enough - but narrowing the drain to PIPE_M faults
+                // L0A/L0B/L0C are reused by the next stage on this same core.
+                // The FIX_M event above only covers L0C; the L0A/L0B WAR is an
+                // Mmad-read vs LoadData-write hazard, so what this needs is an
+                // M -> MTE1 order, not a full drain.  PipeBarrier<PIPE_M> is
+                // *not* that order (it only orders M against M, so the next
+                // LoadData still overwrites L0B under the Mmad) and it faults
                 // this kernel with an aicore exception (MTE/FIXP 0x363c,
                 // CUBE_ERR 0xaf0200ab) about one launch in ten at [1,8192,32]
-                // and one in three at [1,8192,96], so the wide drain has to
-                // stay.  The narrowed form is worth ~0.15 ms of K2.
-                PipeBarrier<PIPE_ALL>();
+                // and one in three at [1,8192,96].  The M_MTE1 event pair is
+                // the actual order and is bit-identical: 6.474 -> 6.383 ms at
+                // [1,8192,96,128] (MIN of 2, same process) with sum 25424.465
+                // unchanged.
+                SetFlag<HardEvent::M_MTE1>(em1);
+                WaitFlag<HardEvent::M_MTE1>(em1);
                 CrossCoreSetFlag<2, PIPE_FIX>(FL_C1);
             }
             // ---- stage 3: d3 = Aqk @ v_new, d4 = v_new^T @ kg for every head
@@ -255,7 +261,10 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 qa.FreeTensor(la);
                 qv.FreeTensor(lv);
                 qk.FreeTensor(lk);
-                PipeBarrier<PIPE_ALL>();
+                // Same M -> MTE1 order as stage 1: d34's operands overwrite the
+                // L0A/L0B bytes the three mmads above read.
+                SetFlag<HardEvent::M_MTE1>(em1);
+                WaitFlag<HardEvent::M_MTE1>(em1);
                 CrossCoreSetFlag<2, PIPE_FIX>(FL_C2);
             }
         }

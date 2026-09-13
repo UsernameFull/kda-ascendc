@@ -197,3 +197,46 @@ T3 完成判据：`[1,8192,96,128]` e2e ≤ 4 ms，精度门禁不变，且 `[1,
 | P4 | `Fixpipe` L0C→L1 / state 不出片 | T3.1 是否可行 | 无 |
 | P5 | bf16 state 的精度 | 是否能用半精度 state 换 UB | 无 |
 | P6 | shape 二分：mix 挂死点 | T0.1 的定位 | 无 |
+
+## 10. K2 实测地板（2026-09-13 晚，14 个探针）
+
+同一 shape、同一进程、MIN of 2–3，基线 `k2_ms = 6.45–6.47`（`MAXH=4`，24 block
+= 1 波 = 512 chunk-step = 每 step 12.65 µs = 每 head-chunk 3.16 µs）：
+
+| 探针 | k2_ms | 结论 |
+|---|---:|---|
+| 基线 | 6.47 | — |
+| AIC 两个 stage 的 `LoadData`/`Mmad`/`Fixpipe` 全删 | 6.46 | AIC 算力 = 0 |
+| AIV stage2 计算/搬运 + stage4 epilogue/state 全删 | 6.42 | AIV 算力 = 0 |
+| AIC 两处 `PipeBarrier<PIPE_ALL>` → `M_MTE1` 事件对（**已落地**） | 6.38 | 屏障 = 0.07 |
+| AIV `PIPE_ALL` 删除 / `MTE2_V` 对删除 / `V_MTE2` 对删除 | 6.45–6.49 | 核内事件 = 0 |
+| D4 写+读各缩到 1/4（−4.7 GB 流量） | 6.35 | 带宽 = 0.1 |
+| AIC 的 GM 加载全删 | 6.23 | AIC 加载 = 0.25 |
+| **两侧 GM 加载全删（零数据）** | **5.37** | 剩下全是协议 |
+| 所有指针钉到同一 GM 地址 | 10.90 | 同址冲突反向变慢 |
+| flag 粗化 16/step → 4/step | 12.14 | **变慢** |
+| 粗化 + 零数据 | 9.31 | 粗化丢失 head 间重叠 |
+| `nh=1`（96 block，4 波） | 12.39 | 4 × 3.1 |
+| `nh=2`（48 block，2 波） | 6.65 | 基本相同 |
+| AIC 加载批量化（单 depth-1 大 buffer） | 7.87 | 变慢 |
+
+模型（14 行全对上）：`k2_ms ≈ 512 step × 4 phase × nh × ~0.65 µs`。
+每个 head 的 4 个 phase 是 `state(AIV)→AIC→d12→AIV→v_new→AIC→d34→AIV` 四跳；
+四跳之所以串行，是因为 stage2/stage4 的 UB staging 被 nh 个 head 共用，代码
+结构上必须"所有 head 走完 stage2 才进 stage4"——这也解释了为什么 per-head
+flag 有效、粗化反而慢（粗化丢失 head 间重叠，且换不出 phase 数）。
+
+**判决**：
+- **L4 / T2.2 作废**：K2 与两侧算力、加载、屏障、事件全部无关（差额 ≤0.25 ms）。
+- **L5 / T2.1 已经吃满**（`MAXH=4` → 24 block 单波，收益已计入）。
+- K2 地板 = **5.37 ms**（零数据零算力），实际 6.3–6.5 ms。要 3 ms 级只有两条路：
+  1. **减少串行 step 数** → T3.2 分段两趟扫描（其前提"每 step 已是通讯主导"现已实测成立）。
+  2. **让 head 之间 phase 重叠** → 需要 stage2/stage4 各自独立的 UB（`ud1/uf/ux`
+     各拆两份 ≈ +14 KB，可行）**且** AIC 的 L0B 拆两份（state 32 KB×2 + d34
+     operand 8 KB×2 = 80 KB > 64 KB，**不可行**）。除非 state 走 bf16（T3.1/P5），
+     否则 AIC 侧先卡死。
+- 另外：`kda_solve_wu_cube_kernel` 1.61 ms / 12288 block = **512 波**，每 unit
+  786 ns（~20 条指令 + 3 次 drain），而它的真实算力只有 0.02 ms；block 固定成本
+  1.26 µs + 每 chunk ~0.45 µs。这是 K2 之外最值得动的单点（流水化 + 每 block
+  多 chunk，预估 1.6 → 0.6–1.0 ms）。`NC` 加深会被 AIC 的 `TQue<B1, N≥4>` 上限挡住，
+  必须改成手工 ping-pong L1。

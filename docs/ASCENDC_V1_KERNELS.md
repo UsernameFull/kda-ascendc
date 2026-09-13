@@ -125,7 +125,61 @@ natural layout and need no staging transpose.
 
 ### Performance notes
 
-`[1,8192,32]` (16384 chunks, 512 chunk steps x 4 launches) is dominated by
+#### `[1,8192,96,128]`: K2 is protocol-bound, not work-bound
+
+Fourteen null-work probes (same process, MIN of 2-3, baseline `k2_ms = 6.45-6.47`
+at `MAXH=4` = 24 blocks = one wave = 512 chunk steps = 12.65 us per step =
+3.16 us per head-chunk):
+
+| probe | k2_ms | verdict |
+|---|---:|---|
+| baseline | 6.47 | - |
+| both AIC stages' `LoadData`/`Mmad`/`Fixpipe` deleted | 6.46 | AIC math = 0 |
+| AIV stage-2 compute/stores + stage-4 epilogue/state walk deleted | 6.42 | AIV math = 0 |
+| AIC `PipeBarrier<PIPE_ALL>` -> `M_MTE1` event pair (landed) | 6.38 | barriers = 0.07 |
+| AIV `PIPE_ALL` deleted / `MTE2_V` pairs deleted / `V_MTE2` pairs deleted | 6.45-6.49 | intra-core events = 0 |
+| D4 fixpipe width and both D4 loads cut to 1/4 (-4.7 GB moved) | 6.35 | bandwidth = 0.1 |
+| all AIC GM loads deleted | 6.23 | AIC loads = 0.25 |
+| **all GM loads on both cores deleted (zero data)** | **5.37** | the rest is the protocol |
+| every AIC and AIV pointer pinned to GM offset 0 | 10.90 | aliasing makes it *worse* |
+| handshakes coarsened 16/step -> 4/step (one per phase per chunk) | 12.14 | **slower** |
+| coarsened *and* zero data | 9.31 | coarsening destroys the overlap |
+| `nh=1` (96 blocks, 4 waves) | 12.39 | 4 x 3.1 |
+| `nh=2` (48 blocks, 2 waves) | 6.65 | about the same |
+| AIC loads batched into one depth-1 queue sized `MAXH*` | 7.87 | slower |
+
+The model that fits every row is
+
+    k2_ms ~= 512 steps x 4 phases x nh heads x ~0.65 us
+
+The four phases per head are the four cross-core hops of `state(AIV) -> AIC ->
+d12 -> AIV -> v_new -> AIC -> d34 -> AIV`. They are serial because the stage-2
+and stage-4 UB staging buffers are shared by all `nh` heads, so the code must
+run every head through stage 2 before any head enters stage 4 - which is also
+why per-head flags win and coarsening loses. The floor with *zero* data and
+*zero* arithmetic is 5.37 ms; the practical value is 6.3-6.5 ms. Removing work
+from K2 (L4 in `ASCENDC_V1_REFACTOR_PLAN_20260913.md`) cannot help; only fewer
+serial steps (segmented scan) or more room to overlap heads can.
+
+#### Hard constraints found on the way (do not retry)
+
+- The AIC's per-stage L0A/L0B reuse needs an **M -> MTE1 order**. `PipeBarrier<PIPE_M>`
+  is *not* that order (it only orders M against M), so the next `LoadData` still
+  overwrites L0B under the running Mmad and the kernel faults with
+  `CUBE_ERR 0xaf0200ab` (MTE/FIXP 0x363c) about 1 launch in 10 at `[1,8192,32]`
+  and 1 in 3 at `[1,8192,96]`. `SetFlag/WaitFlag<HardEvent::M_MTE1>` *is* the
+  order: bit-identical, 6.474 -> 6.383 ms at `[1,8192,96,128]`.
+- `TQue<QuePosition::B1, N>` on the **AIC** hangs once `N >= 4`: the per-buffer
+  MTE2->MTE1 event ids run out and the first launch never returns (`507014`).
+  Keep depth 1 and size the single buffer instead. Batching all of a block's
+  W/Qg/S16 loads into one such buffer measured 6.47 -> 7.87 ms (worse).
+- `PipeBarrier<PIPE_MTE3>` does **not** order a later V-pipe `Cast` after an MTE3
+  read; only `PIPE_ALL` or a real event pair does. On the start-up state publish
+  the snapshot came out wrong and `out_err` went 7.6e-06 -> 2.9e-03.
+- `CrossCoreSetFlag<2, PIPE_X>` waits for pipe X to drain, and only 8 flag ids
+  exist (0-7). The K2 loop spends all eight on four loops of four phases.
+
+#### `[1,8192,32]` (16384 chunks, 512 chunk steps x 4 launches) is dominated by
 per-launch and per-stage latency, not by FLOPs:
 
 - The K2 chain is inherently sequential (`d12 -> vnew -> d34 -> outstate` all
