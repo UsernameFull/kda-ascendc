@@ -63,22 +63,24 @@
 //     "MaskS" tile no longer has to be fetched.  "MaskL" has to stay, because
 //     the K-side loop does write L's diagonal and the mask is what zeroes it.
 //
-// The one "PipeBarrier<PIPE_ALL>" left on the fast path (the "Gate"/"Gc" ones
-// only run when the caller asks for intermediates) guards the "Decay" store:
-// "t2" is reused by the "qg" product a few instructions later, so only the
-// MTE3->V half of it is needed - "SetFlag<HardEvent::MTE3_V>" after the copy,
-// "WaitFlag<HardEvent::MTE3_V>" before the "Mul" that overwrites the tile.
-// 2.259 -> 2.209 ms at [1,8192,32] (R=10, unroll 8, bit-identical), and
-// in-pipeline "pre_gram" 2.285 -> 2.237 ms of a 7.463 -> 7.433 ms pass.
+// The fast path has no "PipeBarrier<PIPE_ALL>" left except the one after the
+// last "post_gram" (the "Gate"/"Gc" ones only run when the caller asks for
+// intermediates).  The "Decay" store needs only the MTE3->V half:
+// "SetFlag<HardEvent::MTE3_V>" after the copy, "WaitFlag<HardEvent::MTE3_V>"
+// before the "Mul" that overwrites the tile - 2.259 -> 2.209 ms at
+// [1,8192,32] (R=10, unroll 8, bit-identical), in-pipeline "pre_gram"
+// 2.285 -> 2.237 ms of a 7.463 -> 7.433 ms pass.
 //
-// The tail "PipeBarrier<PIPE_ALL>" is the bigger prize (deleting it is 2.134
-// ms) but it has no flag formulation that survives this runtime: a
-// loop-carried "SetFlag"/"WaitFlag" pair - MTE3->MTE2, or MTE3->V waited at
-// the top of the body or at the first stored-tile write - hangs the *first*
-// launch, even though the same pattern runs in a toy micro-kernel, the
-// in-body pairs above are fine and the compiled code is the same size.  That
-// one needs the loads and the stores to stop sharing UB, i.e. a double
-// buffered TQue, not a flag.  See docs/ASCENDC_V1_KERNELS.md.
+// The pass boundary (and with it the chunk boundary) is two *self-paired*
+// pairs, one per hazard, not a drain and not a loop-carried flag chain: the
+// MTE3->V drain at the end of the pass body covers "MTE3 read of a stored
+// tile -> V write of that tile", and the V->MTE2 marker at the last
+// landing-buffer read (the rv cast) covers "V read of qnb/knb/rvb -> the next
+// pass's DataCopyPad".  Self-paired means no state crosses the iteration, so
+// the priming problem that hangs loop-carried pairs here does not arise; a
+// WaitFlag only orders its own pipe's queue, which is why the two hazards need
+// two pairs and why a single MTE3->V drain left the loads a pass ahead.  See
+// docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md sections 11.12/11.13.
 //
 // Cost model from probes on this kernel (+8 instructions per chunk, launch
 // time at [1,8192,32]): +0.040 ms for 8 one-repeat "Adds" => ~27 cycles per
@@ -826,7 +828,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // rv tile - the late reader of the three - came back holding the next
     // pass's V (6136/8192 elements wrong at CHUNK = 64, probe /tmp/pgqK.py;
     // with the marker: bit-exact, and 0.004 ms = noise).
-    if (NP > 1) { SetFlag<HardEvent::V_MTE2>(em2); WaitFlag<HardEvent::V_MTE2>(em2); }
+    SetFlag<HardEvent::V_MTE2>(em2); WaitFlag<HardEvent::V_MTE2>(em2);
 
     // ---- kg = kn * exp2(gate_last - gate) --------------------------------
     Sub(t2, gf[(M - 1) * D], gfp, 64, MT, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
@@ -894,7 +896,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // instead hangs or traps even when primed (3 attempts, /tmp/pgq5.py +
     // pgq6.py + pgq7.py).  At KDA_CHUNK = 16 there is one pass and both
     // branches compile away, as before.
-    if (NP > 1) { SetFlag<HardEvent::MTE3_V>(e3p); WaitFlag<HardEvent::MTE3_V>(e3p); }
+    SetFlag<HardEvent::MTE3_V>(e3p); WaitFlag<HardEvent::MTE3_V>(e3p);
     }
     // ---- previous chunk's Gram: mask, scale, round, store -----------------
     if (cprev >= 0) {
@@ -909,7 +911,16 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // hangs the long shapes).
     CrossCoreSetFlag<2, PIPE_MTE3>(FL_READY);
     cprev = c;
-    PipeBarrier<PIPE_ALL>();
+    // No PipeBarrier<PIPE_ALL> here any more (0.13 ms).  The chunk boundary is
+    // the pass boundary one level up and is covered by the same two pairs: the
+    // V->MTE2 marker in the rv block orders the next chunk's three loads after
+    // this chunk's last landing-buffer read, and the MTE3->V drain at the end
+    // of the pass body orders the next chunk's V writes after the stores that
+    // read the tiles they overwrite.  Both are unconditional so that the C=16
+    // build - one pass per chunk, where the boundary *is* the chunk boundary -
+    // keeps the same two guarantees.  Measured at CHUNK=64 (probe /tmp/r3a.py,
+    // 3 interleaved rounds x 8 chunks, 25 intermediates diffed): bit-exact,
+    // pre_gram 3.441 -> 3.310 ms.
     }
     // Drain the pipeline: the last chunk's Gram has no later chunk to hide
     // behind (~1/unroll of the stage, and the Cube is idle by then).
