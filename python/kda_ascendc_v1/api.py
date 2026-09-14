@@ -449,19 +449,18 @@ def kda_bt16_fwd_ascendc(
     # few hundred chunks up (measured 2.679 -> 2.342 ms at [1,8192,32]); tiny
     # grids (fewer than 256 chunks) stay at 1 because the loop wrapper itself
     # costs a few percent there.
-    # R3: the cap was 8, which at [1,8192,96,128]/CHUNK=64 leaves 768 blocks -
-    # 32 waves of the 24 AICs - and every wave re-pays the block prologue.
-    # Measured same-process grid (interleaved MIN of 3, pre_gram ms):
-    # 768 blocks (pu 8) 4.163, 384 (16) 4.099, 256 (24) 4.16, 192 (32) 4.043,
-    # 96 (64) 4.031, 48 (128) 4.160 - i.e. it is the *wave count* that costs
-    # (~0.01 ms/wave) and a partial last wave costs a whole one (128 and 64
-    # blocks are 5.33 and 2.67 waves and land at 4.563/4.561).  So target a
-    # few integral waves rather than a block-count floor: c // 384 is 32 at
-    # c = 12288 (192 blocks = 8 waves) and 64 at c = 49152 (CHUNK=16, 384
-    # blocks, measured 4.551 (pu 8) -> 4.078).  Below c = 768 both formulas
-    # agree, so the medium shapes do not move.
+    # R3: the block count is what costs - every 24-block wave re-pays the
+    # block prologue - so aim at a fixed number of *waves* rather than at a
+    # block-count floor.  The earlier sweep (768 blocks (pu 8) 4.163, 384 (16)
+    # 4.099, 192 (32) 4.043, 96 (64) 4.031 at pre_gram ~4.0 ms) pointed at
+    # ~4 waves of 24 AICs = 96 blocks, i.e. one block per 128 chunks
+    # (pu = c / 192); re-measured on the current stage (3.31 ms baseline,
+    # interleaved MIN of 3: pu 8 3.518, 16 3.374, 32 3.315, 64 3.271, and past
+    # the cap 96 3.771, 128 3.508, 192 4.872, 256 3.416), so the 4-wave target
+    # holds and pu = 64 is the optimum at c = 12288.  c // 192 keeps 96 blocks
+    # (pu capped at 64) for every larger shape and leaves the tiny grids at 1.
     pre_unroll = (int(os.environ.get("KDA_PRE_UNROLL", "0"))
-                  or (1 if c < 256 else min(64, max(2, c // 384))))
+                  or (1 if c < 256 else min(64, max(2, c // 192))))
     mark("pre_gram_start")
     if os.environ.get("KDA_PRE_GRAM", "mix") == "aiv":
         pre_args = _pack_ptrs(pre_head + pre_tail)
