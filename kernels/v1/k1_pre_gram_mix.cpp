@@ -204,18 +204,26 @@ static __aicore__ inline void RowReduce(LocalTensor<float> rs, LocalTensor<float
 // AIV side of the handoff: the Cube has just written the raw fp32 Gram of
 // chunk `c` into the Aqk32/L slots.  Mask, scale and the Aqk16 rounding stay
 // on the vector unit (2 KB read + 2 KB write per chunk, no extra GM buffer).
-static __aicore__ inline void post_gram(const LocalTensor<float> ga32,
-                                        const LocalTensor<float> gl32,
-                                        const LocalTensor<bfloat16_t> ga16,
-                                        const LocalTensor<float> gmaskS,
-                                        const LocalTensor<float> gmaskL,
+//
+// R3: the band staging is a two-deep TQue ring rather than one set of tiles
+// plus a trailing "PipeBarrier<PIPE_ALL>".  That barrier only kept the next
+// band's MTE2 loads out of the UB the current band's MTE3 stores were still
+// reading; a queue's slot is one the compiler tracks a consumer for (MTE3 for
+// "qout"/"qo16"), so the WAR is covered by the queue's own events and the
+// drain disappears.  Measured at [1, 8192, 96, 128] / CHUNK = 64: deleting
+// the two drains outright is worth 0.078 (masks) + 0.24 (band) ms, and this
+// rewrite lands 4.039 -> 3.931 ms, bit-identical on all 13 outputs.
+static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
+                                        TQue<TPosition::VECIN, 2>& qmk,
+                                        TQue<TPosition::VECOUT, 2>& qout,
+                                        TQue<TPosition::VECOUT, 2>& qo16,
                                         const LocalTensor<uint8_t> gmaskBits,
                                         const GlobalTensor<float> Aqk32,
                                         const GlobalTensor<float> L,
                                         const GlobalTensor<bfloat16_t> Aqk16,
                                         const GlobalTensor<float> MaskS,
                                         const GlobalTensor<float> MaskL,
-                                        int32_t c, float scale, TEventID e2v, TEventID ev3) {
+                                        int32_t c, float scale) {
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     CrossCoreWaitFlag(FL_DONE);
     // One 16-row band at a time.  At KDA_CHUNK = 16 (a single band) this is
@@ -229,12 +237,22 @@ static __aicore__ inline void post_gram(const LocalTensor<float> ga32,
     const uint64_t o = m0 + static_cast<uint64_t>(mm) * 16 * M;
     const uint64_t mo = static_cast<uint64_t>(mm) * 16 * M;
     constexpr int32_t NB = 16 * M;   // elements in one band
-    DataCopy(ga32, Aqk32[o], DataCopyParams(16, M / 8, 0, 0));
-    DataCopy(gl32, L[o], DataCopyParams(16, M / 8, 0, 0));
+    LocalTensor<float> gin = qin.AllocTensor<float>();
+    LocalTensor<float> ga32i = gin, gl32i = gin[NB];
+    DataCopy(ga32i, Aqk32[o], DataCopyParams(16, M / 8, 0, 0));
+    DataCopy(gl32i, L[o], DataCopyParams(16, M / 8, 0, 0));
+    qin.EnQue(gin);
+    LocalTensor<float> gmk = qmk.AllocTensor<float>();
+    LocalTensor<float> gmaskS = gmk, gmaskL = gmk[NB];
     DataCopy(gmaskS, MaskS[mo], DataCopyParams(16, M / 8, 0, 0));
     DataCopy(gmaskL, MaskL[mo], DataCopyParams(16, M / 8, 0, 0));
-    SetFlag<HardEvent::MTE2_V>(e2v);
-    WaitFlag<HardEvent::MTE2_V>(e2v);
+    qmk.EnQue(gmk);
+    LocalTensor<float> gA = qin.DeQue<float>();
+    LocalTensor<float> ga32 = gA, gl32 = gA[NB];
+    LocalTensor<float> gM = qmk.DeQue<float>();
+    gmaskS = gM; gmaskL = gM[NB];
+    LocalTensor<float> gout = qout.AllocTensor<float>();
+    LocalTensor<float> ga32o = gout, gl32o = gout[NB];
     // The two masks are applied with a select instead of a multiply.  The raw
     // Gram is the Cube's fp32 accumulation of bf16 gated operands, and inside
     // the region the mask drops the two exponents are the far ends of the
@@ -247,23 +265,27 @@ static __aicore__ inline void post_gram(const LocalTensor<float> ga32,
     // kept region bit-identical and makes the dropped region exactly 0.
     Compares(gmaskBits, gmaskS, 0.5f, CMPMODE::GT, NB);
     PipeBarrier<PIPE_V>();
-    Select(ga32, gmaskBits, ga32, 0.0f, SELMODE::VSEL_TENSOR_SCALAR_MODE, NB);
-    Muls(ga32, ga32, scale, NB);
+    Select(ga32o, gmaskBits, ga32, 0.0f, SELMODE::VSEL_TENSOR_SCALAR_MODE, NB);
+    Muls(ga32o, ga32o, scale, NB);
     PipeBarrier<PIPE_V>();
     Compares(gmaskBits, gmaskL, 0.5f, CMPMODE::GT, NB);
     PipeBarrier<PIPE_V>();
-    Select(gl32, gmaskBits, gl32, 0.0f, SELMODE::VSEL_TENSOR_SCALAR_MODE, NB);
+    Select(gl32o, gmaskBits, gl32, 0.0f, SELMODE::VSEL_TENSOR_SCALAR_MODE, NB);
     PipeBarrier<PIPE_V>();
-    Cast(ga16, ga32, RoundMode::CAST_RINT, NB);
-    PipeBarrier<PIPE_V>();
-    SetFlag<HardEvent::V_MTE3>(ev3);
-    WaitFlag<HardEvent::V_MTE3>(ev3);
-    DataCopy(Aqk32[o], ga32, DataCopyParams(16, M / 8, 0, 0));
-    DataCopy(L[o], gl32, DataCopyParams(16, M / 8, 0, 0));
-    DataCopy(Aqk16[o], ga16, DataCopyParams(16, M / 16, 0, 0));
-    // The stores above read the same UB the next band's loads land in, so the
-    // MTE3 has to drain before the band repeats.
-    PipeBarrier<PIPE_ALL>();
+    LocalTensor<bfloat16_t> g16 = qo16.AllocTensor<bfloat16_t>();
+    Cast(g16, ga32o, RoundMode::CAST_RINT, NB);
+    qout.EnQue(gout);
+    qo16.EnQue(g16);
+    LocalTensor<float> gA2 = qout.DeQue<float>();
+    LocalTensor<float> ga32s = gA2, gl32s = gA2[NB];
+    LocalTensor<bfloat16_t> g16s = qo16.DeQue<bfloat16_t>();
+    DataCopy(Aqk32[o], ga32s, DataCopyParams(16, M / 8, 0, 0));
+    DataCopy(L[o], gl32s, DataCopyParams(16, M / 8, 0, 0));
+    DataCopy(Aqk16[o], g16s, DataCopyParams(16, M / 16, 0, 0));
+    qout.FreeTensor(gA2);
+    qo16.FreeTensor(g16s);
+    qin.FreeTensor(gA);
+    qmk.FreeTensor(gM);
     }
 }
 
@@ -471,9 +493,20 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     TEventID ev3 = pipe.AllocEventID<HardEvent::V_MTE3>();
     TEventID evs = pipe.AllocEventID<HardEvent::V_S>();
     TEventID e3d = pipe.AllocEventID<HardEvent::MTE3_V>();
+    // R3: the band staging of "post_gram" is a two-deep ring, one queue per
+    // stream (Gram tiles, masks, the fp32 result, the bf16 rounding), so that
+    // the band drain can go (see there).  TQue storage is not merged with the
+    // scratch buffers by the TPipe allocator, which is why the ring has to be
+    // paid for in UB rather than overlaid on dead scratch: at CHUNK = 64 the
+    // four queues are 52 KB against the 18 KB of single-buffered tiles they
+    // replace, and the kernel then has under 8 KB of UB headroom left
+    // (measured with a live dummy buffer; the exact budget depends on the
+    // allocator's per-position slabs, not on the nominal sizes).
+    TQue<TPosition::VECIN, 2> qgin, qgmk;
+    TQue<TPosition::VECOUT, 2> qgout, qgo16;
     TBuf<TPosition::VECCALC> bQf, bKf, bT0, bT2, bEf, bRed,
         bQnb, bKnb, bRkb, bRvb, bQgb, bKgb, bBias, bBeta, bBb, bAlog, bZz,
-        bGef, bGefn, bGt, bGmaskS, bGmaskL, bGa32, bGl32, bGa16;
+        bGef, bGefn, bGt, bMbits;
     pipe.InitBuffer(bQf, NG * 4); pipe.InitBuffer(bKf, NG * 4);
     pipe.InitBuffer(bT0, N * 4); pipe.InitBuffer(bT2, NG * 4);
     pipe.InitBuffer(bEf, NG * 4); pipe.InitBuffer(bRed, 384 * 4);
@@ -487,13 +520,15 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     pipe.InitBuffer(bGef, NG * 4);
     pipe.InitBuffer(bGefn, NG * 4);
     pipe.InitBuffer(bGt, NG * 4);
-    // The mask/Gram/rounding staging of "post_gram" is one 16-row band (see
-    // there): whole-chunk tiles are 72 KB of UB at KDA_CHUNK = 64.
-    pipe.InitBuffer(bGmaskS, 16 * M * 4);
-    pipe.InitBuffer(bGmaskL, 16 * M * 4);
-    pipe.InitBuffer(bGa32, 16 * M * 4);
-    pipe.InitBuffer(bGl32, 16 * M * 4);
-    pipe.InitBuffer(bGa16, 16 * M * 2);
+    // 2 x 16 x M fp32 per queue slot = 8 KB at CHUNK = 64 for the Gram and
+    // mask tiles; the fp32 result and its bf16 rounding are a third pair.
+    pipe.InitBuffer(qgin, 2, 2 * 16 * M * 4);
+    pipe.InitBuffer(qgmk, 2, 2 * 16 * M * 4);
+    pipe.InitBuffer(qgout, 2, 2 * 16 * M * 4);
+    pipe.InitBuffer(qgo16, 2, 16 * M * 2);
+    // The select's bit mask is V-only (compare then select, same pipe), so one
+    // small scratch serves every band and both triangles.
+    pipe.InitBuffer(bMbits, 512);
     // Published Gram operands: one pass band's worth of UB per operand.
     // These used to be a two-deep whole-chunk ring (3 x [M, D] bf16 = 48 KB
     // at KDA_CHUNK = 64) which, with the whole-chunk staging above, put this
@@ -515,12 +550,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // One scratch for the three Gram operands: each is cast into the ring
     // as soon as it is formed, so nothing but the ring holds them.
     LocalTensor<float> gt = bGt.Get<float>();
-    LocalTensor<float> gmaskS = bGmaskS.Get<float>(), gmaskL = bGmaskL.Get<float>();
-    // The select's bit mask rides in the Aqk16 staging: the cast that fills
-    // that buffer happens after both masks are applied.
-    LocalTensor<uint8_t> gmaskBits = bGa16.Get<uint8_t>();
-    LocalTensor<float> ga32 = bGa32.Get<float>(), gl32 = bGl32.Get<float>();
-    LocalTensor<bfloat16_t> ga16 = bGa16.Get<bfloat16_t>();
+    LocalTensor<uint8_t> gmaskBits = bMbits.Get<uint8_t>();
 
     LocalTensor<bfloat16_t> qnb = bQnb.Get<bfloat16_t>(), knb = bKnb.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> rkb = bRkb.Get<bfloat16_t>(), rvb = bRvb.Get<bfloat16_t>();
@@ -603,7 +633,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     SetFlag<HardEvent::MTE2_V>(e2vg);
     DataCopy(alog, Alog[head], 8);
     DataCopy(beta, Beta[cm], DataCopyParams(1, M / 8, 0, 0));
-    // The two triangular masks are read band by band inside post_gram.
+    // One set/one wait: the beta sigmoid below needs the G/log/beta loads in
+    // UB, and the wait is the only consumer of this channel ("e2vs" used to
+    // also carry post_gram's mask loads, which the band queues own now).
     SetFlag<HardEvent::MTE2_V>(e2vs);
     WaitFlag<HardEvent::MTE2_V>(e2vg);
 
@@ -832,8 +864,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     }
     // ---- previous chunk's Gram: mask, scale, round, store -----------------
     if (cprev >= 0) {
-        post_gram(ga32, gl32, ga16, gmaskS, gmaskL, gmaskBits, Aqk32, L, Aqk16,
-                  MaskS, MaskL, cprev, scale, e2vs, ev3);
+        post_gram(qgin, qgmk, qgout, qgo16, gmaskBits, Aqk32, L, Aqk16,
+                  MaskS, MaskL, cprev, scale);
     }
     // ---- publish + hand off ---------------------------------------------
     // The publish sits *after* the previous step's DONE wait so that at most
@@ -847,8 +879,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     }
     // Drain the pipeline: the last chunk's Gram has no later chunk to hide
     // behind (~1/unroll of the stage, and the Cube is idle by then).
-    post_gram(ga32, gl32, ga16, gmaskS, gmaskL, gmaskBits, Aqk32, L, Aqk16,
-                  MaskS, MaskL, cprev, scale, e2vs, ev3);
+    post_gram(qgin, qgmk, qgout, qgo16, gmaskBits, Aqk32, L, Aqk16,
+              MaskS, MaskL, cprev, scale);
     PipeBarrier<PIPE_ALL>();
     }
 }

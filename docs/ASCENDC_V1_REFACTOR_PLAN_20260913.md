@@ -700,3 +700,89 @@ stage 3 的 `else` 分支里 `lv` 一次 plain burst、`lx` 4 次带 stride 的�
 
 **K2 的账本现在是 2.46 ms**：0.82 的 store 与 ~0.4 的读已经拿掉，剩下的两个大项还是
 §11.10 的两次整机排水（0.65 ms，需要专属 buffer 或窄事件对）和每 chunk 的协议段数。
+
+## 11.12. R3（五）：pre_gram 的账本推翻重写，以及 post_gram 的两级流水（2026-09-14 深夜）
+
+§11.11 之后 pre_gram 是 4.03 ms、占 e2e 的 45%，而之前所有笔记都把它记成
+"HBM 受限、3.6 GB/pass"。今天用"同进程内删一块、量一块"（`/tmp/pgdec.py`、
+`/tmp/pgcs.py`、`/tmp/pgdrain.py`、`/tmp/pgint2.py`，全部 MIN of 2–3，
+C=64、`[1,8192,96,128]`）把这件事测清楚了：**它不是带宽受限**。
+
+### 1. 删掉流量几乎不省时间（推翻"HBM 受限"）
+
+| 变体（只删、不改结构） | 省下的字节 | pre_gram | 差值 |
+|---|---:|---:|---:|
+| stock | — | 4.041 | — |
+| `nopub`：AIV 不写 Ga/Gk/Gb、AIC 不读（96 KB/chunk = 1.18 GB） | 1.18 GB | 3.793 | **−0.25** |
+| `nord`：post_gram 不读 Aqk32/L（393 MB） | 393 MB | 4.011 | −0.03 |
+| `nowb`：post_gram 不回写 Aqk32/L（393 MB） | 393 MB | 4.014 | −0.03 |
+| `dead`：两个 mask 的 load+Compares 全删（400 MB） | 400 MB | 3.942 | **−0.08** |
+| `aicdead`：AIC 的 6 组 load + 2 个 Mmad + Fixpipe 全删（80 KB/chunk = 983 MB） | 983 MB | 4.333 | **+0.30（变慢！）** |
+
+读法：**C=64 时 1 GB 的流量只值 0.2 ms 左右**（≈ 5 TB/s 的有效带宽 = 全在 L2 里），
+而 Aqk32/L/Aqk16 那圈"Cube→AIV→GM"的往返是 0.03 ms 级、mask 通道是 0.08 ms 级。
+`aicdead` 去掉 Cube 的工作反而慢 0.3 ms，说明 Cube 的 48 KB/chunk 读+32 KB/chunk 写
+不但完全被掩盖，还替 AIV 的 MTE 队列让出了节奏；**Cube 在这个 kernel 里是免费的算力**。
+
+### 2. 真正的账：9 次整机排水 = 0.80 ms
+
+`PipeBarrier<PIPE_ALL>` 在 pre_gram 里每 chunk 出现 **9 次**（4 次 pass 边界、4 次
+post_gram 的 band 边界、1 次 chunk 尾巴）。逐类删掉（timing-only，结果会错）：
+
+| 删掉 | 次数/chunk | pre_gram | 差值 |
+|---|---:|---:|---:|
+| pass 边界的排水 | 4 | 3.499 | **−0.54** |
+| band 边界的排水 | 4 | 3.799 | **−0.24** |
+| chunk 尾巴的排水 | 1 | 3.792 | **−0.25** |
+| 三者都删 | 9 | 3.244 | **−0.80** |
+
+这些排水的存在理由都是 **WAR**：下一段的 MTE2 load / V write 落进上一段 MTE3 store
+还在读的 UB。§11.11 的笔记已经判过"只能用双缓冲 TQue，事件对会挂"，今天按这个方向
+落地了 band 那一级（见下）。另外量到：
+
+| 探针 | pre_gram | 说明 |
+|---|---:|---|
+| `nocs`：删掉 63 条串行 Add 的 gate cumsum | 3.774 | 整条 cumsum = **0.26 ms** |
+| `nobar`：cumsum 保留、删掉 63 个 `PipeBarrier<PIPE_V>` | 4.027 | 屏障是免费的（依赖链才是钱） |
+| `logcs`：Hillis–Steele 6 步 log-scan 换串行扫描 | 5.064 | **更慢 1.0 ms**，负结果 |
+
+cumsum 只值 0.26 ms，且换成 log-scan 反而更慢（去掉 57 个屏障但把每条 Add 的
+地址改成递减遍历），所以这条路到此为止。
+
+### 3. 落地：post_gram 的 band 级双缓冲（TQue）
+
+`kernels/v1/k1_pre_gram_mix.cpp` 的 `post_gram` 从"一套 staging + 尾巴排水"改成
+**四条两级队列**：Gram 两块 fp32（`TQue<VECIN,2>`）、两块 fp32 mask、masked fp32 结果
+（`TQue<VECOUT,2>`）、bf16 取整结果（`TQue<VECOUT,2>`）。WAR 由队列自己的事件覆盖
+（`qout`/`qo16` 的消费者是 MTE3，编译器知道），band 边界的排水删除；
+select 的位掩码是 V→V，同一管道内有序，改成一块 512 B 的普通 scratch。
+
+| | pre_gram | solve | k2 | 合计 |
+|---|---:|---:|---:|---:|
+| 改动前 | 4.027 | 2.535 | 2.464 | 9.026 |
+| 改动后 | **3.928** | 2.525 | 2.459 | **8.935** |
+
+逐位一致（同进程 A/B：`out-diff=0.000e+00`、`state-diff=0.000e+00`），数值闸门读数
+不变（`out rel=8.620e-03 abs=5.490e-04 | state rel=4.245e-03 abs=2.453e-03`），
+`tests/test_persistent_loop.py` 6 项全过。
+
+### 4. 负结果：mask 上提（hoist）与 UB 的真实预算
+
+- mask 的两个三角矩阵是**与 chunk 无关**的，本想把两次 `Compares` 提到 block 开头
+  一次算好（省 400 MB 的 mask 读 + 400 万条向量指令）。`inband128` 证明"位掩码放在
+  缓冲区偏移处、Compares/Select 读同一偏移"是**逐位正确**的；但把 Compares 搬到
+  chunk 循环外面（含专门 buffer、含放到循环第一次迭代里两种写法）**都产出垃圾**
+  ——疑似 TPipe 对 TBuf 的活跃期合并（子张量访问不入活跃期分析），负结果记在
+  `/tmp/pghoist2.py`、`/tmp/pghoist3.py`。
+- **TQue 的 UB 代价远高于名义值**：band 那一级名义 +34 KB，但实测把整核的 UB 余量
+  从 ~96 KB 打到 **<8 KB**（活 dummy buffer 二分：stock +96 KB 过、+128 KB 挂；
+  加了 band 队列后 +8 KB 就挂）。所以 pass 级双缓冲（名义 +40 KB）**目前在 UB 上放不下**，
+  需要先腾地方（把 mask/位掩码改成极小缓冲、或让 scratch 复用）——这是 R3 的下一件事。
+- pass 级双缓冲的实现已经在 `/tmp/pgq2.py` 里写好并编过（AI Core Error = UB 用尽，
+  与 dummy 探针的失败现象一致），等 UB 腾出来即可复用。
+
+### 5. 当前状态
+
+`[1,8192,96,128]`、CHUNK=64、MIN of 4：**8.935 ms**（pre_gram 3.928 / solve 2.525 / k2 2.459）。
+三条线的下一个大项：pre_gram 是 pass 级排水（0.54 ms 上限，卡 UB）；solve 已到重叠地板；
+K2 还是 §11.10 的两次排水（0.65 ms，两次替换尝试都挂）。
