@@ -449,3 +449,42 @@ triton-ascend 54.4 ms（领先 5.1×），FLA H100/H200 CI 2.722 ms（落后 3.9
    两半进一步共用），否则 C=64 就钉在 2。
 3. **pre_gram 4.16 ms 现在是最大单段**：回到 §4 的 L3（指令瘦身）与 L2（融合）
    那条线。
+
+## 11.7. K2 分解探针：3.9 ms 到底花在哪（2026-09-14 下午）
+
+§11.6.5 把"descriptor 数 / 载入量"列为 K2 的第一杠杆。17 个变体（同一个进程里按不同符号名
+编译多份、发射时按名切换，输入与进程状态共用；脚本 `/tmp/k2split{,2,3,4}.py`）把这条线否了。
+数值本来就是错的（探针只测时间）。同进程 stock 的抖动是 3.824–3.875（跨进程），所以只有
+同进程 A/B 的差值有意义：
+
+| 变体（C=64，`[1,8192,96,128]`，MIN of 3） | k2_ms | Δ |
+|---|---:|---:|
+| AIC 的 GM→L1 载入全关（W/Qg/S16/Aqk/KgT/Vt） | 3.689 | **−0.15** |
+| W/Qg/S16 换**同体积 plain copy**（去掉 Nd2Nz 转换） | 3.874 | +0.04 |
+| AIV 的 GM→L1 载入全关（U/D1/D2/D3/D4/Decay） | 3.613 | **−0.22** |
+| AIC 的 L0 载入全关（`LoadData`/`LoadDataWithTranspose`） | 3.805 | −0.07 |
+| AIV 的向量计算全关（Cast/Sub/Mul/Add/Muls/Transpose/Duplicate） | 3.734 | −0.14 |
+| 全部 `Fixpipe` 关 | 3.657 | −0.18 |
+| 只关 D4（128×128 fp32）的 `Fixpipe` | 3.683 | −0.15 |
+| 全部 `Mmad` 关 | 3.982 | +0.15（噪声：Cube 完全被藏住） |
+| **AIV 的四个 store 全关（V/Vt/Out/S16）** | **2.625** | **−1.21** |
+| **载入 + store + 向量计算全关（只剩 flag/Mmad/fixpipe/L0）** | **1.460** | **−2.42** |
+| 只去掉非转置 `V`（vnew）的 store（同进程 A/B） | 3.879 | +0.06（中性） |
+
+1. **不是载入 / descriptor 受限。** 两个引擎的全部 GM→L1 载入加起来 0.37 ms（AIC 0.15 +
+   AIV 0.22），Nd2Nz 转换本身 0（同体积 plain copy 无效），L0 载入 0.07，AIV 向量计算 0.14，
+   而 Cube 的 Mmad 去掉反而慢 0.15——它完全藏在别的管道后面。"把 W/Qg/S16 换成整块 Nd2Nz、
+   砍 descriptor 数"这条线可以从计划里划掉。
+2. **AIV 的 store 段是唯一显著项（1.21 ms，31%），但不是字节数线性。** 单独去掉其中 20%
+   （`V` = 16 KB/chunk-head）实测 **0**（§11.7 最后一行，已在 R2 上试过并回退）。所以这 1.21 ms
+   是"store 序列 + 它两侧的 WAR `PipeBarrier<PIPE_ALL>` 与 MTE3→V 事件对"的**整段**代价，
+   不是搬运量；D4 的 64 KB/chunk-head 的 fixpipe 写入也只值 0.15 ms。
+3. **地板 1.46 ms = 每 chunk 的机器成本。** 512 个串行 head-step（2 波 × 128 chunk × 2 head）
+   → 2.85 µs/step ≈ 4 phase × 0.7 µs，§10 的 protocol 模型在 C=64 上仍然成立。注意各项单独
+   拿掉之和（0.15+0.22+0.07+0.14+0.18 = 0.76）远小于组合拿掉（2.42）：各段互相掩盖，
+   K2 的 3.9 ms 是**每 chunk 的串行段数**，不是任何单项的带宽或指令量。
+
+对 R3 的含义：能动的只剩结构，且都不属于"少搬几个 KB"——
+- 把 state/d4 的 GM 往返搬进 L0C（T3.1）：同时砍掉 fixpipe 的 64 KB/chunk-head 和 AIV 的 d4 读；
+- 减少每 chunk 的 store/屏障段数：stage 2/4 的"两半"合并、去掉一次 MTE3→V 事件对，或把
+  `Vt` 的转置搬到 AIC 的 `LoadDataWithTranspose`（省掉 AIV 的 16 次 `Transpose` 与整个 Vt store 段）。
