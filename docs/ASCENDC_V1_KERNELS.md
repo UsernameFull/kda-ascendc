@@ -107,18 +107,23 @@ which is what makes them come out as a harmless identity.  The Gram only writes
 the real chunks, so the api has to zero `L[c:]` when `c_solve != c` (an
 uninitialised tail is not harmless: the substitution turns it into `inf`).
 
-**C=64 is a K1-only geometry today.**  `KDA_CHUNK` is threaded through
-`preprocess`/`k1_pre_gram*`/`k1_solve*` only: no kernel of the K2 family
-(`k2_persistent_loop.cpp`, `k2_d12*.cpp`, `k2_vnew.cpp`, `k2_d34.cpp`,
-`k2_outstate*.cpp`, ...) mentions `KDA_CHUNK`, and `k2_persistent_loop.cpp`
-carries `M = 16`, `K = 16`, `N = 64` as literals with every per-chunk GM offset
-built as `(bh * NT + chunk) * M * D`.  At `KDA_CHUNK = 64` that kernel therefore
-walks 16-row pieces of 64-row chunks (a quarter of the rows, at the wrong
-offsets), which is fast and wrong; `k2_mode = "separated"` is wrong the same way.
-End-to-end C=64 numbers are only meaningful once K2 is chunk-parameterised - the
-solve-stage numbers below are unaffected (K1 is verified against the fp64
-reference stage by stage at C=64: `Qn`/`Kn`/`Qg`/`Kg`/`Rk`/`Rv`/`Aqk32`/`Aqk`/
-`L`/`Decay` all at bf16 level, and the solve against the fp64 inverse of `L`).
+**C=64 is a K1+K2 geometry as of R2 (2026-09-14).**  `KDA_CHUNK` is threaded
+through `preprocess`/`k1_pre_gram*`/`k1_solve*` *and* `k2_persistent_loop.cpp`,
+which is written over `M = KDA_CHUNK` (`NG = 2 * BV / M`, stage 3 contracts over
+the chunk's rows, every GM offset `(bh * NT + chunk) * M * D`) with no branch on
+the chunk size.  The rest of the K2 family (`k2_d12*.cpp`, `k2_vnew.cpp`,
+`k2_d34.cpp`, `k2_outstate*.cpp`, i.e. `k2_mode = "separated"`) still carries
+`M = 16` as a literal and is therefore a C=16-only oracle - it is what the
+`test_persistent_loop_matches_separated` pytest compares against at C=16, while
+C=32/64 builds are gated against the host fp32 reference instead
+(`test_persistent_loop_matches_fp32_reference`).  A C=64 build is now correct
+end to end (out rel 8.620e-03 / state rel 4.245e-03 against the fp32 reference
+at `[1,8192,8,128]`, the same envelope as C=16) and stage by stage against a
+numpy replay of the recurrence from the *same* K1 outputs (`d1` 6.6e-36,
+`d2` 2.6e-36, `vnew`/`vnewT`/`d3` 0.0, `out` 9.6e-04, `d4`/`state` 3.3e-08).
+K1's own C=64 verification (stage by stage against the fp64 reference:
+`Qn`/`Kn`/`Qg`/`Kg`/`Rk`/`Rv`/`Aqk32`/`Aqk`/`L`/`Decay` all at bf16 level, and
+the solve against the fp64 inverse of `L`) is unaffected.
 
 `NC` is capped by UB (the tile, its bf16 copy, the `Brcb` expansion and the
 `L21` tile end at 118 KB of the 192 KB at `NC = 8`, 172 KB at `NC = 12`, so 10
@@ -151,22 +156,32 @@ an odd slice then hands its last chunk to a Cube unit that would read the
 | `k2_outstate.cpp` | `kda_k2_outstate_kernel` | `BH*NV` | `out_task`, `s32`, `s16` |
 | `k2_outstate_full.cpp` | `kda_k2_outstate_full_kernel` | `BH*NV` | `out_task`, `s32`, `s16` |
 | `k2_mix_d4_outstate.cpp`, `k2_mix_d12_vnew.cpp`, `k2_mix_all_cube.cpp` | MIX kernels | `BH` | same buffers as above |
-| `k2_persistent_loop.cpp` | `kda_k2_persistent_loop` | `ceil(BH/2)` | one launch for all `NT` chunks (see below) |
+| `k2_persistent_loop.cpp` | `kda_k2_persistent_loop` | `ceil(BH / MAXH)` | one launch for all `NT` chunks (see below) |
 
 ### `persistent_loop`: the whole K2 recurrence in one launch
 
 `k2_mode="persistent_loop"` runs `d12 -> vnew -> d34 -> outstate` for every
 chunk inside a single `KERNEL_TYPE_MIX_AIC_1_2` launch, so the host-side chunk
 loop in `api.py` collapses to one `kda_kg_transpose` plus one
-`kda_k2_persistent_loop` call. Each block owns up to `MAXH = 2` heads
+`kda_k2_persistent_loop` call. Each block owns up to `MAXH` heads
 (`h = blk, blk + nblk, ...`) and each AIV subcore owns one 64-column value
 tile, so a block has `nh * 2` state tiles in flight and the AIC is never
-blocked behind its own chain:
+blocked behind its own chain. `MAXH` is 4 at C=16 and 2 at C=64: the fp32 state
+is 32 KB of UB per head and the chunk-sized staging is 29 KB at `M = 16` but
+112.5 KB at `M = 64`, so a third head would need 208.5 KB of the 192 KB:
 
 ```
 AIC: [wait R; d12(h); set C1] x nh   then   [wait V; d34(h); set C2] x nh
 AIV: [wait C1; vnew(h); set V] x nh  then   [wait C2; out(h); set R] x nh
 ```
+
+`nh = 1` is not just "one head fewer": with a depth-one protocol the AIC's
+`d12(h+1)` only overlaps the AIV's `vnew(h)` while a second head is in flight,
+so a block that owns a single head serialises the two engines. That is worth
+4.6 ms of K2 at C=64 (6.04 -> 3.91 ms, the whole e2e 12.79 -> 10.74 ms at
+`[1,8192,96,128]`, MIN of 4) with *bit-identical* outputs and stage-gate rels,
+which is why `PERSIST_MAXH` is 2 rather than 1 for `KDA_CHUNK > 16` even though
+one head would fit the UB too.
 
 Each stage now starts its flag-independent MTE2 loads *before* the
 `CrossCoreWaitFlag` that guards the state-dependent tiles: W/Qg in stage 1,
@@ -187,6 +202,37 @@ stored to `S32` once at the end); only its bf16 copy `S16` goes to GM each
 chunk for the Cube operands. `api.py` must therefore allocate
 `d4_full` as `[bh,128,128]` (per-head reuse) and pass `nblk` with
 `nblk * MAXH >= bh`, otherwise the head map is not total.
+
+### `persistent_loop` at C=64: three tile-layout facts
+
+Making the kernel chunk-generic was not a matter of redefining `M`: three
+operands change *layout* once the chunk is wider than one fractal, and each one
+fails by producing plausible numbers rather than a fault:
+
+- **`Vt` (`v_new^T`) has to be stored row-major, not in the packed block order
+  `Transpose` leaves.**  `AscendC::Transpose` is a 16 x 16 primitive, so the
+  stage-2 transpose writes a *packed* block order: block `(j0, m0)` of the
+  destination sits at `bl = j0 * (M / 16) + m0`. At `M = 16` that packed order
+  *is* row-major, which is why the C=16 kernel could store the whole tile with
+  one `DataCopy`; at `M = 64` the store has to scatter the blocks (`FR` bursts
+  of one 16-element row, destination rows `M` elements apart). The AIC reads the
+  tile as `BV / FR` bands of `FR` *row-major* rows
+  (`Nd2NzParams(1, FR, K, 0, K, FR, 1, 0)`), so a packed store hands it the
+  wrong operand - out rel 1.0 against the fp32 reference, no fault.
+  (Hardware probe of the gather + `Transpose` mechanism in isolation:
+  `/tmp/vtprobe*.py`, dump grid `/tmp/vtgrid3.npz`.)
+- **The d4 A operand (L0A) holds `BV / FR` bands per *value tile*, not `NB`.**
+  The operand is `[NG * M, K]` with the two value tiles iv-major, so `lv` needs
+  `BV / FR` bands per `iv`; `NB = M / FR` only coincides with that at C=64,
+  where `M = BV`. At C=16 (`NB = 1` against `BV / FR = 4`) the single-band form
+  left three quarters of the operand stale - the C=16 pytest control and the
+  `d4`/`state` stage-gate rels are what caught it (out rel 7.59e-02 / state rel
+  1.04, i.e. exactly the C=64 breakage this section is about).
+- **`K == FR` deserves its own load path.**  With one C0 block per row the ND
+  tile *is* the L0A/L0B fractal order, so one plain burst loads the operand
+  where the general per-band `Nd2Nz` costs a descriptor per row (16 per band
+  against ~2 for the whole tile). At C=16 that is 15.6 -> 6.x ms of K2 by
+  itself, so the `Aqk` and `Vt` loads keep a `if (K == FR)` plain-burst path.
 
 ### d4 layout contract
 

@@ -58,6 +58,24 @@ ASM_NCHUNK = int(os.environ.get("KDA_ASM_NCHUNK", "0")) or 4
 # a per-slice event.  Measured at [1,8192,96,128]/CHUNK=64: 3.22 -> 2.51 ms
 # for the whole solve, bit-identical outputs.  0 keeps a single stream.
 SOLVE_OVERLAP = int(os.environ.get("KDA_SOLVE_OVERLAP", "16"))
+# Heads per block in the persistent K2 loop, and therefore the KDA_MAXH the
+# kernel is compiled with (they must agree: the kernel's head map only walks
+# MAXH heads per block, so a smaller define silently drops heads).  The fp32
+# state is 32 KB of UB per head and stays resident, so the staging has to fit
+# in the rest of this part's 192 KB: it is chunk-sized (29 KB at M = 16, 68 KB
+# at 32, 112.5 KB at 64), which caps the tile at 4 heads for C=16 and 2 for
+# C=64/32 (a third would need 208.5/164.5 KB; a UB overrun is a kernel-side
+# aivec error, not a host-side allocation failure, so this is arithmetic, not
+# a probe - MAXH 2 at C=64 is measured, 176.5 KB, stage gate clean).
+# nh = 1 is not just "one fewer head": the depth-one flag protocol only
+# overlaps the two engines when a block has two or more heads in flight, so at
+# C=64 the second head is worth k2 6.04 -> 3.91 ms and e2e 12.79 -> 10.74 ms
+# at [1,8192,96,128] (MIN of 4), numerics unchanged to the bit (K2 stage gate
+# 6.6e-36/9.6e-04/3.3e-08).  The env can lower MAXH, or raise it within the
+# ceiling; C=16/32/64 are each checked end to end against the fp32 reference.
+PERSIST_MAXH = max(1, min(4 if CHUNK <= 16 else 2,
+                          int(os.environ.get("KDA_PERSIST_LOOP_MAXH", "0"))
+                          or (4 if CHUNK <= 16 else 2)))
 KGT_NCHUNK = 8
 WU_NCHUNK = int(os.environ.get("KDA_WU_NCHUNK", "0")) or (4 if CHUNK <= 32 else 2)
 D = 128
@@ -202,12 +220,11 @@ def _defines() -> str:
     guarded kernel (KDA_CHUNK, KDA_SOLVE_WIDE_NCHUNK, KDA_WU_NCHUNK) picks
     them up through its own #ifndef default.
     """
-    maxh = max(1, min(4, int(os.environ.get("KDA_PERSIST_LOOP_MAXH", "4"))))
     return ("#define KDA_CHUNK %d\n#define KDA_SOLVE_WIDE_NCHUNK %d\n"
             "#define KDA_SOLVE_WIDE_SUBB %d\n#define KDA_ASM_NCHUNK %d\n"
             "#define KDA_WU_NCHUNK %d\n#define KDA_MAXH %d\n"
             % (CHUNK, SOLVE_WIDE_NCHUNK, SOLVE_WIDE_SUBB, ASM_NCHUNK,
-               WU_NCHUNK, maxh))
+               WU_NCHUNK, PERSIST_MAXH))
 
 
 def _compile_all() -> None:
@@ -539,9 +556,7 @@ def kda_bt16_fwd_ascendc(
         # [1,8192,96,128]: 4 heads/block 6.53-6.56 ms against 6.71-6.88 for
         # 2 heads/block (MIN of 3 in-process rounds, 3 rounds each), so the
         # auto value is ceil(bh / 24) capped at the kernel's MAXH.
-        maxh_env = os.environ.get("KDA_PERSIST_LOOP_MAXH")
-        maxh = (max(1, min(4, int(maxh_env))) if maxh_env
-                else max(1, min(4, (bh + aic_cores - 1) // aic_cores)))
+        maxh = max(1, min(PERSIST_MAXH, (bh + aic_cores - 1) // aic_cores))
         want = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
         nblk = want if 0 < want <= bh else (bh if bh <= aic_cores
                                            else (bh + maxh - 1) // maxh)

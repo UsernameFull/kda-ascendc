@@ -1,7 +1,7 @@
-// Persistent K2: one MIX_AIC_1_2 launch runs the whole chunk recurrence on the
-// device instead of eight host launches per chunk.
+// Persistent K2, CHUNK-generic (R2): one MIX_AIC_1_2 launch runs the whole
+// chunk recurrence on the device instead of eight host launches per chunk.
 //
-// Each block owns one or two heads (bh) and every AIV subcore owns one value
+// Each block owns one or more heads (bh) and every AIV subcore owns one value
 // tile (iv), so a block has nh * 2 independent state tiles in flight and the
 // AIC is never blocked by its own chain.  Per chunk the two engines run
 //     AIC: [wait R; d12(h); set C1] x nh   then   [wait V; d34(h); set C2] x nh
@@ -12,10 +12,10 @@
 // pre-sets R once per head before the loop so the first chunk needs no special
 // case.  See docs/VLLM_ASCEND_KDA_REVIEW_20260911.md for why that matters.
 //
-// The AIV stores `out` straight into the caller's [B, T, H, D] tensor: the
-// 16 chunk rows of a 64-wide value tile are 16 separate 128 B runs, NH * D
-// elements apart, which the block form of DataCopy expresses with dstGap.
-// The api used to write a task-major `out_task` here and follow it with a
+// The AIV stores `out` straight into the caller's [B, T, H, D] tensor: the M
+// chunk rows of a 64-wide value tile are M separate 128 B runs, NH * D
+// elements apart, which the block form of DataCopy expresses with dstGap.  The
+// api used to write a task-major `out_task` here and follow it with a
 // 67 MB + 67 MB `permute(0, 3, 4, 1, 2, 5).contiguous()` (186 us of device
 // time, measured with msprof); the strided store costs 0.04 ms of K2 and is
 // bit-exact against the old layout plus host permute (checked at
@@ -46,23 +46,74 @@
 // out_err 1.5e-5 (< 1e-3) and state_err 1.4e-7 (< 1e-4).  K2 at [1,8192,32]
 // goes 3.423 -> 3.326 ms (MIN of 3 rounds x 4 reps in one process, median
 // 3.466 -> 3.352), so the half-width tiles are worth ~3%.
+//
+// R2 (2026-09-14): every tile follows the chunk size.  Through R1 this kernel
+// hard-coded M = 16 (the C=16 chunk) while K1 had long been CHUNK-parameterised,
+// so at KDA_CHUNK = 64 it walked 16-row pieces of 64-row chunks - a quarter of
+// the rows, at the wrong GM offsets, i.e. fast and wrong (plan section 11.5).
+// Here M = KDA_CHUNK, NG = 2 * BV / M and stage 3's contraction dim is the
+// chunk's row count, so the whole kernel is one set of formulas over (M, NG)
+// with no branch on the chunk size.
+//
+// What the chunk size does *not* buy is what the protocol model predicted: this
+// loop turned out to be descriptor/work- rather than flag-bound, so handing the
+// flag chain over four times fewer times (512 -> 128 chunks) only moved K2
+// 6.51 -> 6.04 ms at [1,8192,96,128] (MIN of 4).  The win came from the *tile*
+// a bigger chunk makes affordable: the staging is 112.5 KB of the 192 KB at
+// M = 64, so two heads of 32 KB state still fit, and nh = 2 is what lets the
+// depth-one protocol overlap the two engines the way C=16 does with nh = 4.
+// K2 6.04 -> 3.91 ms, e2e 12.79 -> 10.74 ms, outputs bit-identical (plan
+// section 11.6.2); nh = 1 serialises the engines - see api.py's PERSIST_MAXH.
+//
+// The 16-row fractal stays the unit of every L0 load, and the three operand
+// layouts this kernel needs are all built from the two idioms the C=16 kernel
+// already used, each one verified on hardware:
+//   * L0A [R, C] (W/Qg, Aqk, v_new^T as the d4 A operand): R / 16 bands, each
+//     `Nd2NzParams(1, 16, C, 0, C, 16, 1, 0)` - dstNzC0Stride = R = 16 = one
+//     band - then one `LoadData2dParams(0, C / 16, 1, 0, 0, false, 0)`.  At
+//     R = 16 this is the single call the C=16 kernel shipped.
+//   * L0B [C, R] whose source has the rows on the n dim (S16, v_new^T):
+//     `Nd2NzParams(1, R, C, 0, C, R, 1, 0)`, one call, then
+//     `LoadData2dParams(0, R * C / 256, 1, 0, 0, false, 0)`.  dstNzC0Stride =
+//     R packs the source C0 blocks column-block-major, which *is* the L0B
+//     fractal order (the 16-row and 64-row forms of this call are the shipped
+//     S16 and v_new loads).
+//   * L0B [C, R] whose source has the rows on the *k* dim (kg, which the api
+//     hands over in its public [c, CHUNK, D] layout): the same band loop as an
+//     L0A, then `LoadDataWithTranspose` per band, whose destination fractals
+//     are consecutive.  The band's fractals land at band * (R / 16), which is
+//     the L0B k-block order.
+// A chunk-sized tile therefore costs 4 small calls where the C=16 tile cost 1,
+// but four times fewer chunks.  That descriptor count (~640 per chunk-head on
+// the AIC side) is where the remaining 3.9 ms of K2 is thought to sit and is
+// the next lever (plan section 11.6.5); the C=16 path keeps a plain-burst
+// shortcut, see the `K == FR` branches in stage 3.
 #include "kernel_operator.h"
 using namespace AscendC;
 
-constexpr int32_t M = 16;
+#ifndef KDA_CHUNK
+#define KDA_CHUNK 16
+#endif
+#ifndef KDA_MAXH
+#define KDA_MAXH 4
+#endif
+constexpr int32_t M = KDA_CHUNK;     // rows in one chunk (the tile's m dim)
+constexpr int32_t FR = 16;           // fractal side - the unit of every L0 load
+constexpr int32_t NB = M / FR;       // 16-row bands in one chunk-sized tile
 constexpr int32_t D = 128;
 constexpr int32_t BV = 64;
-constexpr int32_t K = 16;
+constexpr int32_t K = M;             // stage 3 contracts over the chunk rows
 constexpr int32_t N = 64;
 constexpr int32_t N_D4 = 128;
 constexpr int32_t TILE = M * BV;
 constexpr int32_t S_TILE = BV * D;
 constexpr int32_t NG = 2 * BV / M;   // 16-row groups in the whole d4 tile
-constexpr int32_t MAXH = 4;          // heads owned by one block (UB: 32 KB of fp32 state each)
+constexpr int32_t MAXH = KDA_MAXH;   // heads owned by one block
 // L0A holds W and Qg side by side (2*M*D bf16) and is then reused by d34's
-// NG+1 16-column operands, so the raw allocation is whichever is larger.
+// NG*M x K v_new operand plus the M x K Aqk tile, so the raw allocation is
+// whichever is larger.
 constexpr int32_t L0A_ELEMS =
-    2 * M * D > (NG + 1) * M * K ? 2 * M * D : (NG + 1) * M * K;
+    (2 * M * D > NG * M * K + M * K) ? 2 * M * D : NG * M * K + M * K;
 // Depth-one loop protocol, ids stay inside the usable range (<= 7).
 constexpr uint16_t FL_C1 = 0;
 constexpr uint16_t FL_V = 1;
@@ -105,18 +156,20 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         TEventID emf = pipe.AllocEventID<HardEvent::M_FIX>();
         TEventID efm = pipe.AllocEventID<HardEvent::FIX_M>();
         TEventID em1 = pipe.AllocEventID<HardEvent::M_MTE1>();
-        TQue<QuePosition::B1, 1> qw, qg, qs, qa, qv, qk;
+        TQue<QuePosition::B1, 1> qw, qg, qs, qa, qv, qx, qk;
         pipe.InitBuffer(qw, 1, M * D * 2);
         pipe.InitBuffer(qg, 1, M * D * 2);
         pipe.InitBuffer(qs, 1, nv * BV * D * 2);
         pipe.InitBuffer(qa, 1, M * K * 2);
-        pipe.InitBuffer(qv, 1, nv * BV * K * 2);
+        pipe.InitBuffer(qv, 1, NG * M * K * 2);
+        pipe.InitBuffer(qx, 1, nv * BV * K * 2);
         pipe.InitBuffer(qk, 1, D * K * 2);
         TQue<QuePosition::CO1, 1> qc;
         pipe.InitBuffer(qc, 1, (NG * M * N_D4 + nv * M * N) * 4);
         LocalTensor<float> cf = qc.AllocTensor<float>();
         LocalTensor<uint8_t> a8(TPosition::A2, 0, L0A_ELEMS * 2);
-        // L0B: the two state tiles (64 fractals), reused by d34's 16.
+        // L0B: the two state tiles (with rows on the n dim), reused by d34's
+        // kg and v_new operands.
         LocalTensor<uint8_t> b8(TPosition::B2, 0, nv * BV * D * 2);
         LocalTensor<bfloat16_t> l0a = a8.ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> l0b = b8.ReinterpretCast<bfloat16_t>();
@@ -129,8 +182,12 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 auto lw = qw.AllocTensor<bfloat16_t>();
                 auto lg = qg.AllocTensor<bfloat16_t>();
                 auto ls = qs.AllocTensor<bfloat16_t>();
-                DataCopy(lw, W[a0], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
-                DataCopy(lg, Qg[a0], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
+                for (int32_t b = 0; b < NB; ++b) {
+                    DataCopy(lw[b * FR * D], W[a0 + b * FR * D],
+                             Nd2NzParams(1, FR, D, 0, D, FR, 1, 0));
+                    DataCopy(lg[b * FR * D], Qg[a0 + b * FR * D],
+                             Nd2NzParams(1, FR, D, 0, D, FR, 1, 0));
+                }
                 CrossCoreWaitFlag(FL_R);
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     const uint64_t s0 = static_cast<uint64_t>(bh * nv + iv) * BV * D;
@@ -144,11 +201,15 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 lw = qw.DeQue<bfloat16_t>();
                 lg = qg.DeQue<bfloat16_t>();
                 ls = qs.DeQue<bfloat16_t>();
-                LoadData(l0a, lw, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
-                LoadData(l0a[M * D], lg, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
+                for (int32_t b = 0; b < NB; ++b) {
+                    LoadData(l0a[b * FR * D], lw[b * FR * D],
+                             LoadData2dParams(0, D / FR, 1, 0, 0, false, 0));
+                    LoadData(l0a[M * D + b * FR * D], lg[b * FR * D],
+                             LoadData2dParams(0, D / FR, 1, 0, 0, false, 0));
+                }
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     LoadData(l0b[iv * BV * D], ls[iv * BV * D],
-                             LoadData2dParams(0, 32, 1, 0, 0, false, 0));
+                             LoadData2dParams(0, BV * D / 256, 1, 0, 0, false, 0));
                 }
                 SetFlag<HardEvent::MTE1_M>(e1m);
                 WaitFlag<HardEvent::MTE1_M>(e1m);
@@ -163,11 +224,11 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     const uint64_t o0 = static_cast<uint64_t>(bh * nv + iv) * NT * TILE +
                                         static_cast<uint64_t>(chunk) * TILE;
-                    auto ip1 = FixpipeParamsV220(N, M, 16, N, false);
+                    auto ip1 = FixpipeParamsV220(N, M, M, N, false);
                     ip1.quantPre = QuantMode_t::F322BF16;
                     ip1.unitFlag = 0;
                     Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(D1[o0], cf[iv * M * N], ip1);
-                    auto ip2 = FixpipeParamsV220(N, M, 16, N, false);
+                    auto ip2 = FixpipeParamsV220(N, M, M, N, false);
                     ip2.quantPre = QuantMode_t::F322BF16;
                     ip2.unitFlag = 0;
                     Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(D2[o0], cf[(nv + iv) * M * N], ip2);
@@ -199,30 +260,79 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const int32_t c = bh * NT + chunk;
                 auto la = qa.AllocTensor<bfloat16_t>();
                 auto lv = qv.AllocTensor<bfloat16_t>();
+                auto lx = qx.AllocTensor<bfloat16_t>();
                 auto lk = qk.AllocTensor<bfloat16_t>();
-                DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
-                DataCopy(lk, Kt[static_cast<uint64_t>(c) * M * D],
-                         Nd2NzParams(1, M, D, 0, D, M, 1, 0));
+                if (K == FR) {
+                    // One C0 block per row: the ND tile already *is* the
+                    // fractal order, so one plain burst loads it - the form
+                    // the C=16 kernel shipped.  The per-band Nd2Nz below is
+                    // the general case and costs a descriptor per row (16 per
+                    // band against ~2 for the whole tile), which at C=16 is
+                    // worth 15.6 -> 6.x ms of K2 all by itself.
+                    DataCopy(la, Aqk[static_cast<uint64_t>(c) * M * K], M * K);
+                } else {
+                    for (int32_t b = 0; b < NB; ++b) {
+                        DataCopy(la[b * FR * K],
+                                 Aqk[static_cast<uint64_t>(c) * M * K + b * FR * K],
+                                 Nd2NzParams(1, FR, K, 0, K, FR, 1, 0));
+                    }
+                }
+                for (int32_t b = 0; b < NB; ++b) {
+                    DataCopy(lk[b * FR * D], Kt[static_cast<uint64_t>(c) * M * D + b * FR * D],
+                             Nd2NzParams(1, FR, D, 0, D, FR, 1, 0));
+                }
                 CrossCoreWaitFlag(FL_V);
                 for (int32_t iv = 0; iv < nv; ++iv) {
                     const int32_t task = bh * nv + iv;
-                    DataCopy(lv[iv * BV * K],
-                             Vt[(static_cast<uint64_t>(task) * NT + chunk) * BV * K], BV * K);
+                    const uint64_t t0 = (static_cast<uint64_t>(task) * NT + chunk) * BV * K;
+                    if (K == FR) {
+                        // Same ND == fractal-order shortcut as `la` above: the
+                        // [BV, K] tile is one C0 block per row, and the d4 A
+                        // operand (which reads BV / FR bands per value tile,
+                        // iv-major - the band count is *not* NB: at C=16 it is
+                        // 4 against NB = 1) and the d34 B operand both read it
+                        // straight.  One burst per operand and per tile.
+                        DataCopy(lv[iv * BV * K], Vt[t0], BV * K);
+                        DataCopy(lx[iv * BV * K], Vt[t0], BV * K);
+                    } else {
+                        for (int32_t b = 0; b < BV / FR; ++b) {
+                            DataCopy(lv[(iv * (BV / FR) + b) * FR * K], Vt[t0 + b * FR * K],
+                                     Nd2NzParams(1, FR, K, 0, K, FR, 1, 0));
+                        }
+                        DataCopy(lx[iv * BV * K], Vt[t0],
+                                 Nd2NzParams(1, BV, K, 0, K, BV, 1, 0));
+                    }
                 }
                 SetFlag<HardEvent::MTE2_MTE1>(e21);
                 WaitFlag<HardEvent::MTE2_MTE1>(e21);
                 qa.EnQue(la);
                 qv.EnQue(lv);
+                qx.EnQue(lx);
                 qk.EnQue(lk);
                 la = qa.DeQue<bfloat16_t>();
                 lv = qv.DeQue<bfloat16_t>();
+                lx = qx.DeQue<bfloat16_t>();
                 lk = qk.DeQue<bfloat16_t>();
-                LoadData(l0a, lv, LoadData2dParams(0, NG, 1, 0, 0, false, 0));
-                LoadData(l0a[NG * M * K], la, LoadData2dParams(0, 1, 1, 0, 0, false, 0));
-                LoadDataWithTranspose(l0b, lk, LoadData2dTransposeParams(0, D / M, 1, 0, 0));
+                // The d4 A operand is NG * M rows: both value tiles, iv-major,
+                // i.e. NG * NB bands of FR rows (2 * BV / FR of them, whatever
+                // the chunk size).  It is *not* NB bands: at C=16 the two
+                // coincide only because lv's row-major [BV, K] tile is already
+                // the L0A fractal order when K = FR = 16, and the load above
+                // then fills the whole NG * M * K - which is why the shipped
+                // single LoadData(.., NG, ..) covered it.
+                for (int32_t b = 0; b < NG * NB; ++b) {
+                    LoadData(l0a[b * FR * K], lv[b * FR * K],
+                             LoadData2dParams(0, K / FR, 1, 0, 0, false, 0));
+                }
+                for (int32_t b = 0; b < NB; ++b) {
+                    LoadData(l0a[NG * M * K + b * FR * K], la[b * FR * K],
+                             LoadData2dParams(0, K / FR, 1, 0, 0, false, 0));
+                    LoadDataWithTranspose(l0b[b * (D / FR) * 256], lk[b * FR * D],
+                                          LoadData2dTransposeParams(0, D / FR, 1, 0, 0));
+                }
                 for (int32_t iv = 0; iv < nv; ++iv) {
-                    LoadData(l0b[D * K + iv * BV * K], lv[iv * BV * K],
-                             LoadData2dParams(0, BV / M, 1, 0, 0, false, 0));
+                    LoadData(l0b[D * K + iv * BV * K], lx[iv * BV * K],
+                             LoadData2dParams(0, BV * K / 256, 1, 0, 0, false, 0));
                 }
                 SetFlag<HardEvent::MTE1_M>(e1m);
                 WaitFlag<HardEvent::MTE1_M>(e1m);
@@ -249,7 +359,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         D4[static_cast<uint64_t>(bh) * D * D], cf[0], ip);
                 }
                 for (int32_t iv = 0; iv < nv; ++iv) {
-                    auto ip = FixpipeParamsV220(N, M, 16, N, false);
+                    auto ip = FixpipeParamsV220(N, M, M, N, false);
                     ip.unitFlag = 0;
                     ip.quantPre = QuantMode_t::F322BF16;
                     Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(
@@ -260,6 +370,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 WaitFlag<HardEvent::FIX_M>(efm);
                 qa.FreeTensor(la);
                 qv.FreeTensor(lv);
+                qx.FreeTensor(lx);
                 qk.FreeTensor(lk);
                 // Same M -> MTE1 order as stage 1: d34's operands overwrite the
                 // L0A/L0B bytes the three mmads above read.
@@ -306,23 +417,24 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         TEventID evm2 = pipe.AllocEventID<HardEvent::V_MTE2>();
         TEventID e3v = pipe.AllocEventID<HardEvent::MTE3_V>();
         // UB budget.  The fp32 state is 32 KB per head and all MAXH of them
-        // stay resident for the whole loop, so at MAXH = 4 (the head count
-        // that makes [1,8192,96] a single wave of 24 blocks) the staging has to
-        // fit in the ~64 KB left of this part's 192 KB UB (probe: 96 KB of
-        // state plus 90.5 KB of staging passes, 112 KB of state does not).  The
-        // d4 tile is therefore walked in two 32-row halves (ud4h) and so is the
-        // bf16 state publish (us16h), the three fp32 widens share ux, the fp32
-        // output tile is uf (the widened u, dead after stage 2) and the bf16
-        // output tile is ud1 (d1, also dead after stage 2): 54.5 KB of staging
-        // plus the 128 KB of state.
-        TBuf<TPosition::VECCALC> uu, ud1, uv, ut, uf, usc, ud2, ud3, ud4h, udec, us, us16h, ux;
-        pipe.InitBuffer(uu, M * D * sizeof(bfloat16_t));
+        // stay resident for the whole loop, so the staging has to fit in the
+        // rest of this part's 192 KB UB.  The staging is chunk-sized (TILE
+        // elements), which is why a 64-row chunk drops MAXH from 4 to 2:
+        // the 16-row tiles cost 34.5 KB plus 32 KB of state per head, the
+        // 64-row ones 112.5 KB plus the same 32 KB (probe on the C=16 kernel:
+        // 96 KB of state plus 90.5 KB of staging passes, 112 KB of state does
+        // not).  The d4 tile is walked in two 32-row halves (ud4h) and so is
+        // the bf16 state publish (us16h), d1f/d2f/d3f share ux (the fp32
+        // widening, dead after stage 2), the fp32 output and the widened u
+        // share uf, and the bf16 output rides in d1's buffer.
+        TBuf<TPosition::VECCALC> uu, ud1, uv, ut, usc, ux, uf, ud2, ud3, ud4h, udec, us, us16h;
+        pipe.InitBuffer(uu, M * BV * sizeof(bfloat16_t));
         pipe.InitBuffer(ud1, TILE * sizeof(bfloat16_t));
         pipe.InitBuffer(ux, TILE * sizeof(float));
         pipe.InitBuffer(uv, TILE * sizeof(bfloat16_t));
-        pipe.InitBuffer(ut, TILE * sizeof(bfloat16_t));
-        pipe.InitBuffer(uf, M * D * sizeof(float));
-        pipe.InitBuffer(usc, (BV / M) * M * M * sizeof(bfloat16_t));
+        pipe.InitBuffer(ut, BV * M * sizeof(bfloat16_t));
+        pipe.InitBuffer(uf, TILE * sizeof(float));
+        pipe.InitBuffer(usc, (BV / FR) * (M / FR) * FR * FR * sizeof(bfloat16_t));
         pipe.InitBuffer(ud2, TILE * sizeof(bfloat16_t));
         pipe.InitBuffer(ud3, TILE * sizeof(bfloat16_t));
         pipe.InitBuffer(ud4h, (S_TILE / 2) * sizeof(float));
@@ -357,7 +469,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 PipeBarrier<PIPE_V>();
             } else {
                 DataCopy(state, H0[static_cast<uint64_t>(task) * S_TILE],
-                         DataCopyParams(BV, 16, 0, 0));
+                         DataCopyParams(BV, D / 8, 0, 0));
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
             }
@@ -378,7 +490,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 SetFlag<HardEvent::V_MTE3>(ev3);
                 WaitFlag<HardEvent::V_MTE3>(ev3);
                 DataCopy(S16[static_cast<uint64_t>(task) * S_TILE + hf * (BV / 2) * D], s16,
-                         DataCopyParams(BV / 2, 8, 0, 0));
+                         DataCopyParams(BV / 2, D / 16, 0, 0));
             }
 
             PipeBarrier<PIPE_ALL>();
@@ -400,38 +512,65 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 PipeBarrier<PIPE_ALL>();
                 const uint64_t u0 = static_cast<uint64_t>(c) * M * D;
                 const uint64_t out0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
-                DataCopy(ub, U[u0], DataCopyParams(M, 8, 0, 0));
+                // Only this subcore's value half of U is read: the block form
+                // gathers the iv-th 64-column run of each of the M rows.
+                DataCopy(ub, U[u0 + iv * BV], DataCopyParams(M, BV / 16, (D - BV) / 16, 0));
                 CrossCoreWaitFlag(FL_C1);
-                DataCopy(d1, D1[out0], DataCopyParams(M, 4, 0, 0));
+                DataCopy(d1, D1[out0], DataCopyParams(M, BV / 16, 0, 0));
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
-                Cast(vf, ub, RoundMode::CAST_NONE, M * D);
+                Cast(vf, ub, RoundMode::CAST_NONE, M * BV);
                 Cast(d1f, d1, RoundMode::CAST_NONE, TILE);
                 PipeBarrier<PIPE_V>();
-                // v_new = u - d1 for all 16 rows in one instruction: the dst
-                // and the d1 operand step by one 64-float row (8 blocks), the
-                // u operand by one 128-float row of the fp32 tile.
-                Sub(vf, vf[iv * BV], d1f, BV, M,
-                    BinaryRepeatParams(1, 1, 1, 8, 16, 8));
+                // v_new = u - d1 for all M rows in one instruction: both the
+                // dst and the d1 operand step by one BV-float row (BV / 8
+                // blocks), the u operand is the same-shape fp32 tile.
+                Sub(vf, vf, d1f, BV, M,
+                    BinaryRepeatParams(1, 1, 1, BV / 8, BV / 8, BV / 8));
                 Cast(vb, vf, RoundMode::CAST_RINT, TILE);
                 PipeBarrier<PIPE_V>();
                 SetFlag<HardEvent::V_MTE2>(evm2);
                 WaitFlag<HardEvent::V_MTE2>(evm2);
-                for (int32_t bl = 0; bl < BV / M; ++bl) {
-                    for (int32_t r = 0; r < M; ++r) {
-                        DataCopy(sc[bl * M * M + r * M], vb[r * BV + bl * M], DataCopyParams(1, 1, 0, 0));
+                // One 16 x 16 block per call: the source block of the
+                // destination's (j band j0, m band m0) is vb's (m band m0,
+                // j band j0) - the m index is vb's *row* - and the rows of
+                // both are BV / 16 blocks apart.  The destination is the
+                // packed block order of the [BV, M] tile the transpose below
+                // writes, i.e. its first index (j) is the row.
+                for (int32_t j0 = 0; j0 < BV / FR; ++j0) {
+                    for (int32_t m0 = 0; m0 < NB; ++m0) {
+                        DataCopy(sc[(j0 * NB + m0) * FR * FR], vb[m0 * FR * BV + j0 * FR],
+                                 DataCopyParams(FR, 1, BV / FR - 1, 0));
                     }
                 }
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
-                for (int32_t bl = 0; bl < BV / M; ++bl) {
-                    AscendC::Transpose(vt[bl * M * M], sc[bl * M * M]);
+                for (int32_t bl = 0; bl < (BV / FR) * NB; ++bl) {
+                    AscendC::Transpose(vt[bl * FR * FR], sc[bl * FR * FR]);
                 }
                 PipeBarrier<PIPE_V>();
                 SetFlag<HardEvent::V_MTE3>(ev3);
                 WaitFlag<HardEvent::V_MTE3>(ev3);
-                DataCopy(V[out0], vb, DataCopyParams(M, 4, 0, 0));
-                DataCopy(Vt[out0], vt, DataCopyParams(BV, 1, 0, 0));
+                DataCopy(V[out0], vb, DataCopyParams(M, BV / 16, 0, 0));
+                // The 16 transposes above leave the [BV, M] tile in *packed*
+                // 16 x 16 block order - the blocks are contiguous, in the
+                // (j, m) band order the gather used.  That is exactly a
+                // row-major [BV, M] tile only when M = FR, which is why the
+                // C=16 kernel could store it with one call; at M > FR the AIC
+                // (which reads the tile as BV / FR bands of FR rows with
+                // Nd2Nz, i.e. row-major, rows M elements apart) needs the
+                // blocks scattered back into place.  One call per block, FR
+                // bursts of one 16-element row, the destination rows M
+                // elements - M / 16 blocks - apart: the same GM-side gap form
+                // as the stage-4 out store, with a fully contiguous UB source.
+                // At M = FR this is bit-identical to the single call it
+                // replaces (16 bursts, no gap, contiguous destination).
+                for (int32_t bl = 0; bl < (BV / FR) * NB; ++bl) {
+                    const int32_t j0 = bl / NB;
+                    const int32_t m0 = bl - j0 * NB;
+                    DataCopy(Vt[out0 + static_cast<uint64_t>(j0 * FR) * M + m0 * FR],
+                             vt[bl * FR * FR], DataCopyParams(FR, 1, 0, M / 16 - 1));
+                }
                 CrossCoreSetFlag<2, PIPE_MTE3>(FL_V);
             }
             // ---- stage 4: out = d2*scale + d3 and the state recurrence
@@ -447,11 +586,11 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 const uint64_t t0 = static_cast<uint64_t>(task * NT + chunk) * TILE;
                 const uint64_t d4base = static_cast<uint64_t>(bh) * D * D +
                                         static_cast<uint64_t>(iv) * BV * D;
-                DataCopy(d2, D2[t0], DataCopyParams(M, 4, 0, 0));
-                DataCopy(dec, Decay[static_cast<uint64_t>(c) * D], DataCopyParams(1, 16, 0, 0));
+                DataCopy(d2, D2[t0], DataCopyParams(M, BV / 16, 0, 0));
+                DataCopy(dec, Decay[static_cast<uint64_t>(c) * D], DataCopyParams(1, D / 8, 0, 0));
                 CrossCoreWaitFlag(FL_C2);
-                DataCopy(d3, D3[t0], DataCopyParams(M, 4, 0, 0));
-                DataCopy(d4, D4[d4base], DataCopyParams(BV / 2, 16, 0, 0));
+                DataCopy(d3, D3[t0], DataCopyParams(M, BV / 16, 0, 0));
+                DataCopy(d4, D4[d4base], DataCopyParams(BV / 2, D / 8, 0, 0));
                 SetFlag<HardEvent::MTE2_V>(e2v);
                 WaitFlag<HardEvent::MTE2_V>(e2v);
                 // out = d2 * scale + d3 is accumulated in fp32 and only then
@@ -496,17 +635,18 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                                                    (static_cast<uint64_t>(M) * NH * D) +
                                                static_cast<uint64_t>(hh) * D + iv * BV;
                         DataCopy(Out[obase], ob,
-                                 DataCopyParams(M, 4, 0, static_cast<uint16_t>(NH * D / 16 - 4)));
+                                 DataCopyParams(M, BV / 16, 0,
+                                                static_cast<uint16_t>(NH * D / 16 - BV / 16)));
                     }
                     DataCopy(S16[static_cast<uint64_t>(task) * S_TILE + hf * (BV / 2) * D], s16,
-                             DataCopyParams(BV / 2, 8, 0, 0));
+                             DataCopyParams(BV / 2, D / 16, 0, 0));
                     if (hf == 0) {
                         // ... and release the buffer for the second half once
                         // this store has actually read it.
                         SetFlag<HardEvent::MTE3_V>(e3v);
                         SetFlag<HardEvent::V_MTE2>(evm2);
                         WaitFlag<HardEvent::V_MTE2>(evm2);
-                        DataCopy(d4, D4[d4base + (BV / 2) * D], DataCopyParams(BV / 2, 16, 0, 0));
+                        DataCopy(d4, D4[d4base + (BV / 2) * D], DataCopyParams(BV / 2, D / 8, 0, 0));
                         SetFlag<HardEvent::MTE2_V>(e2v);
                     }
                 }
@@ -519,7 +659,7 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
         for (int32_t s = 0; s < nh; ++s) {
             const int32_t task = heads[s] * nv + iv;
             DataCopy(S32[static_cast<uint64_t>(task) * S_TILE], st[s * S_TILE],
-                     DataCopyParams(BV, 16, 0, 0));
+                     DataCopyParams(BV, D / 8, 0, 0));
         }
         PipeBarrier<PIPE_ALL>();
         return;

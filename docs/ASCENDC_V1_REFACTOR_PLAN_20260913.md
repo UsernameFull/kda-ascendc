@@ -357,3 +357,95 @@ KDA_CHUNK=64 时它按 16 行的步子走 64 行的 chunk：每个 chunk 只处�
 收益要等 **K2 的 CHUNK 参数化**（把 16 行的 tile 改成 `CHUNK/16` 个 16 行子块、
 chunk 步长用 `CHUNK * D`，并处理 chunk 内的 aqk 耦合/state 更新）落地之后才能
 报。C=16 的 e2e 一直是好的，可作回归基线。
+
+## 11.6. R2 落地：K2 的 chunk 参数化 + C=64 的 e2e 收益（2026-09-14）
+
+R2 的靶子是 11.5 的结论：C=64 的 e2e 数字要等 K2 的 CHUNK 参数化落地才能报。
+改动落在 `kernels/v1/k2_persistent_loop.cpp`（全量重写为 `M = KDA_CHUNK` 的公式：
+`NG = 2 * BV / M`、stage 3 的收缩维 = chunk 行数、所有 GM 偏移 `(bh*NT+chunk)*M*D`，
+没有一条 chunk-size 分支）和 `python/kda_ascendc_v1/api.py`（`PERSIST_MAXH`
+随 chunk size 取 4/2，见 11.6.2）。
+
+### 11.6.1 三个 tile 布局事实（都不是"把 M 从 16 改成 64"）
+
+1. **`Vt` 的 store 必须是行主序。** `AscendC::Transpose` 是 16×16 原语，stage 2
+   的转置输出是 *packed 块序*（块 `(j0,m0)` 落在 `bl = j0*(M/16)+m0`）。`M=16`
+   时 packed 序就是行主序（C=16 一直对就是这个原因），`M=64` 时必须把块散回去
+   （`FR` 个"一行 16 元素"的 burst，目的行距 `M`）。AIC 侧按**行主序**读
+   （每个 band `Nd2NzParams(1, FR, K, 0, K, FR, 1, 0)`），拿到 packed 序不会
+   fault、只会算错：对齐 fp32 参照 out rel 1.0。隔离硬件探针
+   `/tmp/vtprobe*.py`（5 种形态逐位一致）、dump 网格 `/tmp/vtgrid3.npz`。
+2. **d4 的 A 操作数（L0A）是"每个 value tile `BV/FR` 个 band"，不是 `NB`。**
+   该操作数是 `[NG*M, K]`、两个 value tile iv-major，所以 `lv` 每个 `iv` 要
+   `BV/FR` 个 band；`NB = M/FR` 只在 C=64（`M = BV`）恰好相等。C=16 时
+   `NB=1` 只装了 1/4 的操作数——这个错是 11.6.3 的对照实验抓到的。
+3. **`K == FR` 值得单开一条 load 路径。** 每行正好一个 C0 块时 ND 布局*就是*
+   fractal 序，一条 plain burst 顶得上 general 路径的逐 band `Nd2Nz`
+   （16 个 descriptor/band vs 整块 ~2 个）：C=16 上这一条值 K2 整体
+   15.6 → 5.5 ms。
+
+### 11.6.2 收益：C=64 要靠"两个 head/block"才真赚
+
+`MIN of 4`，`[1,8192,96,128]`，一个进程一个配置：
+
+| 配置 | pre_gram | solve | K2 | e2e |
+|---|---:|---:|---:|---:|
+| C=16，MAXH=4（旧默认） | 4.550 | 2.105 | 5.529 | 12.201 |
+| C=32，MAXH=2 | 4.316 | 2.288 | 5.941 | 12.546 |
+| C=64，MAXH=1（初次能算对） | 4.159 | 2.591 | 6.042 | 12.792 |
+| C=64，MAXH=2（R2 默认） | 4.156 | 2.621 | 3.913 | **10.742** |
+
+C=32 顺带做了对照（同一个内核的 general 分支、`NB=2 != BV/FR=4`，数值同样是
+8.620e-03/4.245e-03）：它比 C=16 慢、比 C=64 慢，所以默认还是 C=64。K2 的
+每 chunk-head 成本随 chunk 变大而升（C=16/32/64 各 ~2.7/5.8/7.7 us），
+说明大 tile 的*效率*在下降——但 chunk 数目的下降仍然更快。
+
+C=64 只减少"每 chunk 的 flag 往返"（512 → 128），而**K2 不是 flag 受限、
+是 descriptor/工作受限**：§10 的 protocol 模型（`k2 ~= chunks × 4 phase × nh ×
+0.65 us`）预测 K2 该掉 4 倍，实测只从 6.51 掉到 6.04。真正让 C=64 赚的是
+**第二个 head 把两个引擎重叠起来**——深度一协议下 `nh=1` 时 AIC 的
+`d12(h+1)` 没有下一个 head 可重叠，两个引擎严格串行：K2 6.04 → 3.91 ms，
+e2e 12.79 → 10.74 ms，且输出**逐位不变**、stage gate 的 rel 一字不变。
+UB 账：staging 112.5 KB（M=64）+ 2×32 KB state = 176.5 KB / 192 KB，第三个
+head 要 208.5 KB（UB 溢出是 kernel 侧 aivec error，不是 host 侧分配失败）。
+
+### 11.6.3 控制实验抓到的 C=16 回归（回写教训）
+
+重写只动"切 chunk 的方式"，但 C=16 的对照跑出 out rel 7.59e-02 / state rel
+1.04（HEAD 是 8.62e-03 / 4.25e-03）——不是"读到陈旧 build"，是真回归：
+`lv` 的 band 数被写成 `NB`（C=64 恰好等于 `BV/FR`，所以 C=64 对、C=16 错）。
+修法（`BV/FR`）+ `K == FR` 快路径后，C=16 回到 8.620e-03 / 4.245e-03，并且比
+旧 kernel 略快（K2 6.51 → 5.53）。教训：把 tile 公式从"单一 chunk size 下恰好
+成立"推广时，**必须同时在旧 chunk size 上跑一遍控制**；C=16 的 separated 路径
+正好是免费的 oracle。
+
+顺带一个对照：pre-R2 的 C=64 e2e 是 8.24 ms，但每个 chunk 只走 16 行（做 1/4
+的活）——"快且错"；现在 10.74 ms 才是这个几何的真实数字。
+
+### 11.6.4 数值门禁（可复现）
+
+- e2e vs 主机 fp32 参照，`[1,8192,8,128]`，C=16 与 C=64 都是
+  out rel **8.620e-03** / state rel **4.245e-03**（两个 chunk size 一位不差）。
+- K2 stage gate（numpy 重放同一批 K1 中间结果，C=64 T=64 H=2）：
+  `d1` 6.562e-36、`d2` 2.585e-36、`vnew`/`vnewT`/`d3` 0、`out` 9.591e-04、
+  `d4`/`state` 3.294e-08。
+- pytest `tests/test_persistent_loop.py`：C=16 全绿（6 passed）；C=64
+  3 skipped（`k2_mode="separated"` 是 C=16-only oracle）+ 3 passed。新增
+  `test_persistent_loop_matches_fp32_reference` 是 chunk-generic 的（C=32/64
+  也有门禁，pre-R2 的"快且错"它抓得住），determinism 用例改成 48 heads
+  （任何配置都 `nh >= 2`，能压到多 head 交错的那条路）。
+
+### 11.6.5 现在的账与下一步
+
+`10.742 = pre_gram 4.156 + solve 2.621 + K2 3.913`。对照 FLA：本机
+triton-ascend 54.4 ms（领先 5.1×），FLA H100/H200 CI 2.722 ms（落后 3.9×）。
+四个阶段的排序没变，但 K2 从"最大头"降到第二位（pre_gram 现在是第一大段）：
+
+1. **K2 的 descriptor 数**：AIC 侧每个 chunk-head 约 640 条（W/Qg/S16 的
+   逐 band `Nd2Nz` 各占 64/64/128），这是 nh 重叠之后剩下的主项——把"整块一次
+   转换"的等价形式找出来（先确认 `dstNzC0Stride` 的整块语义）就能再砍一半。
+2. **K2 的 `nh` 上不去**：112.5 KB staging + 2×32 KB state = 176.5/192 KB。
+   要 4 heads/block 得先缩 staging（AIV 只 stage 自己那 64 列、d4 与 S16 的
+   两半进一步共用），否则 C=64 就钉在 2。
+3. **pre_gram 4.16 ms 现在是最大单段**：回到 §4 的 L3（指令瘦身）与 L2（融合）
+   那条线。
