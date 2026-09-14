@@ -60,22 +60,36 @@ ASM_NCHUNK = int(os.environ.get("KDA_ASM_NCHUNK", "0")) or 4
 SOLVE_OVERLAP = int(os.environ.get("KDA_SOLVE_OVERLAP", "16"))
 # Heads per block in the persistent K2 loop, and therefore the KDA_MAXH the
 # kernel is compiled with (they must agree: the kernel's head map only walks
-# MAXH heads per block, so a smaller define silently drops heads).  The fp32
-# state is 32 KB of UB per head and stays resident, so the staging has to fit
-# in the rest of this part's 192 KB: it is chunk-sized (29 KB at M = 16, 68 KB
-# at 32, 112.5 KB at 64), which caps the tile at 4 heads for C=16 and 2 for
-# C=64/32 (a third would need 208.5/164.5 KB; a UB overrun is a kernel-side
-# aivec error, not a host-side allocation failure, so this is arithmetic, not
-# a probe - MAXH 2 at C=64 is measured, 176.5 KB, stage gate clean).
+# MAXH heads per block, so a smaller define silently drops heads).
+# The fp32 state is 32 KB of UB per head and stays resident, so all the
+# staging has to fit in the rest of this part's 192 KB.  R3 halved that
+# staging by aliasing it across the two phases the loop alternates (stage 2
+# and stage 4, each of which opens with a PIPE_ALL drain): 112.5 KB -> 56.5 KB
+# at C=64, 46.5 -> 26.5 KB at C=16 (kernels/v1/k2_persistent_loop.cpp carries
+# the budget).  That is what makes 4 heads fit at every chunk size -
+# 128 + 56.5 = 184.5 KB of 192 at C=64, 128 + 36.5 = 164.5 at C=32 - where
+# the old layout capped C=64/32 at 2 (176.5 KB).  A UB overrun is a
+# kernel-side aivec error, not a host-side allocation failure, so this is
+# arithmetic, not a probe.
+# Heads per block is not a free knob: 4 heads/block puts the whole 96-head
+# grid on 24 blocks, i.e. one wave per AIC instead of two, and the second wave
+# costs a whole second pass over the chunks.  Measured same-process A/B at
+# [1,8192,96,128] (interleaved MIN of 4, bit-identical outputs incl. the fp32
+# state): C=64 k2 6.23 (MAXH 2, 2 waves) -> 5.97 ms (MAXH 4, 1 wave); C=32
+# 6.12 -> 5.81 ms.  The aliasing is *not* free at a fixed head count - it
+# needs the stage-4 recurrence split into four 16-row quarters instead of two
+# 32-row halves, worth +0.54 ms at C=64/MAXH 2 - so the MAXH 4 gain is what
+# pays for it, and the pairing is the point (2 + 56.5 = 120.5 KB wastes the
+# diet).
 # nh = 1 is not just "one fewer head": the depth-one flag protocol only
 # overlaps the two engines when a block has two or more heads in flight, so at
 # C=64 the second head is worth k2 6.04 -> 3.91 ms and e2e 12.79 -> 10.74 ms
 # at [1,8192,96,128] (MIN of 4), numerics unchanged to the bit (K2 stage gate
 # 6.6e-36/9.6e-04/3.3e-08).  The env can lower MAXH, or raise it within the
 # ceiling; C=16/32/64 are each checked end to end against the fp32 reference.
-PERSIST_MAXH = max(1, min(4 if CHUNK <= 16 else 2,
+PERSIST_MAXH = max(1, min(4 if CHUNK <= 64 else 2,
                           int(os.environ.get("KDA_PERSIST_LOOP_MAXH", "0"))
-                          or (4 if CHUNK <= 16 else 2)))
+                          or (4 if CHUNK <= 64 else 2)))
 KGT_NCHUNK = 8
 WU_NCHUNK = int(os.environ.get("KDA_WU_NCHUNK", "0")) or (4 if CHUNK <= 32 else 2)
 D = 128
@@ -432,7 +446,8 @@ def kda_bt16_fwd_ascendc(
     # capped at 8 chunks so at least ~256 blocks stay in flight, and tiny grids
     # (fewer than 256 chunks) stay at 1 because the loop wrapper itself costs a
     # few percent there.
-    pre_unroll = 1 if c < 256 else min(8, max(2, c // 512))
+    pre_unroll = (int(os.environ.get("KDA_PRE_UNROLL", "0"))
+                  or (1 if c < 256 else min(8, max(2, c // 512))))
     mark("pre_gram_start")
     if os.environ.get("KDA_PRE_GRAM", "mix") == "aiv":
         pre_args = _pack_ptrs(pre_head + pre_tail)

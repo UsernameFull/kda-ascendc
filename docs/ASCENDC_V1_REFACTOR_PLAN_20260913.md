@@ -488,3 +488,46 @@ triton-ascend 54.4 ms（领先 5.1×），FLA H100/H200 CI 2.722 ms（落后 3.9
 - 把 state/d4 的 GM 往返搬进 L0C（T3.1）：同时砍掉 fixpipe 的 64 KB/chunk-head 和 AIV 的 d4 读；
 - 减少每 chunk 的 store/屏障段数：stage 2/4 的"两半"合并、去掉一次 MTE3→V 事件对，或把
   `Vt` 的转置搬到 AIC 的 `LoadDataWithTranspose`（省掉 AIV 的 16 次 `Transpose` 与整个 Vt store 段）。
+
+## 11.8. R3（一）：K2 的 UB 分期复用，把 MAXH 从 2 抬到 4（2026-09-14 晚）
+
+§11.7 说 K2 只能靠结构动刀，而结构里最便宜的一刀是**把每块里的 head 数从 2 抬到 4**：
+b=1/h=96 时 96 个 head 落在 24 个 AIC 上就是**一波**，而 MAXH=2 时 48 块 = 两波，
+第二波要把 128 个 chunk 整个再走一遍。这件事之前被 UB 顶着：fp32 state 32 KB/head 常驻，
+4 个就是 128 KB，剩下的 64 KB 装不下当时 112.5 KB 的 staging。
+
+**做法：staging 按阶段复用。** stage 2（v_new）和 stage 4（out + state 递推）在本 loop 里
+从不同时活着——每一段开头都有一个 `PipeBarrier<PIPE_ALL>` 在排水——所以一套 buffer 可以
+轮着用两段：
+
+| buffer | 字节（C=64） | stage 2 | stage 4 |
+|---|---:|---|---|
+| A | `TILE * 4` = 16 KB | `vf`（u 的 fp32 展宽） | `of`（out 的 fp32 累加） |
+| E | `TILE * 4` = 16 KB | `sc`（缩放后的 k，bf16）+ `vt` | `d1f/d2f/d3f`（fp32 展宽暂存） |
+| B | 8 KB | `ub` | `d2`，随后是 s16 的 1/4 |
+| C | 8 KB | `d1` | `d3`，随后是 `ob` |
+| D | 8 KB | `vb` | `d4` 的 16 行 1/4 |
+
+56.5 KB，加上 128 KB 的 state = 184.5 KB / 192 KB。代价是 stage 4 的递推必须从
+"两个 32 行半"改成"**四个 16 行 1/4**"：`uD` 只有 8 KB，装不下 32 行的 fp32 d4
+（16 KB）。同进程 A/B（交错 MIN of 4，输出与 fp32 state **逐位相同**）：
+
+| [1,8192,96,128]，CHUNK=64 | k2_ms |
+|---|---:|
+| HEAD（112.5 KB staging，MAXH 2，48 块 = 2 波） | 6.232 |
+| 新 layout，但仍是 MAXH 2（48 块 = 2 波） | 6.774（**+0.54**：四个 1/4 的代价） |
+| 新 layout + MAXH 4（24 块 = 1 波） | **5.973**（−0.26） |
+
+CHUNK=32 同向（6.118 → 5.808），CHUNK=16 本来就能上 4。
+
+1. **收益来自"一波 vs 两波"，不是来自少搬字节。** 同分布的 A/B 显示分期复用本身是
+   **负的**（+0.54 ms，四个 1/4 比两个 1/2 多出 2 组 `MTE3→V` / `V→MTE2` 往返，
+   每 chunk-head 多约 8 次跨 pipe 握手）。所以这个改动不能拆开用：2 个 head 配 56.5 KB
+   是白扔（120.5 KB），必须配 MAXH 4 才回本。
+2. **K2 的时间是"每 block 的 head-step 数 × 每步延迟"，不是块数。** MAXH 2（48 块）：
+   每块 2 head × 128 chunk = 256 步，两波；MAXH 4（24 块）：每块 512 步，一波。
+   总 head-step 数不变（12288），所以 1 波 × 512 步 ≈ 2 波 × 256 步，
+   实测 5.97 对 2 × 1.97 = 3.94 的差就是第二波的 ramp。
+3. **数值门禁**（fp32 参考，H=8，T=8192）：C=16/32/64 全部 `out rel=8.620e-03,
+   state rel=4.245e-03`，与改前逐位相同；MAXH 4 与 MAXH 2 的输出与 fp32 state
+   在全 shape 上 diff = 0.000e+00。
