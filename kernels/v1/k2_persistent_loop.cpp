@@ -65,13 +65,27 @@
 // K2 6.04 -> 3.91 ms, e2e 12.79 -> 10.74 ms, outputs bit-identical (plan
 // section 11.6.2); nh = 1 serialises the engines - see api.py's PERSIST_MAXH.
 //
+// R3 (2026-09-14): the [BV, M] v_new^T tile is stored *once*, in the block order
+// the d4 A operand reads - packed, contiguous, one call - and the d34 B
+// operand's order (the same 16 x 16 blocks, block-transposed) is built by its
+// load with explicit strides.  The two L0 walks really do differ: the A operand
+// walks R / 16 bands row-block-major, while a `dstNzC0Stride = R` Nd2Nz packs
+// the source C0 blocks column-block-major, which is the B operand's order.  The
+// three variants were measured separately (plan section 11.11): the packed
+// store alone leaves `out` wrong and the state exact (d4's operands are this
+// tile and kg^T, so only the B-operand path moves `out`), the two plain reads
+// leave `out` right up to that block order and the state wrong, and only the
+// pair is bit-exact (out and state rel 0.000e+00, K2 3.696 -> 2.457 ms at
+// [1,8192,96,128]).
+//
 // The 16-row fractal stays the unit of every L0 load, and the three operand
 // layouts this kernel needs are all built from the two idioms the C=16 kernel
 // already used, each one verified on hardware:
 //   * L0A [R, C] (W/Qg, Aqk, v_new^T as the d4 A operand): R / 16 bands, each
 //     `Nd2NzParams(1, 16, C, 0, C, 16, 1, 0)` - dstNzC0Stride = R = 16 = one
 //     band - then one `LoadData2dParams(0, C / 16, 1, 0, 0, false, 0)`.  At
-//     R = 16 this is the single call the C=16 kernel shipped.
+//     R = 16 this is the single call the C=16 kernel shipped.  v_new^T is
+//     now *stored* in that band order (R3), so the read is one plain burst.
 //   * L0B [C, R] whose source has the rows on the n dim (S16, v_new^T):
 //     `Nd2NzParams(1, R, C, 0, C, R, 1, 0)`, one call, then
 //     `LoadData2dParams(0, R * C / 256, 1, 0, 0, false, 0)`.  dstNzC0Stride =
@@ -295,12 +309,18 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         DataCopy(lv[iv * BV * K], Vt[t0], BV * K);
                         DataCopy(lx[iv * BV * K], Vt[t0], BV * K);
                     } else {
-                        for (int32_t b = 0; b < BV / FR; ++b) {
-                            DataCopy(lv[(iv * (BV / FR) + b) * FR * K], Vt[t0 + b * FR * K],
-                                     Nd2NzParams(1, FR, K, 0, K, FR, 1, 0));
+                        // R3: the GM tile is in the A operand's block order
+                        // (one plain burst) and the B operand's is its block
+                        // transpose, done here with explicit block strides
+                        // instead of an Nd2Nz that re-packs the row-major
+                        // tile.  See the stage-2 store and plan section 11.11.
+                        DataCopy(lv[iv * BV * K], Vt[t0], BV * K);
+                        for (int32_t c = 0; c < BV / FR; ++c) {
+                            DataCopy(lx[iv * BV * K + c * (BV / FR) * FR * FR],
+                                     Vt[t0 + c * FR * FR],
+                                     DataCopyParams(BV / FR, FR * FR / 16,
+                                                    (BV / FR) * FR * FR / 16 - FR * FR / 16, 0));
                         }
-                        DataCopy(lx[iv * BV * K], Vt[t0],
-                                 Nd2NzParams(1, BV, K, 0, K, BV, 1, 0));
                     }
                 }
                 SetFlag<HardEvent::MTE2_MTE1>(e21);
@@ -560,23 +580,19 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 DataCopy(V[out0], vb, DataCopyParams(M, BV / 16, 0, 0));
                 // The 16 transposes above leave the [BV, M] tile in *packed*
                 // 16 x 16 block order - the blocks are contiguous, in the
-                // (j, m) band order the gather used.  That is exactly a
-                // row-major [BV, M] tile only when M = FR, which is why the
-                // C=16 kernel could store it with one call; at M > FR the AIC
-                // (which reads the tile as BV / FR bands of FR rows with
-                // Nd2Nz, i.e. row-major, rows M elements apart) needs the
-                // blocks scattered back into place.  One call per block, FR
-                // bursts of one 16-element row, the destination rows M
-                // elements - M / 16 blocks - apart: the same GM-side gap form
-                // as the stage-4 out store, with a fully contiguous UB source.
-                // At M = FR this is bit-identical to the single call it
-                // replaces (16 bursts, no gap, contiguous destination).
-                for (int32_t bl = 0; bl < (BV / FR) * NB; ++bl) {
-                    const int32_t j0 = bl / NB;
-                    const int32_t m0 = bl - j0 * NB;
-                    DataCopy(Vt[out0 + static_cast<uint64_t>(j0 * FR) * M + m0 * FR],
-                             vt[bl * FR * FR], DataCopyParams(FR, 1, 0, M / 16 - 1));
-                }
+                // (j, m) band order the gather used, which is exactly the A
+                // operand's band walk and *not* the row-major [BV, M] tile.
+                // R3: one call for the packed order, and the B operand's
+                // block transpose is done on the MTE2 side (see stage 3) -
+                // 0.82 ms of store plus ~0.4 ms of the two Nd2Nz reads, which
+                // re-packed this same tile, for 3.696 -> 2.457 ms at
+                // [1,8192,96,128] with out and state bit-identical.  The form
+                // this replaces scattered each block into its row-major slot:
+                // one call per block, FR bursts of one 16-element row, M / 16
+                // blocks apart - the stage-4 out store's gap form, but 16x the
+                // descriptors.  At M = FR that loop was already contiguous and
+                // this call is bit-identical to it (verified at C=16).
+                DataCopy(Vt[out0], vt, BV * M);
                 CrossCoreSetFlag<2, PIPE_MTE3>(FL_V);
             }
             // ---- stage 4: out = d2*scale + d3 and the state recurrence
