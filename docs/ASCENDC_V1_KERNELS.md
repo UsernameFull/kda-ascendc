@@ -13,7 +13,8 @@ silently produces wrong numbers, so the contracts are spelled out here.
 | `k1_gram.cpp` | `kda_gram_kernel` | `Aqk32`/`Aqk` bf16 `[c,16,16]`, `L` |
 | `k1_pre_gram.cpp` | `kda_pre_gram_kernel` | everything the two rows above write, in one block per chunk; reads `q`/`k`/`v`/`g` in the public `[B,T,H,D]` layout |
 | `k1_solve_wu.cpp` | `kda_solve_wu_kernel` | `A32`/`A16` |
-| `k1_solve_wu_wide.cpp` | `kda_solve_wu_wide` | the same, 32 chunks per vector instruction |
+| `k1_solve_wu_wide.cpp` | `kda_solve_wu_wide` | the same, `NC` (sub-block, chunk) instances per vector instruction; at `SB = 2` only the diagonal sub-blocks, plus `Xb`/`Lneg` |
+| `k1_solve_assemble.cpp` | `kda_solve_assemble` | the coupling block `X21 = -X22 L21 X11` into `A16`'s lower-left (SB = 2 only) |
 | `k1_solve_wu_cube.cpp` | `kda_solve_wu_cube_kernel` | `W`, `U` |
 
 The preprocess kernel indexes the packed chunk-major layout, so `api.py` passes
@@ -28,6 +29,111 @@ Row reductions inside these kernels use the tested idiom
 `Add(tmp, tile, tile[64], 64, M, BinaryRepeatParams(1,1,1,16,16,16))` followed by
 `WholeReduceSum(rs, tmp, 64, M, 1, 1, 16)`: the fp32 L1 mask is 64 lanes, and
 with `dstRepStride = 1` the results land contiguously at `rs[i]` (not `rs[i*8]`).
+
+### Two-level solve (`kda_solve_wu_wide` + `kda_solve_assemble`, SB = 2)
+
+`KDA_SOLVE_WIDE_SUBB = 2` (the `api.py` default at `KDA_CHUNK = 64`) splits each
+chunk's forward substitution in two levels.  The row recursion costs `M^3/2`
+vector lanes per chunk, so it is the *depth* that has to come down: solving the
+`SB` diagonal `M = CHUNK/SB` triangles of a chunk instead of the whole chunk
+divides the vector work by `SB^2` (4x at `SB = 2`), and what is left of the
+chunk-sized inverse is the coupling block of the 2x2 block inverse
+
+```
+A_inv = [[X11, 0], [-X22 L21 X11, X22]]      (I + L = [[I+L11, 0], [L21, I+L22]])
+```
+
+i.e. `X21 = -X22 @ L21 @ X11`, two `M x M x M` matmuls - exactly the work the
+Cube is for.  The wide kernel (AIV) now walks `(sub-block, chunk)` instances of
+one `[M, M]` tile, so one `MulAddDst` updates row `i` of `SB x NCH` blocks at
+once and the number of vector instructions per chunk falls with `SB^2`; it
+exports, next to the parent-tile copies the Cube solve already consumes:
+
+| tensor | shape | layout |
+|---|---|---|
+| `A32`, `A16` | `[c_solve, CHUNK, CHUNK]` | the diagonal sub-blocks only (fp32 debug / bf16 operand) |
+| `Xb` | `[c_solve, SB, M, M]` bf16 | the same sub-blocks contiguous, as the assemble kernel's operands |
+| `Lneg` | `[c_solve, M, M]` bf16 | `-L21` (the sign is folded into the operand so the Cube needs no extra pass) |
+
+The parent tile's **strict upper triangle** is zero in `A_inv` but no kernel
+computes it, while the Cube solve reads all of `[CHUNK, CHUNK]`: the wide kernel
+blanks it from a whole `M x M` tile of zeros held in UB, for `A16` *and* `A32`
+(the fp32 debug twin - leaving it uninitialised made the two exports disagree on
+a block that is zero in `A_inv`).  A `DataCopyParams` source gap of 0 means *no
+gap* between bursts, i.e. the rows are read contiguously (probe `/tmp/dcprobe.py`:
+a one-row source walks off the end of its buffer and stores UB garbage, and a
+full-tile source lands exactly the tile) - the broadcast the first version
+assumed would have to be a repeat stride inside a vector op, not a DMA
+parameter.  That was a real bug: with a 2 KB-per-chunk blank the tile's upper
+block kept whatever the allocation held, which is zero for the fresh 100 MB
+buffer of the real shape but 1e36-`inf` for recycled memory at small shapes, so
+the Cube solve read garbage there (W/U came out `inf`, the e2e output wrong).
+
+`kda_solve_assemble` (AIC) forms the coupling block in two passes: pass 0
+`P = Lneg @ X11` fixpiped row-major into its own `[c_solve, M, M]` bf16 tile,
+pass 1 `X21 = X22 @ P` fixpiped straight into the parent tile's lower-left
+block.  The `L0C -> GM -> L1` round trip of `P` is unavoidable (L0C has no path
+back into L0A/L0B); splitting the passes keeps it off the per-chunk critical
+path.  Both operands go in through `Nd2Nz` (whole tile for A, per-band for B,
+which `LoadDataWithTranspose` wants band-major).  The kernel's L1 queue has to
+be `NC` deep - the loads of a whole pass are issued before its arithmetic
+starts, and a 2-deep queue **deadlocks** on the third `AllocTensor` (measured:
+`KDA_ASM_NCHUNK = 2` runs, 4 and 8 hang the block).
+
+Numerically the two-level path is a *bf16 chain*: `Xb` and `Lneg` are bf16, `P`
+is bf16, and the parent tile is bf16.  Against the fp64 inverse of the same
+`I + L` that puts `X11`/`X22` at 4.882e-04 (one bf16 rounding of a value of
+order 1) and the coupling block at 1.411e-03 - a numpy replay of exactly that
+chain (bf16 `Xb`, `Lneg`, `P`, `X21`) reproduces both numbers to the last
+digit, so the kernel adds nothing of its own.  The single-level path kept the
+whole `A_inv` at one rounding; this is the price of the 4x shorter recursion.
+
+Measured at `[1,8192,96,128]`, MIN of 4, one process per config (`wide` = AIV
+kernel, `asm`/`cube` = the two AIC kernels):
+
+| config | wide | asm | cube | solve |
+|---|---:|---:|---:|---:|
+| `SB = 1`, `NC = 4` (pre-R1) | 3.865 | - | 1.290 | 5.19 |
+| `SB = 2`, `NC = 4`, `KA = 4` | 1.957 | 0.777 | 1.259 | 4.00 |
+| `SB = 2`, `NC = 6`, `KA = 4` | 1.490 | 0.760 | 1.260 | 3.51 |
+| `SB = 2`, `NC = 8`, `KA = 4` | 1.351 | 0.772 | 1.258 | 3.38 |
+| `SB = 2`, `NC = 10`, `KA = 4` | 1.202 | 0.758 | 1.261 | 3.22 |
+| `SB = 2`, `NC = 12`, `KA = 4` | 1.245 | 0.771 | 1.259 | 3.27 |
+| `SB = 2`, `NC = 8`, `KA = 4`, 16 two-stream slices | - | - | - | **2.51** |
+
+The chunk count is rounded up to a whole wide block by `api.py`, and the tail
+chunks are solved too - on the strength of the tail rows of `L` being zero,
+which is what makes them come out as a harmless identity.  The Gram only writes
+the real chunks, so the api has to zero `L[c:]` when `c_solve != c` (an
+uninitialised tail is not harmless: the substitution turns it into `inf`).
+
+**C=64 is a K1-only geometry today.**  `KDA_CHUNK` is threaded through
+`preprocess`/`k1_pre_gram*`/`k1_solve*` only: no kernel of the K2 family
+(`k2_persistent_loop.cpp`, `k2_d12*.cpp`, `k2_vnew.cpp`, `k2_d34.cpp`,
+`k2_outstate*.cpp`, ...) mentions `KDA_CHUNK`, and `k2_persistent_loop.cpp`
+carries `M = 16`, `K = 16`, `N = 64` as literals with every per-chunk GM offset
+built as `(bh * NT + chunk) * M * D`.  At `KDA_CHUNK = 64` that kernel therefore
+walks 16-row pieces of 64-row chunks (a quarter of the rows, at the wrong
+offsets), which is fast and wrong; `k2_mode = "separated"` is wrong the same way.
+End-to-end C=64 numbers are only meaningful once K2 is chunk-parameterised - the
+solve-stage numbers below are unaffected (K1 is verified against the fp64
+reference stage by stage at C=64: `Qn`/`Kn`/`Qg`/`Kg`/`Rk`/`Rv`/`Aqk32`/`Aqk`/
+`L`/`Decay` all at bf16 level, and the solve against the fp64 inverse of `L`).
+
+`NC` is capped by UB (the tile, its bf16 copy, the `Brcb` expansion and the
+`L21` tile end at 118 KB of the 192 KB at `NC = 8`, 172 KB at `NC = 12`, so 10
+is the knee and 12 the last size that fits), and the Cube solve stays at 2
+chunks per block because L0C holds one slot per `(pass, chunk)` unit.
+
+The last row is the overlap: the wide kernel is `AIV_ONLY` and the
+assemble/Cube pair `AIC_ONLY`, so `api.py` cuts the chunk range into whole
+`unit` groups and runs the wide slices on one stream and the assemble+Cube
+slices on another behind a per-slice event.  Both engines then work at the same
+time (3.22 -> 2.51 ms) and the outputs are **bit-identical** to the serial path
+(`a16`, `W` and `U` compared over all 12288 chunks).  The slicing has to be
+done in whole groups of `lcm(wide block, assemble block, Cube block)` chunks:
+an odd slice then hands its last chunk to a Cube unit that would read the
+*next* slice's (not yet written) parent tile.
 
 ## K2: d12 -> vnew -> d3 -> d4 -> out/state
 

@@ -243,3 +243,117 @@ flag 有效、粗化反而慢（粗化丢失 head 间重叠，且换不出 phase
   剩下的两个 drain（`MTE1_M`、`M_FIX`）删掉会 fault（实测 507015），要拿它们
   必须真做软件流水（`NC` 加深会被 AIC 的 `TQue<B1, N≥4>` 上限挡住，
   必须改成手工 ping-pong L1），预估还能拿 0.4–0.8 ms。
+
+## 11. R1 落地：C=64 两级 solve（2026-09-13 深夜）
+
+R1 的靶子是 solve 的 `wide`（AIV）侧：C=64 时它的行递推是 `M^3/2`=131k lane/chunk，
+实测 3.865 ms 里 3.12 ms 是这一项（`/tmp/wideattr.py`：整段删掉只剩 0.747 ms）。
+把每个 chunk 的 64×64 三角拆成 SB=2 个 32×32 对角块，递推的 lane 数按 `SB^2` 掉，
+剩下一个耦合块 `X21 = -X22 L21 X11`（两个 32³ 的乘）交给 Cube——
+这正是 Cube 该干的活。改动落在 `k1_solve_wu_wide.cpp`（两级的 AIV 侧）+
+新 kernel `k1_solve_assemble.cpp`（AIC 侧耦合块）+ `python/kda_ascendc_v1/api.py`（接线）。
+
+### 11.1 先把三个真 bug 摘出来
+
+上一轮的"assemble 会 fault"不是 harness 问题，是两个真错：
+
+1. **尺寸写反**：kernel 里 `constexpr int32_t M = KDA_CHUNK`、`PC = M * SB`，
+   但后面到处把 `M` 当*子块*用。`PC=128` 时 L 的 gather 步长是 4 倍，
+   读到映射窗口外 → `aivec error … "The GM address accessed by scalar exceeds
+   48 bits"`（0x4000）。它的指纹很好认：fault 的核数正好是 grid 的 1/25
+   （grid 256 → 50 个 fault，grid 2458 → 123 个），因为只有读写落到窗口外的那
+   几个 block 会炸。修正就是把 `M`/`PC` 的角色换回来（`M = PC / SB`）。
+2. **`#if SB > 1` 是死代码**：`SB` 是 `constexpr` 不是宏，预处理把它当 0，
+   整条 L21/Xb/Lneg 通路被编译掉（所以 `xb`/`lneg` 一直是哨兵值、assemble 没东西可读）。
+   6 处都改成 `#if KDA_SOLVE_WIDE_SUBB > 1`。
+3. **`Lneg` 的 store 步长错**：`DataCopyParams(NCH, M/16, (RW21-M)/16, …)` →
+   `(NCH, M / 16, 0, (MM - M) / 16)`（`l21b` 的 chunk 是连续的，行间没有间隙）。
+
+三个都修完后，NC=4/8/12 在真 shape 上干净且数值精确（见 11.3）。
+
+### 11.2 配置扫描（MIN of 4，一个进程一个配置）
+
+| 配置 | wide | asm | cube | solve |
+|---|---:|---:|---:|---:|
+| `SB=1, NC=4`（R1 前） | 3.865 | - | 1.290 | 5.19 |
+| `SB=2, NC=4, KA=4` | 1.957 | 0.777 | 1.259 | 4.00 |
+| `SB=2, NC=6, KA=4` | 1.490 | 0.760 | 1.260 | 3.51 |
+| `SB=2, NC=8, KA=4` | 1.351 | 0.772 | 1.258 | 3.38 |
+| `SB=2, NC=10, KA=4` | 1.202 | 0.758 | 1.261 | 3.22 |
+| `SB=2, NC=12, KA=4` | 1.245 | 0.771 | 1.259 | 3.27 |
+| `SB=2, NC=8, KA=4`，16 片双流 | - | - | - | **2.51** |
+
+- `NC`（wide 一个 block 的 tile 列数）到 10 为止，12 回落：UB 在 NC=8 时用到
+  118 KB / 192 KB，12 时 172 KB。
+- `KA=4` 稳定优于 2（0.76 vs 0.87）——但 assemble 的 L1 队列必须是 `NC` 深，
+  2 深的队列在第三次 `AllocTensor` 上**死锁**（不是变慢），`KA=8` 会挂在
+  L0 槽位上。
+- Cube solve 一直钉在 1.258–1.261（L0C 只能容 2 个 chunk×(pass, chunk) 槽），
+  它是这条链的下一个瓶颈。
+
+### 11.3 收益与代价
+
+- **solve：5.19 → 2.51 ms**（隔离测）/ 2.62 ms（流水线里，2026-09-14 复测
+  `pre_gram 4.14 + solve 2.62 + k2 1.67 = 8.42 ms`，MIN of 4）。
+- **e2e 的 8.42 ms 现在还不能当收益算**：见 11.5，K2 整个家族是 CHUNK=16 实现，
+  C=64 下它每个 chunk 只走 16 行（**做 1/4 的活**）并且输出是错的，所以这个 e2e
+  数字既偏快又不正确。solve 段的收益不受影响（K1 是 CHUNK 参数化的，且已逐段
+  对过 fp64 参照）。
+- 数值：fp64 参照下 `X11/X22` 误差 4.882e-04（一次 bf16 舍入），耦合块 1.411e-03。
+  numpy 重放同一条 bf16 链（`Xb`、`Lneg`、`P`、`X21` 各自 bf16）两个数一位不差，
+  说明误差全部来自 bf16 存储本身，kernel 没有额外贡献；单级路径是"整块一次舍入"，
+  这是 4x 更短的递推的代价。
+- **双流重叠**：wide 是 `AIV_ONLY`、assemble+Cube 是 `AIC_ONLY`，把 chunk 区间切成
+  `lcm(wide block, asm block, cube block)` 的整数倍后交错在两条 stream 上（每片一个
+  event），两个引擎同时干活：3.22 → 2.51 ms，输出与串行**逐字节相同**（12288 个
+  chunk 的 `a16`/`W`/`U` 全比过）。切片必须按整个 unit 切，否则奇数片会把最后
+  一个 chunk 交给会去读*下一片*（还没写）的 Cube unit。
+
+### 11.4 还剩什么
+
+- Cube solve 1.26 ms 是波次受限（12288 block / 24 AIC = 512 波）：L0C 的
+  `(pass, chunk)` 槽位上限把它钉在 NC=2，要动它只能真做软件流水或把
+  assemble 折进去（下一个 R）。
+- assemble 0.76 ms 里每个 block 两次全屏障 + 8 次 `SetFlag/WaitFlag` 是主要成本，
+  per-chunk 流水（pass0(ch)+pass1(ch) 交错）是明显可做的下一步。
+- 重叠之后 AIC 侧（2.0 ms）成了关键路径，而 wide 只有 1.2 ms：下一步要么把
+  cube 压到 1 ms 以内，要么把 AIC 的活再分掉一部分。
+
+### 11.5 为什么 C=64 的 e2e 数字现在还不能算数（2026-09-14 发现）
+
+C=64/C=32 的 chunk size 只在 **K1** 里真正落地：`grep -l KDA_CHUNK kernels/v1/k2_*.cpp`
+是空的——K2 全家（`k2_persistent_loop`、`k2_d12*`、`k2_vnew`、`k2_d34`、
+`k2_outstate*`）都把 `M = 16 / K = 16 / N = 64` 写成字面量，persistent loop 里
+每个 chunk 的 GM 偏移还是 `(bh * NT + chunk) * M * D`（`k2_persistent_loop.cpp:128`）。
+KDA_CHUNK=64 时它按 16 行的步子走 64 行的 chunk：每个 chunk 只处理 16 行、偏移全错，
+于是"快且错"；`k2_mode="separated"` 同错。
+
+证据（2026-09-14，全部 `MIN of 4` / 单进程）：
+
+| 检查 | 结果 |
+|---|---|
+| e2e vs fp32 参照 `[1,8192,8,128]`，C=16 | out rel 8.6e-03 ✓ |
+| 同上，C=64 | out rel 1.0 ✗（\|ref\| 6.4e-2，我们的值整体不相关） |
+| 小 shape vs fp64 参照（T=64/640，H=2），C=16 | rel 7.4e-03 ✓ |
+| 同上，C=64 | rel 1.0 ✗（两种 K2 mode 都一样错） |
+| K1 逐段 vs fp64 参照，C=64 | `Qn/Kn/Qg/Kg/Rk/Rv/Aqk32/Aqk/L/Decay` 全部 bf16 级 ✓ |
+| `KDA_SOLVE_WIDE_SUBB=1`（R1 前）C=64，同一输入 | **vector core exception**（既有 C=64 缺陷） |
+
+本轮顺带修掉的两个 K1 真 bug（都是"输出看运气"级别，e2e 快照看不出来）：
+
+1. **两级路径的 Cube 启动没有按真实 chunk 数截断**：`rk/rv/W/U` 只按 `c` 个 chunk
+   分配，而 slice 长度 `n` 带了 padding，Cube kernel 又只按传入的 `n` 截断自己的
+   循环 → 尾块越过 `W/U` 末尾写 GM（OOB 写），小 shape 直接把邻居 buffer 打花
+   （T=64/H=2 输出 1e35）。修法：launch 前 `ncube = min(n, c - lo)`。
+2. **`A16`/`A32` 的严格上三角从来没人写**：wide kernel 本来用"一行零 + srcGap=0"
+   广播去补，但 `DataCopyParams` 的 gap=0 语义是**连续读**（`/tmp/dcprobe.py`），
+   一行源会读到 buffer 外面；于是那块保持 `torch.empty` 的内容——真 shape 的
+   100 MB 新分配恰好是 0（所以之前"验证过"），小 shape 回收内存里是 1e36/inf，
+   Cube 读到后 W/U 变 inf、输出全错。修法：UB 里放整块 `M x M` 零 tile，
+   `A16`/`A32` 都补；另外 `L[c:]` 现在显式清零（kernel 契约本来就要求"尾块解成
+   无害单位阵"）。
+
+**结论**：R1（两级 solve）本身已经"做完 + 数值验证 + 变快"，但 C=64 的 e2e
+收益要等 **K2 的 CHUNK 参数化**（把 16 行的 tile 改成 `CHUNK/16` 个 16 行子块、
+chunk 步长用 `CHUNK * D`，并处理 chunk 内的 aqk 耦合/state 更新）落地之后才能
+报。C=16 的 e2e 一直是好的，可作回归基线。

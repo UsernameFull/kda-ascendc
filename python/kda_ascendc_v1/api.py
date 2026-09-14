@@ -1,6 +1,7 @@
 """S07 separated AscendC device closure for KDA v1."""
 from __future__ import annotations
 
+import math
 import struct
 import os
 import time
@@ -19,11 +20,46 @@ if str(EXT) not in sys.path:
     sys.path.insert(0, str(EXT))
 from kda_ascendc_v1_launcher import launch_argsarray_engine, rtc_compile
 
-CHUNK = 16
+# Chunk size of the whole pipeline.  It has to match the kernels' KDA_CHUNK
+# (see _DEFINES below): the AIV/Cube block sizes, the triangular masks and the
+# identity tile all follow it.  32 is the faster setting at [1,8192,96,128]
+# (the per-chunk setup and the gate cumsum are amortised over twice the rows
+# while K2 does half the chunk hand-offs), 16 is the long-standing default.
+CHUNK = int(os.environ.get("KDA_CHUNK", "16"))
 SOLVE_NCHUNK = 8
-SOLVE_WIDE_NCHUNK = 32
+# The wide solve keeps four live [NC, CHUNK, CHUNK] tiles plus the Brcb
+# expansion, so the 192 KB of UB cap NC at 32/16/4 chunks for CHUNK =
+# 16/32/64 (the 16 and 4 settings are 184 KB: NC x [CHUNK, CHUNK] fp32 twice
+# over, its bf16 rounding copy and the Brcb expansion).  The sweep at
+# [1,8192,96,128] measured the solve stage at 2.70 (NC 8) -> 2.43 (NC 16) ms
+# for CHUNK = 32.  The solve-Cube's L0C holds one slot per (pass, chunk) unit
+# (2 * NC * CHUNK * 128 fp32), which is why NC drops to 4 at CHUNK = 32 (the
+# whole 128 KB of L0C, 2.56 ms) and to 2 at CHUNK = 64 (also 128 KB).
+SOLVE_WIDE_NCHUNK = (int(os.environ.get("KDA_SOLVE_WIDE_NCHUNK", "0"))
+                     or (32 if CHUNK <= 16 else (16 if CHUNK <= 32 else 8)))
+# Two-level solve (R1): the wide kernel runs the row recursion on M = CHUNK/SB
+# sub-blocks and the assemble kernel forms the coupling block on the Cube, so
+# the substitution's M^3/2 vector lanes per chunk drop with SB^2 (64 -> 16 -> 4
+# kLane for SB = 1/2/4).  SB = 2 needs M >= 16 for the 16-row fractal copies
+# of the assemble kernel, i.e. CHUNK >= 32; the 64-wide chunk is the one the
+# e2e spends its time in, so it is the one that gets the two-level path.
+SOLVE_WIDE_SUBB = (int(os.environ.get("KDA_SOLVE_WIDE_SUBB", "0"))
+                   or (2 if CHUNK >= 64 else 1))
+# Chunks one wide block solves (the wide kernel's tile runs over sub-blocks x
+# chunks, see its header): SB sub-blocks of every chunk share one tile.
+SOLVE_WIDE_NCH = SOLVE_WIDE_NCHUNK // SOLVE_WIDE_SUBB
+# Chunks one assemble block forms the coupling block of.  Every pass of the
+# kernel issues the L1 loads of the whole block before its arithmetic, so the
+# queue has to be that deep (a shorter queue deadlocks on AllocTensor).
+ASM_NCHUNK = int(os.environ.get("KDA_ASM_NCHUNK", "0")) or 4
+# The wide part is AIV-only and the assemble/Cube part AIC-only, so the two
+# can run at the same time: the chunk range is cut into this many slices, the
+# wide slices go on one stream and the assemble+Cube slices on another behind
+# a per-slice event.  Measured at [1,8192,96,128]/CHUNK=64: 3.22 -> 2.51 ms
+# for the whole solve, bit-identical outputs.  0 keeps a single stream.
+SOLVE_OVERLAP = int(os.environ.get("KDA_SOLVE_OVERLAP", "16"))
 KGT_NCHUNK = 8
-WU_NCHUNK = 4
+WU_NCHUNK = int(os.environ.get("KDA_WU_NCHUNK", "0")) or (4 if CHUNK <= 32 else 2)
 D = 128
 BV = 64
 NV = 2
@@ -34,21 +70,31 @@ _TRITON_AIV_COMPILED = False
 _LAST_PROFILE: dict[str, object] = {}
 # Triangular 0/1 masks for the intra-chunk Gram kernel, built once per device.
 _GRAM_MASKS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
-# Identity tile read by the K1 solve kernel, built once per device.
-_EYE_TILES: dict[torch.device, torch.Tensor] = {}
+# Identity tile read by the K1 solve kernel, built once per (device, width).
+_EYE_TILES: dict[tuple, torch.Tensor] = {}
 _LAUNCH_COUNTS: dict[str, int] = {}
 _LAUNCH_BLOCKS: dict[str, int] = {}
 
 
-def _tri_eye(device: torch.device) -> torch.Tensor:
-    """Identity tile for the K1 solve: A_inv starts from it."""
-    eye = _EYE_TILES.get(device)
+def _tri_eye(device: torch.device, n: int | None = None) -> torch.Tensor:
+    """Identity tile for the K1 solve: A_inv starts from it.
+
+    The wide kernel reads it as one dense n x n block (``DataCopyParams(n, n/8,
+    0, 0)``), so the two-level path wants the M x M sub-block identity, not the
+    CHUNK x CHUNK one: passing the chunk-sized tile there reads the first
+    M*M floats of a CHUNK-wide identity packed M-per-row, which is a different
+    matrix and puts the solve off by O(1) (measured 1.178e+00 against the
+    fp64 inverse, vs 4.882e-04 with the right tile).
+    """
+    n = CHUNK if n is None else n
+    key = (device, n)
+    eye = _EYE_TILES.get(key)
     if eye is None:
-        eye = torch.eye(CHUNK, device=device, dtype=torch.float32).contiguous()
+        eye = torch.eye(n, device=device, dtype=torch.float32).contiguous()
         # torch_npu does not order every elementwise op against the raw
         # aclrtLaunchKernel calls, so publish the tile before any kernel reads it.
         torch.npu.synchronize()
-        _EYE_TILES[device] = eye
+        _EYE_TILES[key] = eye
     return eye
 
 
@@ -70,6 +116,100 @@ def _launch(name: str, blocks: int, args: list[bytes], stream):
     launch_argsarray_engine(name, int(blocks), stream, args, 0)
 
 
+# The two-level solve runs its AIV half and its AIC half on their own streams
+# (see _launch_solve_two_level); one pair per device, created once.
+_SOLVE_STREAMS: dict = {}
+
+
+def _solve_streams(device: torch.device):
+    pair = _SOLVE_STREAMS.get(device)
+    if pair is None:
+        pair = (torch_npu.npu.Stream(device=device),
+                torch_npu.npu.Stream(device=device))
+        _SOLVE_STREAMS[device] = pair
+    return pair
+
+
+def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
+                            a32, a16, xb, lneg, pmid, rk, rv, W, U, stream) -> None:
+    """R1 two-level solve: wide kernel (AIV), then assemble + Cube (AIC).
+
+    The substitution runs on M = CHUNK/SB sub-blocks (k1_solve_wu_wide.cpp) and
+    the coupling block X21 = -X22 L21 X11 is left to the Cube
+    (k1_solve_assemble.cpp), which cuts the row recursion's M^3/2 vector lanes
+    per chunk by SB^2 and leaves the Cube the part it is actually good at.
+
+    The wide half occupies the vector cores and the assemble/Cube half the Cube
+    cores, so the chunk range is cut into ``overlap`` slices and the two halves
+    run on their own streams behind a per-slice event - at [1,8192,96,128] and
+    CHUNK = 64 that takes the stage from 3.22 to 2.51 ms with bit-identical
+    outputs.  Slices hold whole ``unit`` (wide block / assemble / Cube unit)
+    groups, which is what keeps a padded tail from leaking into the next slice;
+    ``overlap = 0`` runs everything on the caller's stream.  ``c`` is the real
+    chunk count: the wide/assemble halves own c-sized-per-chunk buffers padded
+    up to ``c_solve``, but rk/rv/W/U only carry the c real chunks, so the Cube
+    launch - whose kernel clamps its loop to the count it is handed - has to be
+    clamped to them (a padded count sends the tail block's stores past W/U).
+    """
+    unit = math.lcm(nch, asm_nchunk, wu_nchunk)
+    ngrp = c_solve // unit
+    # Slices have to stay fat enough to keep a block's fixed cost amortised:
+    # at most ngrp/8 of them, and never more than one per group.
+    slices = min(overlap, max(1, ngrp // 8)) if overlap > 0 else 0
+    ovl = slices >= 2
+    overlap = slices
+    cur = torch_npu.npu.current_stream()
+    pairs = [(0, ngrp)] if not ovl else \
+        [(i * ngrp // overlap, (i + 1) * ngrp // overlap) for i in range(overlap)]
+    if ovl:
+        sa, sb = _solve_streams(a16.device)
+        # The wide slices read what the caller's stream produced (L, the aqk
+        # Gram's bf16 tile) and the Cube slices write W/U that K2 reads there.
+        sa.wait_stream(cur)
+    for glo, ghi in pairs:
+        lo, n = glo * unit, (ghi - glo) * unit
+        wargs = _pack_ptrs([L[lo:], eye, a32[lo:], a16[lo:], xb[lo:],
+                            lneg[lo:]]) + [_i(n)]
+        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:], pmid[lo:]]) + [_i(n)]
+        cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + [_i(n)]
+        ncube = min(n, c - lo)
+        if ovl:
+            _launch("kda_solve_wu_wide", n // nch, wargs, sa.npu_stream)
+            ev = torch_npu.npu.Event()
+            ev.record(sa)
+            sb.wait_event(ev)
+            _launch("kda_solve_assemble", (n + asm_nchunk - 1) // asm_nchunk,
+                    aargs, sb.npu_stream)
+            if ncube > 0:
+                _launch("kda_solve_wu_cube_kernel",
+                        (ncube + wu_nchunk - 1) // wu_nchunk, cargs, sb.npu_stream)
+        else:
+            _launch("kda_solve_wu_wide", n // nch, wargs, stream)
+            _launch("kda_solve_assemble", (n + asm_nchunk - 1) // asm_nchunk,
+                    aargs, stream)
+            if ncube > 0:
+                _launch("kda_solve_wu_cube_kernel",
+                        (ncube + wu_nchunk - 1) // wu_nchunk, cargs, stream)
+    if ovl:
+        cur.wait_stream(sb)
+
+
+def _defines() -> str:
+    """Source-side flags for the RTC compile.
+
+    aclrtcCreateProg has no -D option, so the chunk size and the two
+    chunk-dependent block sizes ride in front of the kernel source; every
+    guarded kernel (KDA_CHUNK, KDA_SOLVE_WIDE_NCHUNK, KDA_WU_NCHUNK) picks
+    them up through its own #ifndef default.
+    """
+    maxh = max(1, min(4, int(os.environ.get("KDA_PERSIST_LOOP_MAXH", "4"))))
+    return ("#define KDA_CHUNK %d\n#define KDA_SOLVE_WIDE_NCHUNK %d\n"
+            "#define KDA_SOLVE_WIDE_SUBB %d\n#define KDA_ASM_NCHUNK %d\n"
+            "#define KDA_WU_NCHUNK %d\n#define KDA_MAXH %d\n"
+            % (CHUNK, SOLVE_WIDE_NCHUNK, SOLVE_WIDE_SUBB, ASM_NCHUNK,
+               WU_NCHUNK, maxh))
+
+
 def _compile_all() -> None:
     global _COMPILED
     if _COMPILED:
@@ -81,6 +221,7 @@ def _compile_all() -> None:
         ("kernels/v1/k1_pre_gram_mix.cpp", "kda_pre_gram_mix"),
         ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
         ("kernels/v1/k1_solve_wu_wide.cpp", "kda_solve_wu_wide"),
+        ("kernels/v1/k1_solve_assemble.cpp", "kda_solve_assemble"),
         ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
         ("kernels/v1/k2_init.cpp", "kda_k2_init_kernel"),
         ("kernels/v1/k2_d12.cpp", "kda_k2_d12_kernel"),
@@ -98,8 +239,9 @@ def _compile_all() -> None:
         ("kernels/v1/k2_outstate_full.cpp", "kda_k2_outstate_full_kernel"),
         ("kernels/v1/k2_outstate.cpp", "kda_k2_outstate_kernel"),
     ]
+    head = _defines()
     for rel, name in sources:
-        rtc_compile((ROOT / rel).read_text(), name, "")
+        rtc_compile(head + (ROOT / rel).read_text(), name, "")
     _COMPILED = True
 
 
@@ -151,7 +293,7 @@ def _check_inputs(q, k, v, g, beta, A_log, bias, initial_state):
         raise ValueError("q/k/v must have identical [B,T,H,128] shape")
     b, t, h, d = q.shape
     if d != D or t < CHUNK or t % CHUNK:
-        raise ValueError("support is T>=16, T%16==0, D=128")
+        raise ValueError("support is T>=%d, T%%%d==0, D=128" % (CHUNK, CHUNK))
     if g.shape != q.shape or g.dtype != torch.float32:
         raise ValueError("g must be FP32 [B,T,H,128]")
     if beta.shape != (b, t, h) or beta.dtype != torch.float32:
@@ -245,8 +387,15 @@ def kda_bt16_fwd_ascendc(
     # read, and never handed out below) may be whatever uninitialised device
     # memory holds.  The debug dict hands out narrowed views so the shapes stay
     # ``[c, 16, 16]``.
-    c_solve = (c + SOLVE_WIDE_NCHUNK - 1) // SOLVE_WIDE_NCHUNK * SOLVE_WIDE_NCHUNK
+    c_solve = (c + SOLVE_WIDE_NCH - 1) // SOLVE_WIDE_NCH * SOLVE_WIDE_NCH
     L = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
+    if c_solve != c:
+        # The wide kernel is launched in whole SOLVE_WIDE_NCH-chunk blocks, so
+        # the chunk count is rounded up and the tail chunks are solved as well -
+        # on the strength of L's tail being zero, which is what makes them come
+        # out as a harmless identity (k1_solve_wu_wide.cpp).  The Gram only
+        # writes the c real chunks, so the tail has to be zeroed here.
+        L[c:].zero_()
     mask_s, mask_l = _tri_masks(q.device)
     # Stages 1+2 run as one AIV block per chunk ("k1_pre_gram.cpp"): the fused
     # kernel consumes Qn/Kn/Gc out of UB instead of round-tripping 32 KB per
@@ -294,16 +443,34 @@ def kda_bt16_fwd_ascendc(
     a16 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.bfloat16, device=q.device)
     W = torch.empty_like(qn)
     U = torch.empty_like(qn)
-    solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16]) + [_i(c)]
     mark("solve_start")
-    # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector
-    # instruction (see the kernel header); the padded chunks are solved too but
-    # land outside the first c.
-    _launch("kda_solve_wu_wide", c_solve // SOLVE_WIDE_NCHUNK, solve_args, stream)
-    # The Cube needs the bf16 A_inv the substitution just wrote, so the two
-    # launches stay ordered on the stream.
-    _launch("kda_solve_wu_cube_kernel", (c + WU_NCHUNK - 1) // WU_NCHUNK,
-            _pack_ptrs([a16, rk, rv, W, U]) + [_i(c)], stream)
+    if SOLVE_WIDE_SUBB > 1:
+        # Two-level solve: the wide kernel writes the diagonal sub-blocks (Xb
+        # next to the parent tile) and the negated coupling triangle, the
+        # assemble kernel forms X21 on the Cube, and the Cube solve consumes
+        # the assembled tile.  See _launch_solve_two_level.
+        sub = CHUNK // SOLVE_WIDE_SUBB
+        bf16 = torch.bfloat16
+        xb = torch.empty((c_solve, SOLVE_WIDE_SUBB, sub, sub), dtype=bf16, device=q.device)
+        lneg = torch.empty((c_solve, sub, sub), dtype=bf16, device=q.device)
+        pmid = torch.empty((c_solve, sub, sub), dtype=bf16, device=q.device)
+        _launch_solve_two_level(c_solve, c, SOLVE_WIDE_NCH, ASM_NCHUNK, WU_NCHUNK,
+                                SOLVE_OVERLAP, L,
+                                _tri_eye(q.device, CHUNK // SOLVE_WIDE_SUBB),
+                                a32, a16,
+                                xb, lneg, pmid, rk, rv, W, U, stream)
+    else:
+        # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector
+        # instruction (see the kernel header); the padded chunks are solved too
+        # but land outside the first c.  The two-level operands are null here:
+        # the kernel takes them in every build, and a short argument list would
+        # leave it reading C out of the args array's tail.
+        solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16, None, None]) + [_i(c)]
+        _launch("kda_solve_wu_wide", c_solve // SOLVE_WIDE_NCHUNK, solve_args, stream)
+        # The Cube needs the bf16 A_inv the substitution just wrote, so the two
+        # launches stay ordered on the stream.
+        _launch("kda_solve_wu_cube_kernel", (c + WU_NCHUNK - 1) // WU_NCHUNK,
+                _pack_ptrs([a16, rk, rv, W, U]) + [_i(c)], stream)
     finish("solve_ms", "solve_start")
 
     # Historical name: ``persistent_scan_cube`` has always been served by the
@@ -381,7 +548,11 @@ def kda_bt16_fwd_ascendc(
         nblk = max(nblk, (bh + maxh - 1) // maxh)
         s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
         s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
-        d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.float32, device=q.device)
+        # d1/d2/d3 cross to the vector side as bf16 (the loop's fixpipe rounds
+        # them), so they are allocated bf16 here as well: the loop indexes the
+        # buffers in bf16 elements and an fp32 allocation silently half-filled
+        # them and returned garbage through ``return_intermediates``.
+        d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
         d2 = torch.empty_like(d1)
         d3 = torch.empty_like(d1)
         d4f = torch.empty((bh, D, D), dtype=torch.float32, device=q.device)

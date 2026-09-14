@@ -14,7 +14,12 @@
 // loads of every chunk are issued up front and the mmads follow.
 #include "kernel_operator.h"
 using namespace AscendC;
-constexpr int32_t M = 16, K = 16, D = 128;
+#ifndef KDA_CHUNK
+#define KDA_CHUNK 16
+#endif
+constexpr int32_t M = KDA_CHUNK, K = KDA_CHUNK, D = 128;
+constexpr int32_t KF = K / 16;   // 16-row bands of a chunk-sized tile
+constexpr int32_t DF = D / 16;
 #ifndef KDA_WU_NCHUNK
 #define KDA_WU_NCHUNK 4
 #endif
@@ -55,6 +60,30 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
         for (int32_t ch = 0; ch < nch; ++ch) {
             auto la = qa.AllocTensor<bfloat16_t>();
             auto lb = qb.AllocTensor<bfloat16_t>();
+#if KDA_CHUNK > 16
+            // One whole-tile call, whose dstNzC0Stride = nValue layout is
+            // column-block-major (probe /tmp/nzprobe.py), so the L0A read
+            // below crosses its indices.  That crossing is free; the per-band
+            // form would be KF calls and a "Nd2Nz-shaped" copy costs ~600 ns
+            // more per call than the plain one on this part (measured at
+            // KDA_CHUNK = 16: 8 such calls per block are worth 2.6 ms of the
+            // 4.4 ms solve), and this kernel is wave-bound.
+            DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K],
+                     Nd2NzParams(1, M, K, 0, K, M, 1, 0));
+            GlobalTensor<bfloat16_t> &rhs = (pass == 0) ? Rk : Rv;
+            for (int32_t mm = 0; mm < KF; ++mm) {
+                DataCopy(lb[mm * DF * 256],
+                         rhs[static_cast<uint64_t>(c0 + ch) * M * D + mm * 16 * D],
+                         Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+            }
+#else
+            // KF == 1 (the 16-row chunk): the band loop above would run once
+            // and convert exactly one fractal, but the Nd2Nz-parameterised
+            // copy costs ~600 ns more per call than the plain one on this part
+            // and this kernel is wave-bound, not bandwidth-bound: measured at
+            // [1,8192,96,128], the per-band form costs 4.39 ms of the solve
+            // against 1.75 for the plain form (both correct).  So the 16-row
+            // build keeps the original single calls.
             DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K], M * K);
             if (pass == 0) {
                 DataCopy(lb, Rk[static_cast<uint64_t>(c0 + ch) * M * D],
@@ -63,6 +92,7 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
                 DataCopy(lb, Rv[static_cast<uint64_t>(c0 + ch) * M * D],
                          Nd2NzParams(1, M, D, 0, D, M, 1, 0));
             }
+#endif
             qa.EnQue(la);
             qb.EnQue(lb);
         }
@@ -77,15 +107,25 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
             const int32_t slot = pass * NC + ch;
             LocalTensor<bfloat16_t> a = a8[slot * M * K * 2].ReinterpretCast<bfloat16_t>();
             LocalTensor<bfloat16_t> b = b8[slot * D * K * 2].ReinterpretCast<bfloat16_t>();
-            LoadData(a, la, LoadData2dParams(0, 1, 1, 0, 0, false, 0));
-            LoadDataWithTranspose(b, lb, LoadData2dTransposeParams(0, 8, 1, 0, 0));
+            // A16 arrives column-block-major (see the load above) while L0A
+            // wants its fractal grid (band, k-block) - the same crossing the
+            // K2 loop's W/Qg loads undo.  L0B keeps the band-major L1 order
+            // with the 16x16 fractal transposed by the load.
+            for (int32_t dd = 0; dd < K / 16; ++dd) {
+                for (int32_t mm = 0; mm < KF; ++mm) {
+                    LoadData(a[(mm * (K / 16) + dd) * 256],
+                             la[(dd * KF + mm) * 256],
+                             LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+                }
+            }
+            LoadDataWithTranspose(b, lb, LoadData2dTransposeParams(0, KF * DF, 1, 0, 0));
             SetFlag<HardEvent::MTE1_M>(e1m);
             WaitFlag<HardEvent::MTE1_M>(e1m);
             LocalTensor<float> cf = cfall[slot * M * D];
             Mmad(cf, a, b, MmadParams(M, D, K, 0, false, true));
             SetFlag<HardEvent::M_FIX>(emf);
             WaitFlag<HardEvent::M_FIX>(emf);
-            auto ip = FixpipeParamsV220(D, M, 16, D, false);
+            auto ip = FixpipeParamsV220(D, M, M, D, false);
             ip.quantPre = QuantMode_t::F322BF16;
             ip.unitFlag = 0;
             if (pass == 0) {

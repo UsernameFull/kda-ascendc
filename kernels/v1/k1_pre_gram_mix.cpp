@@ -148,9 +148,24 @@
 #include "kernel_operator.h"
 using namespace AscendC;
 
-constexpr int32_t M = 16;
+#ifndef KDA_CHUNK
+#define KDA_CHUNK 16
+#endif
+constexpr int32_t M = KDA_CHUNK;   // rows in one chunk
 constexpr int32_t D = 128;
 constexpr int32_t N = M * D;
+// The vector side walks the chunk in NP passes of MT rows so that every
+// staging buffer keeps the size it has at KDA_CHUNK = 16: at C = 32 the
+// whole-chunk tiles do not fit in the 192 KB UB (the eleven fp32 [M, D]
+// tiles alone are 176 KB).  Only the gate is chunk-global - its cumsum runs
+// along the rows - so it stays one [M, D] tile computed before the passes.
+// The Cube side is unchanged: the AIV still publishes whole [M, D] operands
+// through the ring, so it is the ring rather than the Gram that grows.
+constexpr int32_t MT = M > 16 ? 16 : M;
+constexpr int32_t NP = M / MT;      // passes over one chunk
+constexpr int32_t NG = MT * D;      // elements in one pass tile
+constexpr int32_t KF = M / 16;      // 16-row fractal bands of a chunk tile
+constexpr int32_t DF = D / 16;
 constexpr float RCP_LN2 = 1.4426950216f;
 constexpr float LN2 = 0.6931471805599453f;
 constexpr float EPS = 1e-6f;
@@ -173,15 +188,15 @@ constexpr float EPS = 1e-6f;
 constexpr uint16_t FL_READY = 8;    // both AIVs -> AIC: step u's operands are in GM
 constexpr uint16_t FL_DONE = 9;     // AIC -> both AIVs: step u's raw Gram is in GM
 
-// Row-wise sum of a [M, D] fp32 tile: rs[i] holds sum_d tile[i, d].
+// Row-wise sum of an [MT, D] fp32 pass tile: rs[i] holds sum_d tile[i, d].
 // The first Add halves every row in place (strided repeats keep each row's
 // data inside its own 128-element slot); WholeReduceSum then collapses the
 // remaining 64 elements per row.
 static __aicore__ inline void RowReduce(LocalTensor<float> rs, LocalTensor<float> tmp,
                                         const LocalTensor<float> tile) {
-    Add(tmp, tile, tile[64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 16));
+    Add(tmp, tile, tile[64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 16));
     PipeBarrier<PIPE_V>();
-    WholeReduceSum(rs, tmp, 64, M, 1, 1, 16);
+    WholeReduceSum(rs, tmp, 64, MT, 1, 1, 16);
 }
 
 
@@ -194,27 +209,62 @@ static __aicore__ inline void post_gram(const LocalTensor<float> ga32,
                                         const LocalTensor<bfloat16_t> ga16,
                                         const LocalTensor<float> gmaskS,
                                         const LocalTensor<float> gmaskL,
+                                        const LocalTensor<uint8_t> gmaskBits,
                                         const GlobalTensor<float> Aqk32,
                                         const GlobalTensor<float> L,
                                         const GlobalTensor<bfloat16_t> Aqk16,
+                                        const GlobalTensor<float> MaskS,
+                                        const GlobalTensor<float> MaskL,
                                         int32_t c, float scale, TEventID e2v, TEventID ev3) {
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     CrossCoreWaitFlag(FL_DONE);
-    DataCopy(ga32, Aqk32[m0], DataCopyParams(M, 2, 0, 0));
-    DataCopy(gl32, L[m0], DataCopyParams(M, 2, 0, 0));
+    // One 16-row band at a time.  At KDA_CHUNK = 16 (a single band) this is
+    // exactly the whole-chunk form this function has always used; at
+    // KDA_CHUNK = 64 the whole-chunk staging (two fp32 masks, two fp32 Gram
+    // tiles and the bf16 rounding tile = 72 KB) is a third of the 192 KB of
+    // UB and the kernel faulted with a VEC out-of-bounds.  Every element goes
+    // through the same compare/select/scale/round sequence either way, so the
+    // outputs are bit-identical.
+    for (int32_t mm = 0; mm < KF; ++mm) {
+    const uint64_t o = m0 + static_cast<uint64_t>(mm) * 16 * M;
+    const uint64_t mo = static_cast<uint64_t>(mm) * 16 * M;
+    constexpr int32_t NB = 16 * M;   // elements in one band
+    DataCopy(ga32, Aqk32[o], DataCopyParams(16, M / 8, 0, 0));
+    DataCopy(gl32, L[o], DataCopyParams(16, M / 8, 0, 0));
+    DataCopy(gmaskS, MaskS[mo], DataCopyParams(16, M / 8, 0, 0));
+    DataCopy(gmaskL, MaskL[mo], DataCopyParams(16, M / 8, 0, 0));
     SetFlag<HardEvent::MTE2_V>(e2v);
     WaitFlag<HardEvent::MTE2_V>(e2v);
-    Mul(ga32, ga32, gmaskS, M * M);
-    Muls(ga32, ga32, scale, M * M);
-    Mul(gl32, gl32, gmaskL, M * M);
+    // The two masks are applied with a select instead of a multiply.  The raw
+    // Gram is the Cube's fp32 accumulation of bf16 gated operands, and inside
+    // the region the mask drops the two exponents are the far ends of the
+    // 2 * CHUNK-row gate cumsum: at KDA_CHUNK = 32 that product overflows fp32
+    // (exp2 of +-230), so `x * 0` turns an Inf/NaN into a NaN and the rounding
+    // below then writes NaN into Aqk16 - which is where a C = 32 run picked up
+    // NaNs in the output (measured with the fp32 torch reference: 50 NaNs in
+    // the Aqk32 upper triangle at [1, 64, 2, 128], none at chunk 16, where the
+    // doubled range still fits: exp2(116) = 8e34 < 3.4e38).  A select keeps the
+    // kept region bit-identical and makes the dropped region exactly 0.
+    Compares(gmaskBits, gmaskS, 0.5f, CMPMODE::GT, NB);
     PipeBarrier<PIPE_V>();
-    Cast(ga16, ga32, RoundMode::CAST_RINT, M * M);
+    Select(ga32, gmaskBits, ga32, 0.0f, SELMODE::VSEL_TENSOR_SCALAR_MODE, NB);
+    Muls(ga32, ga32, scale, NB);
+    PipeBarrier<PIPE_V>();
+    Compares(gmaskBits, gmaskL, 0.5f, CMPMODE::GT, NB);
+    PipeBarrier<PIPE_V>();
+    Select(gl32, gmaskBits, gl32, 0.0f, SELMODE::VSEL_TENSOR_SCALAR_MODE, NB);
+    PipeBarrier<PIPE_V>();
+    Cast(ga16, ga32, RoundMode::CAST_RINT, NB);
     PipeBarrier<PIPE_V>();
     SetFlag<HardEvent::V_MTE3>(ev3);
     WaitFlag<HardEvent::V_MTE3>(ev3);
-    DataCopy(Aqk32[m0], ga32, DataCopyParams(M, 2, 0, 0));
-    DataCopy(L[m0], gl32, DataCopyParams(M, 2, 0, 0));
-    DataCopy(Aqk16[m0], ga16, DataCopyParams(M, 1, 0, 0));
+    DataCopy(Aqk32[o], ga32, DataCopyParams(16, M / 8, 0, 0));
+    DataCopy(L[o], gl32, DataCopyParams(16, M / 8, 0, 0));
+    DataCopy(Aqk16[o], ga16, DataCopyParams(16, M / 16, 0, 0));
+    // The stores above read the same UB the next band's loads land in, so the
+    // MTE3 has to drain before the band repeats.
+    PipeBarrier<PIPE_ALL>();
+    }
 }
 
 // The paired Cube: for every step u it computes the two Grams of the two
@@ -270,12 +320,30 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
         auto tk1 = qa.AllocTensor<bfloat16_t>();
         auto tb0 = qb.AllocTensor<bfloat16_t>();
         auto tb1 = qb.AllocTensor<bfloat16_t>();
-        DataCopy(ta0, Ga[o0], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
-        DataCopy(tk0, Gk[o0], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
-        DataCopy(tb0, Gb[o0], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
-        DataCopy(ta1, Ga[o1], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
-        DataCopy(tk1, Gk[o1], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
-        DataCopy(tb1, Gb[o1], Nd2NzParams(1, M, D, 0, D, M, 1, 0));
+        for (int32_t mm = 0; mm < KF; ++mm) {
+            DataCopy(ta0[mm * DF * 256], Ga[o0 + mm * 16 * D],
+                     Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+        }
+        for (int32_t mm = 0; mm < KF; ++mm) {
+            DataCopy(tk0[mm * DF * 256], Gk[o0 + mm * 16 * D],
+                     Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+        }
+        for (int32_t mm = 0; mm < KF; ++mm) {
+            DataCopy(tb0[mm * DF * 256], Gb[o0 + mm * 16 * D],
+                     Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+        }
+        for (int32_t mm = 0; mm < KF; ++mm) {
+            DataCopy(ta1[mm * DF * 256], Ga[o1 + mm * 16 * D],
+                     Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+        }
+        for (int32_t mm = 0; mm < KF; ++mm) {
+            DataCopy(tk1[mm * DF * 256], Gk[o1 + mm * 16 * D],
+                     Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+        }
+        for (int32_t mm = 0; mm < KF; ++mm) {
+            DataCopy(tb1[mm * DF * 256], Gb[o1 + mm * 16 * D],
+                     Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+        }
         qa.EnQue(ta0);
         qa.EnQue(tk0);
         qa.EnQue(ta1);
@@ -296,15 +364,52 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
         LocalTensor<bfloat16_t> lk1 = a8[3 * M * D * 2].ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> lb0 = b8[0].ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> lb1 = b8[M * D * 2].ReinterpretCast<bfloat16_t>();
-        LoadData(la0, ta0, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
-        LoadData(lk0, tk0, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
-        LoadData(la1, ta1, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
-        LoadData(lk1, tk1, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
-        LoadData(lb0, tb0, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
-        LoadData(lb1, tb1, LoadData2dParams(0, 8, 1, 0, 0, false, 0));
+        for (int32_t dd = 0; dd < DF; ++dd) {
+            for (int32_t mm = 0; mm < KF; ++mm) {
+                LoadData(la0[(mm * DF + dd) * 256], ta0[(mm * DF + dd) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
+        }
+        for (int32_t dd = 0; dd < DF; ++dd) {
+            for (int32_t mm = 0; mm < KF; ++mm) {
+                LoadData(lk0[(mm * DF + dd) * 256], tk0[(mm * DF + dd) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
+        }
+        for (int32_t dd = 0; dd < DF; ++dd) {
+            for (int32_t mm = 0; mm < KF; ++mm) {
+                LoadData(la1[(mm * DF + dd) * 256], ta1[(mm * DF + dd) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
+        }
+        for (int32_t dd = 0; dd < DF; ++dd) {
+            for (int32_t mm = 0; mm < KF; ++mm) {
+                LoadData(lk1[(mm * DF + dd) * 256], tk1[(mm * DF + dd) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
+        }
+        for (int32_t dd = 0; dd < DF; ++dd) {
+            for (int32_t mm = 0; mm < KF; ++mm) {
+                LoadData(lb0[(dd * KF + mm) * 256], tb0[(mm * DF + dd) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
+        }
+        for (int32_t dd = 0; dd < DF; ++dd) {
+            for (int32_t mm = 0; mm < KF; ++mm) {
+                LoadData(lb1[(dd * KF + mm) * 256], tb1[(mm * DF + dd) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
+        }
         SetFlag<HardEvent::MTE1_M>(e1m);
         WaitFlag<HardEvent::MTE1_M>(e1m);
-        auto ip = FixpipeParamsV220(M, M, 1, M, false);
+        // srcStride counts C0 (16-element) units between the n-blocks of one
+        // L0C row: at KF = 2 the two n-blocks of a row sit KF * 256 elements
+        // apart, i.e. KF * 16 = M units (probe /tmp/cubeprobe.py STYLE=fract
+        // FXMODE=one FXSTRIDE=32 is exact; M / 16 = 2 is not).  With a
+        // single n-block the field is not read, so the KDA_CHUNK = 16 build
+        // keeps the value it has always shipped.
+        constexpr int32_t FX_SRC_STRIDE = M > 16 ? M : 1;
+        auto ip = FixpipeParamsV220(M, M, FX_SRC_STRIDE, M, false);
         ip.quantPre = QuantMode_t::NoQuant;
         ip.unitFlag = 0;
         for (int32_t s = 0; s < 2; ++s) {
@@ -366,36 +471,40 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     TEventID ev3 = pipe.AllocEventID<HardEvent::V_MTE3>();
     TEventID evs = pipe.AllocEventID<HardEvent::V_S>();
     TEventID e3d = pipe.AllocEventID<HardEvent::MTE3_V>();
-    TEventID e2vg2 = pipe.AllocEventID<HardEvent::MTE2_V>();
     TBuf<TPosition::VECCALC> bQf, bKf, bT0, bT2, bEf, bRed,
         bQnb, bKnb, bRkb, bRvb, bQgb, bKgb, bBias, bBeta, bBb, bAlog, bZz,
-        bGef, bGefn, bGa, bGk1, bGb, bRedA, bRedK, bGmaskS, bGmaskL, bGtb, bGa32, bGl32, bGa16;
-    pipe.InitBuffer(bQf, N * 4); pipe.InitBuffer(bKf, N * 4);
-    pipe.InitBuffer(bT0, N * 4); pipe.InitBuffer(bT2, N * 4);
-    pipe.InitBuffer(bEf, N * 4); pipe.InitBuffer(bRed, 384 * 4);
-    pipe.InitBuffer(bQnb, N * 2); pipe.InitBuffer(bKnb, N * 2); pipe.InitBuffer(bRkb, N * 2);
-    pipe.InitBuffer(bRvb, N * 2); pipe.InitBuffer(bQgb, N * 2); pipe.InitBuffer(bKgb, N * 2);
+        bGef, bGefn, bGt, bGmaskS, bGmaskL, bGa32, bGl32, bGa16;
+    pipe.InitBuffer(bQf, NG * 4); pipe.InitBuffer(bKf, NG * 4);
+    pipe.InitBuffer(bT0, N * 4); pipe.InitBuffer(bT2, NG * 4);
+    pipe.InitBuffer(bEf, NG * 4); pipe.InitBuffer(bRed, 384 * 4);
+    pipe.InitBuffer(bQnb, NG * 2); pipe.InitBuffer(bKnb, NG * 2); pipe.InitBuffer(bRkb, NG * 2);
+    pipe.InitBuffer(bRvb, NG * 2); pipe.InitBuffer(bQgb, NG * 2); pipe.InitBuffer(bKgb, NG * 2);
     pipe.InitBuffer(bBias, D * 4); pipe.InitBuffer(bBeta, M * 4);
-    pipe.InitBuffer(bBb, M * 64 * 4); pipe.InitBuffer(bAlog, 8 * 4);
-    pipe.InitBuffer(bZz, N * 4);
-    pipe.InitBuffer(bGef, N * 4);
-    pipe.InitBuffer(bGefn, N * 4);
-    pipe.InitBuffer(bGa, N * 4);
-    pipe.InitBuffer(bGk1, N * 4);
-    pipe.InitBuffer(bGb, N * 4);
-    pipe.InitBuffer(bRedA, M * M * 4);
-    pipe.InitBuffer(bRedK, M * M * 4);
-    pipe.InitBuffer(bGmaskS, M * M * 4);
-    pipe.InitBuffer(bGmaskL, M * M * 4);
-    pipe.InitBuffer(bGtb, D * 4);
-    pipe.InitBuffer(bGa32, M * M * 4);
-    pipe.InitBuffer(bGl32, M * M * 4);
-    pipe.InitBuffer(bGa16, M * M * 2);
-    // Two-deep UB ring for the published Gram operands (see the header note).
-    TBuf<TPosition::VECCALC> bPga0, bPga1, bPgk0, bPgk1, bPgb0, bPgb1;
-    pipe.InitBuffer(bPga0, N * 2); pipe.InitBuffer(bPga1, N * 2);
-    pipe.InitBuffer(bPgk0, N * 2); pipe.InitBuffer(bPgk1, N * 2);
-    pipe.InitBuffer(bPgb0, N * 2); pipe.InitBuffer(bPgb1, N * 2);
+    // The beta broadcast only needs one 32 B block per row: Brcb leaves row k
+    // at bb[8 * k] and the consumers walk it with srcRepStride = 1.
+    pipe.InitBuffer(bBb, M * 8 * 4); pipe.InitBuffer(bAlog, 8 * 4);
+    pipe.InitBuffer(bZz, NG * 4);
+    pipe.InitBuffer(bGef, NG * 4);
+    pipe.InitBuffer(bGefn, NG * 4);
+    pipe.InitBuffer(bGt, NG * 4);
+    // The mask/Gram/rounding staging of "post_gram" is one 16-row band (see
+    // there): whole-chunk tiles are 72 KB of UB at KDA_CHUNK = 64.
+    pipe.InitBuffer(bGmaskS, 16 * M * 4);
+    pipe.InitBuffer(bGmaskL, 16 * M * 4);
+    pipe.InitBuffer(bGa32, 16 * M * 4);
+    pipe.InitBuffer(bGl32, 16 * M * 4);
+    pipe.InitBuffer(bGa16, 16 * M * 2);
+    // Published Gram operands: one pass band's worth of UB per operand.
+    // These used to be a two-deep whole-chunk ring (3 x [M, D] bf16 = 48 KB
+    // at KDA_CHUNK = 64) which, with the whole-chunk staging above, put this
+    // kernel past the 192 KB of UB (measured: the C = 64 build faulted with a
+    // VEC out-of-bounds).  The stores now leave for GM with each pass band,
+    // and the FL_READY handoff below already rides PIPE_MTE3, so the Cube
+    // still only sees a chunk once its last band has drained.
+    TBuf<TPosition::VECCALC> bPga0, bPgk0, bPgb0;
+    pipe.InitBuffer(bPga0, NG * 2);
+    pipe.InitBuffer(bPgk0, NG * 2);
+    pipe.InitBuffer(bPgb0, NG * 2);
     LocalTensor<float> qf = bQf.Get<float>(), kf = bKf.Get<float>();
     LocalTensor<float> gf = bT0.Get<float>(), t2 = bT2.Get<float>();
     LocalTensor<float> ef = bEf.Get<float>(), red = bRed.Get<float>();
@@ -403,10 +512,13 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     LocalTensor<float> bb = bBb.Get<float>(), alog = bAlog.Get<float>();
     LocalTensor<float> zz = bZz.Get<float>();
     LocalTensor<float> gef = bGef.Get<float>(), gefn = bGefn.Get<float>();
-    LocalTensor<float> ga = bGa.Get<float>(), gk1 = bGk1.Get<float>(), gb = bGb.Get<float>();
-    LocalTensor<float> redA = bRedA.Get<float>(), redK = bRedK.Get<float>();
+    // One scratch for the three Gram operands: each is cast into the ring
+    // as soon as it is formed, so nothing but the ring holds them.
+    LocalTensor<float> gt = bGt.Get<float>();
     LocalTensor<float> gmaskS = bGmaskS.Get<float>(), gmaskL = bGmaskL.Get<float>();
-    LocalTensor<float> gtb = bGtb.Get<float>();
+    // The select's bit mask rides in the Aqk16 staging: the cast that fills
+    // that buffer happens after both masks are applied.
+    LocalTensor<uint8_t> gmaskBits = bGa16.Get<uint8_t>();
     LocalTensor<float> ga32 = bGa32.Get<float>(), gl32 = bGl32.Get<float>();
     LocalTensor<bfloat16_t> ga16 = bGa16.Get<bfloat16_t>();
 
@@ -483,72 +595,31 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // this part (halves the bursts land unwritten, probe
     // /tmp/kdaval/probe_stride4.py); DataCopyPad's byte-stride form reads the
     // same gather correctly, so the four stage-1 inputs use it.
-    DataCopyPad(qnb, Q[xb], DataCopyExtParams(M, D * 2, xRowBytes, 0, 0), padNop);
-    SetFlag<HardEvent::MTE2_V>(e2vq);
-    DataCopyPad(knb, K[xb], DataCopyExtParams(M, D * 2, xRowBytes, 0, 0), padNop);
-    SetFlag<HardEvent::MTE2_V>(e2vk);
+    // ---- full-chunk gate -------------------------------------------------
+    // The cumsum runs along the rows, so the whole chunk has to be in one
+    // tile; everything else below is row-local and is walked in NP passes of
+    // MT rows, which is what keeps the staging at its KDA_CHUNK = 16 size.
     DataCopyPad(gf, G[xb], DataCopyExtParams(M, D * 4, gRowBytes, 0, 0), padNopF);
     SetFlag<HardEvent::MTE2_V>(e2vg);
-    DataCopyPad(rvb, V[xb], DataCopyExtParams(M, D * 2, xRowBytes, 0, 0), padNop);
-    SetFlag<HardEvent::MTE2_V>(e2vv);
     DataCopy(alog, Alog[head], 8);
-    DataCopy(beta, Beta[cm], DataCopyParams(1, 2, 0, 0));
-    DataCopy(gmaskL, MaskL[0], DataCopyParams(M, 2, 0, 0));
-    // The A-side triangle comes back: the Cube writes the full Gram.
-    DataCopy(gmaskS, MaskS[0], DataCopyParams(M, 2, 0, 0));
-    SetFlag<HardEvent::MTE2_V>(e2vg2);
+    DataCopy(beta, Beta[cm], DataCopyParams(1, M / 8, 0, 0));
+    // The two triangular masks are read band by band inside post_gram.
     SetFlag<HardEvent::MTE2_V>(e2vs);
-    WaitFlag<HardEvent::MTE2_V>(e2vq);
-    Cast(qf, qnb, RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
+    WaitFlag<HardEvent::MTE2_V>(e2vg);
 
-    // ---- q l2 norm -------------------------------------------------------
-    Mul(t2, qf, qf, N);
-    PipeBarrier<PIPE_V>();
-    RowReduce(red, ef, t2);
-    Adds(red, red, EPS, M);
-    Rsqrt(red, red, M);
-    PipeBarrier<PIPE_V>();
-    Brcb(red[64], red, 2, BrcbRepeatParams(1, 8));
-    PipeBarrier<PIPE_V>();
-    Mul(qf, qf, red[64], 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
-    Mul(qf[64], qf[64], red[64], 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
-    PipeBarrier<PIPE_V>();
-    Cast(qnb, qf, RoundMode::CAST_RINT, N);
-    PipeBarrier<PIPE_V>();
-    Cast(qf, qnb, RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
-
-    // ---- k l2 norm -------------------------------------------------------
-    WaitFlag<HardEvent::MTE2_V>(e2vk);
-    Cast(kf, knb, RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
-    Mul(t2, kf, kf, N);
-    PipeBarrier<PIPE_V>();
-    RowReduce(red, ef, t2);
-    Adds(red, red, EPS, M);
-    Rsqrt(red, red, M);
-    PipeBarrier<PIPE_V>();
-    Brcb(red[64], red, 2, BrcbRepeatParams(1, 8));
-    PipeBarrier<PIPE_V>();
-    Mul(kf, kf, red[64], 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
-    Mul(kf[64], kf[64], red[64], 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
-    PipeBarrier<PIPE_V>();
-    Cast(knb, kf, RoundMode::CAST_RINT, N);
-    PipeBarrier<PIPE_V>();
-    Cast(kf, knb, RoundMode::CAST_NONE, N);
-    PipeBarrier<PIPE_V>();
-
-    WaitFlag<HardEvent::MTE2_V>(e2vg2);
     // ---- beta sigmoid ----------------------------------------------------
     WaitFlag<HardEvent::MTE2_V>(e2vs);
-    WaitFlag<HardEvent::MTE2_V>(e2vg);
     Muls(beta, beta, -1.0f, M);
     Exp(beta, beta, M);
     Adds(beta, beta, 1.0f, M);
     Duplicate(red, 1.0f, M);
     PipeBarrier<PIPE_V>();
     Div(beta, red, beta, M);
+    PipeBarrier<PIPE_V>();
+    // ---- beta broadcast over the D axis ----------------------------------
+    // Brcb leaves row k's beta at bb[8 * k] (one 32 B block apart), which is
+    // the stride the beta products below read with srcRepStride = 1.
+    Brcb(bb, beta, M / 8, BrcbRepeatParams(1, 8));
     PipeBarrier<PIPE_V>();
 
     // ---- gate (cumsum carried in the log2 domain) ------------------------
@@ -564,14 +635,21 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     SetFlag<HardEvent::V_S>(evs);
     WaitFlag<HardEvent::V_S>(evs);
     const float aexp = -alog.GetValue(0);
-    Muls(gf, gf, aexp, N);
-    Exp(gf, gf, N);
-    Adds(gf, gf, 1.0f, N);
-    Duplicate(t2, 1.0f, N);
+    // The elementwise part of the sigmoid runs in the same NP passes as the
+    // rest of the chunk: it needs a full-tile "1.0" operand, and the staging
+    // only holds an MT-row tile (see the header note).  The cumsum below is
+    // the only row-coupled op, so it keeps the whole chunk.
+    for (int32_t hp = 0; hp < NP; ++hp) {
+    LocalTensor<float> gfs = gf[hp * NG];
+    Muls(gfs, gfs, aexp, NG);
+    Exp(gfs, gfs, NG);
+    Adds(gfs, gfs, 1.0f, NG);
+    Duplicate(t2, 1.0f, NG);
     PipeBarrier<PIPE_V>();
-    Div(gf, t2, gf, N);
-    Muls(gf, gf, lower_bound, N);
+    Div(gfs, t2, gfs, NG);
+    Muls(gfs, gfs, lower_bound, NG);
     PipeBarrier<PIPE_V>();
+    }
     for (int32_t i = 1; i < M; ++i) {
         Add(gf[i * D], gf[i * D], gf[(i - 1) * D], D);
         PipeBarrier<PIPE_V>();
@@ -585,106 +663,177 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     }
 
     // ---- decay = exp2(gate_last) ----------------------------------------
-    Muls(t2, gf[15 * D], LN2, D);
+    Muls(t2, gf[(M - 1) * D], LN2, D);
     Exp(t2, t2, D);
     SetFlag<HardEvent::V_MTE3>(ev3);
     WaitFlag<HardEvent::V_MTE3>(ev3);
     DataCopy(Decay[static_cast<uint64_t>(c) * D], t2, DataCopyParams(1, 16, 0, 0));
-    // "t2" is reused by the qg product below, so this one store needs an
-    // MTE3->V flag instead of a full PIPE_ALL.
+    // "t2" is reused by the first pass below, so this one store needs an
+    // MTE3->V flag instead of a full PIPE_ALL.  The wait sits above the pass
+    // loop rather than at the first consumer: one SetFlag pairs with exactly
+    // one WaitFlag (a second wait on the same event never fires and hangs the
+    // block), and the passes after the first already have the store behind
+    // them.
     SetFlag<HardEvent::MTE3_V>(e3d);
+    DataCopy(BetaOut[cm], beta, DataCopyParams(1, M / 8, 0, 0));
+    LocalTensor<bfloat16_t> pga = bPga0.Get<bfloat16_t>();
+    LocalTensor<bfloat16_t> pgk = bPgk0.Get<bfloat16_t>();
+    LocalTensor<bfloat16_t> pgb = bPgb0.Get<bfloat16_t>();
+
+    WaitFlag<HardEvent::MTE3_V>(e3d);
+    // ---- the row-local rest of the chunk, NP passes of MT rows -----------
+    for (int32_t hp = 0; hp < NP; ++hp) {
+    const int32_t gh = hp * NG;                              // pass offset in UB
+    const uint64_t xh = x0 + gh;                             // ... and in GM
+    const uint64_t xbh = xb + static_cast<uint64_t>(hp) * MT * H * D;
+    LocalTensor<float> gfp = gf[gh];
+    LocalTensor<float> bbp = bb[hp * MT * 8];
+    DataCopyPad(qnb, Q[xbh], DataCopyExtParams(MT, D * 2, xRowBytes, 0, 0), padNop);
+    SetFlag<HardEvent::MTE2_V>(e2vq);
+    DataCopyPad(knb, K[xbh], DataCopyExtParams(MT, D * 2, xRowBytes, 0, 0), padNop);
+    SetFlag<HardEvent::MTE2_V>(e2vk);
+    DataCopyPad(rvb, V[xbh], DataCopyExtParams(MT, D * 2, xRowBytes, 0, 0), padNop);
+    SetFlag<HardEvent::MTE2_V>(e2vv);
+    WaitFlag<HardEvent::MTE2_V>(e2vq);
+    Cast(qf, qnb, RoundMode::CAST_NONE, NG);
+    PipeBarrier<PIPE_V>();
+
+    // ---- q l2 norm -------------------------------------------------------
+    Mul(t2, qf, qf, NG);
+    PipeBarrier<PIPE_V>();
+    RowReduce(red, ef, t2);
+    Adds(red, red, EPS, MT);
+    Rsqrt(red, red, MT);
+    PipeBarrier<PIPE_V>();
+    Brcb(red[64], red, 2, BrcbRepeatParams(1, 8));
+    PipeBarrier<PIPE_V>();
+    Mul(qf, qf, red[64], 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(qf[64], qf[64], red[64], 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    PipeBarrier<PIPE_V>();
+    Cast(qnb, qf, RoundMode::CAST_RINT, NG);
+    PipeBarrier<PIPE_V>();
+    Cast(qf, qnb, RoundMode::CAST_NONE, NG);
+    PipeBarrier<PIPE_V>();
+
+    // ---- k l2 norm -------------------------------------------------------
+    WaitFlag<HardEvent::MTE2_V>(e2vk);
+    Cast(kf, knb, RoundMode::CAST_NONE, NG);
+    PipeBarrier<PIPE_V>();
+    Mul(t2, kf, kf, NG);
+    PipeBarrier<PIPE_V>();
+    RowReduce(red, ef, t2);
+    Adds(red, red, EPS, MT);
+    Rsqrt(red, red, MT);
+    PipeBarrier<PIPE_V>();
+    Brcb(red[64], red, 2, BrcbRepeatParams(1, 8));
+    PipeBarrier<PIPE_V>();
+    Mul(kf, kf, red[64], 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(kf[64], kf[64], red[64], 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    PipeBarrier<PIPE_V>();
+    Cast(knb, kf, RoundMode::CAST_RINT, NG);
+    PipeBarrier<PIPE_V>();
+    Cast(kf, knb, RoundMode::CAST_NONE, NG);
+    PipeBarrier<PIPE_V>();
 
     // ---- gc = gate - gate[mid] ------------------------------------------
-    Sub(zz, gf, gf[8 * D], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-    Sub(zz[64], gf[64], gf[8 * D + 64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Sub(zz, gfp, gf[(M / 2) * D], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Sub(zz[64], gfp[64], gf[(M / 2) * D + 64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
     if (pGc != nullptr) {
         SetFlag<HardEvent::V_MTE3>(ev3);
         WaitFlag<HardEvent::V_MTE3>(ev3);
-        DataCopy(Gc[x0], zz, DataCopyParams(M, 16, 0, 0));
+        DataCopy(Gc[xh], zz, DataCopyParams(MT, 16, 0, 0));
         PipeBarrier<PIPE_ALL>();
     }
 
     // ---- exp2(gate) ------------------------------------------------------
-    Muls(ef, gf, LN2, N);
-    Exp(ef, ef, N);
-    PipeBarrier<PIPE_V>();
-
-    // ---- beta broadcast over the D axis ---------------------------------
-    PipeBarrier<PIPE_V>();
-    Brcb(bb, beta, 2, BrcbRepeatParams(1, 8));
+    Muls(ef, gfp, LN2, NG);
+    Exp(ef, ef, NG);
     PipeBarrier<PIPE_V>();
 
     // ---- qg = qn * exp2(gate) --------------------------------------------
-    WaitFlag<HardEvent::MTE3_V>(e3d);
-    Mul(t2, qf, ef, N);
+    Mul(t2, qf, ef, NG);
     PipeBarrier<PIPE_V>();
-    Cast(qgb, t2, RoundMode::CAST_RINT, N);
+    Cast(qgb, t2, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
 
     // ---- rk = kn * beta * exp2(gate) -------------------------------------
-    Mul(t2, kf, ef, N);
+    Mul(t2, kf, ef, NG);
     PipeBarrier<PIPE_V>();
-    Mul(t2, t2, bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
-    Mul(t2[64], t2[64], bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(t2, t2, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(t2[64], t2[64], bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
-    Cast(rkb, t2, RoundMode::CAST_RINT, N);
+    Cast(rkb, t2, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
 
     // ---- rv = v * beta ---------------------------------------------------
     WaitFlag<HardEvent::MTE2_V>(e2vv);
-    Cast(t2, rvb, RoundMode::CAST_NONE, N);
+    Cast(t2, rvb, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
-    Mul(t2, t2, bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
-    Mul(t2[64], t2[64], bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(t2, t2, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(t2[64], t2[64], bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
-    Cast(rvb, t2, RoundMode::CAST_RINT, N);
+    Cast(rvb, t2, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
 
     // ---- kg = kn * exp2(gate_last - gate) --------------------------------
-    Sub(t2, gf[15 * D], gf, 64, M, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
-    Sub(t2[64], gf[15 * D + 64], gf[64], 64, M, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
+    Sub(t2, gf[(M - 1) * D], gfp, 64, MT, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
+    Sub(t2[64], gf[(M - 1) * D + 64], gfp[64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
     PipeBarrier<PIPE_V>();
-    Muls(t2, t2, LN2, N);
-    Exp(t2, t2, N);
+    Muls(t2, t2, LN2, NG);
+    Exp(t2, t2, NG);
     PipeBarrier<PIPE_V>();
-    Mul(t2, t2, kf, N);
+    Mul(t2, t2, kf, NG);
     PipeBarrier<PIPE_V>();
-    Cast(kgb, t2, RoundMode::CAST_RINT, N);
+    Cast(kgb, t2, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
-
 
     // early stores: let MTE3 drain behind the Gram work
     SetFlag<HardEvent::V_MTE3>(ev3);
     WaitFlag<HardEvent::V_MTE3>(ev3);
-    DataCopy(Qg[x0], qgb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Kg[x0], kgb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Rk[x0], rkb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Rv[x0], rvb, DataCopyParams(M, 8, 0, 0));
-    DataCopy(BetaOut[cm], beta, DataCopyParams(1, 2, 0, 0));
+    DataCopy(Qg[xh], qgb, DataCopyParams(MT, 8, 0, 0));
+    DataCopy(Kg[xh], kgb, DataCopyParams(MT, 8, 0, 0));
+    DataCopy(Rk[xh], rkb, DataCopyParams(MT, 8, 0, 0));
+    DataCopy(Rv[xh], rvb, DataCopyParams(MT, 8, 0, 0));
+    if (pQn != nullptr) DataCopy(Qn[xh], qnb, DataCopyParams(MT, 8, 0, 0));
+    if (pKn != nullptr) DataCopy(Kn[xh], knb, DataCopyParams(MT, 8, 0, 0));
 
     // ---- Gram half: bf16 operands for the paired Cube ---------------------
-    Muls(gef, zz, LN2, N);
-    Exp(gef, gef, N);
-    Muls(gefn, zz, -LN2, N);
-    Exp(gefn, gefn, N);
+    // Each pass casts its own MT rows and stores them straight to GM, so the
+    // operands never need a whole-chunk UB ring (see the buffer note).
+    Muls(gef, zz, LN2, NG);
+    Exp(gef, gef, NG);
+    Muls(gefn, zz, -LN2, NG);
+    Exp(gefn, gefn, NG);
     PipeBarrier<PIPE_V>();
-    Mul(ga, qf, gef, N);
-    Mul(gk1, kf, gef, N);
-    Mul(gb, kf, gefn, N);
+    Mul(gt, qf, gef, NG);
     PipeBarrier<PIPE_V>();
-    Mul(gk1, gk1, bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
-    Mul(gk1[64], gk1[64], bb, 64, M, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Cast(pga, gt, RoundMode::CAST_RINT, NG);
+    Mul(gt, kf, gef, NG);
     PipeBarrier<PIPE_V>();
-    LocalTensor<bfloat16_t> pga = (u & 1) == 0 ? bPga0.Get<bfloat16_t>() : bPga1.Get<bfloat16_t>();
-    LocalTensor<bfloat16_t> pgk = (u & 1) == 0 ? bPgk0.Get<bfloat16_t>() : bPgk1.Get<bfloat16_t>();
-    LocalTensor<bfloat16_t> pgb = (u & 1) == 0 ? bPgb0.Get<bfloat16_t>() : bPgb1.Get<bfloat16_t>();
-    Cast(pga, ga, RoundMode::CAST_RINT, N);
-    Cast(pgk, gk1, RoundMode::CAST_RINT, N);
-    Cast(pgb, gb, RoundMode::CAST_RINT, N);
+    Mul(gt, gt, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(gt[64], gt[64], bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
+    Cast(pgk, gt, RoundMode::CAST_RINT, NG);
+    Mul(gt, kf, gefn, NG);
+    PipeBarrier<PIPE_V>();
+    Cast(pgb, gt, RoundMode::CAST_RINT, NG);
+    PipeBarrier<PIPE_V>();
+    SetFlag<HardEvent::V_MTE3>(ev3);
+    WaitFlag<HardEvent::V_MTE3>(ev3);
+    DataCopy(Ga[xh], pga, DataCopyParams(MT, 8, 0, 0));
+    DataCopy(Gk[xh], pgk, DataCopyParams(MT, 8, 0, 0));
+    DataCopy(Gb[xh], pgb, DataCopyParams(MT, 8, 0, 0));
+    // The next pass reuses qnb/knb/rvb and zz while this pass's MTE3 stores
+    // are still reading them, so the pass boundary needs a drain; a PIPE_ALL
+    // is the only formulation that works here (the MTE3->MTE2 flag pair is
+    // the same one the chunk loop could not make survive, see the header).
+    // At KDA_CHUNK = 16 there is a single pass and the branch compiles away.
+    if (NP > 1) { PipeBarrier<PIPE_ALL>(); }
+    }
     // ---- previous chunk's Gram: mask, scale, round, store -----------------
     if (cprev >= 0) {
-        post_gram(ga32, gl32, ga16, gmaskS, gmaskL, Aqk32, L, Aqk16, cprev, scale, e2vs, ev3);
+        post_gram(ga32, gl32, ga16, gmaskS, gmaskL, gmaskBits, Aqk32, L, Aqk16,
+                  MaskS, MaskL, cprev, scale, e2vs, ev3);
     }
     // ---- publish + hand off ---------------------------------------------
     // The publish sits *after* the previous step's DONE wait so that at most
@@ -692,20 +841,14 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // count, so a subcore that runs a step ahead would otherwise donate its
     // next set to the current wait and the pairings would drift (which is what
     // hangs the long shapes).
-    SetFlag<HardEvent::V_MTE3>(ev3);
-    WaitFlag<HardEvent::V_MTE3>(ev3);
-    DataCopy(Ga[x0], pga, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Gk[x0], pgk, DataCopyParams(M, 8, 0, 0));
-    DataCopy(Gb[x0], pgb, DataCopyParams(M, 8, 0, 0));
-    if (pQn != nullptr) DataCopy(Qn[x0], qnb, DataCopyParams(M, 8, 0, 0));
-    if (pKn != nullptr) DataCopy(Kn[x0], knb, DataCopyParams(M, 8, 0, 0));
     CrossCoreSetFlag<2, PIPE_MTE3>(FL_READY);
     cprev = c;
     PipeBarrier<PIPE_ALL>();
     }
     // Drain the pipeline: the last chunk's Gram has no later chunk to hide
     // behind (~1/unroll of the stage, and the Cube is idle by then).
-    post_gram(ga32, gl32, ga16, gmaskS, gmaskL, Aqk32, L, Aqk16, cprev, scale, e2vs, ev3);
+    post_gram(ga32, gl32, ga16, gmaskS, gmaskL, gmaskBits, Aqk32, L, Aqk16,
+                  MaskS, MaskL, cprev, scale, e2vs, ev3);
     PipeBarrier<PIPE_ALL>();
     }
 }

@@ -41,78 +41,207 @@
 // is now at the bandwidth floor rather than the issue floor.
 //
 // C is rounded up to a multiple of NC by the caller, which zeroes the tail rows
-// of L so the padded chunks solve to a harmless identity.
+// of L so the padded chunks solve to a harmless identity (api.py, right after
+// the buffer is allocated - an uninitialised tail is not harmless, it is
+// garbage that the substitution turns into inf).
 #include "kernel_operator.h"
 using namespace AscendC;
 
-constexpr int32_t M = 16;
+#ifndef KDA_CHUNK
+#define KDA_CHUNK 16
+#endif
+// The parent chunk (one column block of the pipeline) and its size.  M is the
+// *sub-block* the recursion runs on: the two-level solve below splits every
+// PC x PC chunk into SB diagonal M x M sub-blocks, so at
+// KDA_SOLVE_WIDE_SUBB = 2 and KDA_CHUNK = 64 the substitution sees 32-wide
+// blocks.  SB = 1 keeps the single-level kernel (M = PC).
+#ifndef KDA_SOLVE_WIDE_SUBB
+#define KDA_SOLVE_WIDE_SUBB 1
+#endif
+constexpr int32_t SB = KDA_SOLVE_WIDE_SUBB;  // diagonal sub-blocks per chunk
+constexpr int32_t PC = KDA_CHUNK;            // the parent (whole-chunk) size
+constexpr int32_t M = PC / SB;               // the diagonal sub-block size
 constexpr int32_t MM = M * M;
 #ifndef KDA_SOLVE_WIDE_NCHUNK
 #define KDA_SOLVE_WIDE_NCHUNK 32
 #endif
 constexpr int32_t NC = KDA_SOLVE_WIDE_NCHUNK;
+// Two-level solve (SB > 1).  The recursion costs M^3/2 vector lanes per
+// chunk, so it is the *depth* that has to come down: solving SB diagonal
+// M x M sub-blocks of each PC-sized chunk instead of the whole PC x PC
+// triangle divides the vector work by SB^2, and the coupling block
+// X21 = X22 @ Lneg21 @ X11 is left to the Cube (k1_solve_assemble.cpp).
+// The instances of one block's tile are then (sub-block, chunk) pairs: a row
+// of the tile runs over SB groups of NCH chunks, and the gather stride
+// between two instances is one whole parent chunk (PC * PC floats).
+constexpr int32_t NCH = NC / SB;             // chunks per block
+// The block's A_inv tile is laid out [row][chunk][lane] rather than the GM's
+// [chunk][row][lane]: the repeat axis of every instruction is the chunk, so
+// its stride has to fit the 8-bit repeat-stride field, and at KDA_CHUNK = 64
+// the chunk stride of the GM order is MM/8 = 512 blocks (the field saturates
+// at 255 - the compiler warns "512 to 0" and the solve then reads the wrong
+// rows).  RW is both the stride of one row in this tile and the length of one
+// gathered row of L, which is chunk-major for exactly the same reason.
+constexpr int32_t RW = NC * M;    // floats in one row of the tile / of lraw
 constexpr int32_t CH = NC * MM;   // floats in one block's A_inv
-constexpr int32_t RW = NC * M;    // floats in one gathered row of L
+constexpr int32_t CM = 64 * 255;  // largest count-mode calCount
+constexpr int32_t RW21 = NCH * M;  // floats in one row of the L21 tile
 
 extern "C" __global__ __aicore__ void kda_solve_wu_wide(
-    GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA32, GM_ADDR pA16, int32_t C) {
+    GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA32, GM_ADDR pA16, GM_ADDR pXb,
+    GM_ADDR pLneg, int32_t C) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    const int32_t c0 = GetBlockIdx() * NC;
+    const int32_t c0 = GetBlockIdx() * NCH;
     if (c0 >= C) return;
     TPipe pipe;
     TEventID e2v = pipe.AllocEventID<HardEvent::MTE2_V>();
     TEventID e3 = pipe.AllocEventID<HardEvent::V_MTE3>();
     TBuf<TPosition::VECCALC> bLraw, bCexp, bAf, bAb, bEye;
     pipe.InitBuffer(bLraw, CH * 4);
-    pipe.InitBuffer(bCexp, 2 * NC * 64 * 4);
+#if KDA_SOLVE_WIDE_SUBB > 1
+    // A whole M x M tile of zeros: the parent tile's strict upper triangle is
+    // zero in A_inv but no kernel writes it (this one stores the diagonal
+    // sub-blocks, the assemble kernel the lower-left one) while the Cube solve
+    // reads the whole parent tile, so this kernel has to blank it.  The source
+    // has to be the full tile: a DataCopyParams source gap of 0 means *no gap*
+    // between bursts, i.e. the rows are read contiguously (measured - with a
+    // one-row buffer the copy walks off its end and stores UB garbage), so the
+    // broadcast the header used to assume would have to be a repeat stride
+    // inside a vector op, not a DMA parameter.
+    TBuf<TPosition::VECCALC> bZf, bZb;
+    pipe.InitBuffer(bZf, MM * 4);
+    pipe.InitBuffer(bZb, MM * 2);
+#endif
+    pipe.InitBuffer(bCexp, NC * M * 8 * 4);
     pipe.InitBuffer(bAf, CH * 4);
     pipe.InitBuffer(bAb, CH * 2);
     pipe.InitBuffer(bEye, MM * 4);
+#if KDA_SOLVE_WIDE_SUBB > 1
+    TBuf<TPosition::VECCALC> bL21f, bL21b;
+    pipe.InitBuffer(bL21f, M * RW21 * 4);
+    pipe.InitBuffer(bL21b, M * RW21 * 2);
+#endif
     LocalTensor<float> lraw = bLraw.Get<float>(), cexp = bCexp.Get<float>();
     LocalTensor<float> af = bAf.Get<float>(), eye = bEye.Get<float>();
     LocalTensor<bfloat16_t> ab = bAb.Get<bfloat16_t>();
+#if KDA_SOLVE_WIDE_SUBB > 1
+    LocalTensor<float> zf = bZf.Get<float>();
+    LocalTensor<bfloat16_t> zrow = bZb.Get<bfloat16_t>();
+#endif
     GlobalTensor<float> L, Eye, A32;
     GlobalTensor<bfloat16_t> A16;
+#if KDA_SOLVE_WIDE_SUBB > 1
+    LocalTensor<float> l21f = bL21f.Get<float>();
+    LocalTensor<bfloat16_t> l21b = bL21b.Get<bfloat16_t>();
+    GlobalTensor<bfloat16_t> Xb, Lneg;
+    Xb.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pXb));
+    Lneg.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pLneg));
+#endif
     L.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pL));
     Eye.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pEye));
     A32.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pA32));
     A16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pA16));
 
-    DataCopy(eye, Eye[0], DataCopyParams(M, 2, 0, 0));
+    DataCopy(eye, Eye[0], DataCopyParams(M, M / 8, 0, 0));
     for (int32_t i = 0; i < M; ++i) {
-        DataCopy(lraw[i * RW], L[static_cast<uint64_t>(c0) * MM + i * M],
-                 DataCopyParams(NC, 2, 30, 0));
+        for (int32_t s = 0; s < SB; ++s) {
+            DataCopy(lraw[i * RW + s * NCH * M],
+                     L[static_cast<uint64_t>(c0) * PC * PC + (s * M + i) * PC + s * M],
+                     DataCopyParams(NCH, M / 8, (PC * PC - M) / 8, 0));
+        }
     }
+#if KDA_SOLVE_WIDE_SUBB > 1
+    // The coupling block wants L21 negated so the Cube can fold the sign into
+    // its operand.  One gather per row, over all NCH chunks at once.
+    for (int32_t i = 0; i < M; ++i) {
+        DataCopy(l21f[i * RW21], L[static_cast<uint64_t>(c0) * PC * PC + (M + i) * PC],
+                 DataCopyParams(NCH, M / 8, (PC * PC - M) / 8, 0));
+    }
+#endif
     SetFlag<HardEvent::MTE2_V>(e2v);
     WaitFlag<HardEvent::MTE2_V>(e2v);
     // Fold the sign of the coefficient into the load: one instruction for the
-    // whole gathered tile.
-    Muls(lraw, lraw, -1.0f, CH);
+    // whole gathered tile (split: a count-mode call stops at CM elements).
+    for (int32_t off = 0; off < CH; off += CM) {
+        const int32_t n = (CH - off < CM) ? (CH - off) : CM;
+        Muls(lraw[off], lraw[off], -1.0f, n);
+    }
+#if KDA_SOLVE_WIDE_SUBB > 1
+    Muls(l21f, l21f, -1.0f, M * RW21);
+    Cast(l21b, l21f, RoundMode::CAST_RINT, M * RW21);
+#endif
+#if KDA_SOLVE_WIDE_SUBB > 1
+    Duplicate(zf, 0.0f, MM);
+    PipeBarrier<PIPE_V>();
+    Cast(zrow, zf, RoundMode::CAST_RINT, MM);
+#endif
     PipeBarrier<PIPE_V>();
 
     for (int32_t i = 0; i < M; ++i) {
-        // Row i starts from e_i for every chunk (one instruction, 16 chunks).
-        Adds(af[i * M], eye[i * M], 0.0f, M, NC, UnaryRepeatParams(1, 1, 32, 0));
-        Brcb(cexp, lraw[i * RW], 2 * NC, BrcbRepeatParams(1, 8));
+        // Row i starts from e_i for every chunk: one instruction whose repeat
+        // stride walks the chunks of the tile layout, while the source re-reads
+        // the same identity row (srcRepStride = 0) for each of them.
+        Adds(af[i * RW], eye[i * M], 0.0f, M, NC, UnaryRepeatParams(1, 1, M / 8, 0));
+        Brcb(cexp, lraw[i * RW], NC * M / 8, BrcbRepeatParams(1, 8));
         PipeBarrier<PIPE_V>();
         for (int32_t j = 0; j < i; ++j) {
-            MulAddDst(af[i * M], af[j * M], cexp[j * 8], M, NC,
-                      BinaryRepeatParams(1, 1, 0, 32, 32, 16));
+            MulAddDst(af[i * RW], af[j * RW], cexp[j * 8], M, NC,
+                      BinaryRepeatParams(1, 1, 0, M / 8, M / 8, M));
         }
         PipeBarrier<PIPE_V>();
     }
-    Cast(ab, af, RoundMode::CAST_RINT, CH);
-    PipeBarrier<PIPE_V>();
-    Cast(af, ab, RoundMode::CAST_NONE, CH);
-    PipeBarrier<PIPE_V>();
+    for (int32_t off = 0; off < CH; off += CM) {
+        const int32_t n = (CH - off < CM) ? (CH - off) : CM;
+        Cast(ab[off], af[off], RoundMode::CAST_RINT, n);
+        PipeBarrier<PIPE_V>();
+        Cast(af[off], ab[off], RoundMode::CAST_NONE, n);
+        PipeBarrier<PIPE_V>();
+    }
 
     SetFlag<HardEvent::V_MTE3>(e3);
     WaitFlag<HardEvent::V_MTE3>(e3);
-    for (int32_t ch = 0; ch < NC; ++ch) {
-        DataCopy(A32[static_cast<uint64_t>(c0 + ch) * MM], af[ch * MM],
-                 DataCopyParams(M, 2, 0, 0));
-        DataCopy(A16[static_cast<uint64_t>(c0 + ch) * MM], ab[ch * MM],
-                 DataCopyParams(M, 1, 0, 0));
+#if KDA_SOLVE_WIDE_SUBB > 1
+    // Both exports get the blank: the Cube solve reads A16, and A32 is the
+    // fp32 twin the debug views hand out - leaving it uninitialised made the
+    // two disagree on a block that is zero in A_inv.
+    for (int32_t s = 0; s + 1 < SB; ++s) {
+        for (int32_t s2 = s + 1; s2 < SB; ++s2) {
+            for (int32_t ch = 0; ch < NCH; ++ch) {
+                const uint64_t d = static_cast<uint64_t>(c0 + ch) * PC * PC
+                                   + (s * M) * PC + s2 * M;
+                DataCopy(A32[d], zf, DataCopyParams(M, M / 8, 0, (PC - M) / 8));
+                DataCopy(A16[d], zrow, DataCopyParams(M, M / 16, 0, (PC - M) / 16));
+            }
+        }
     }
+#endif
+    // One call per chunk gathers that chunk's rows out of the [row][chunk]
+    // tile: blockCount = M rows, srcStride = the NC - 1 other chunks' rows.
+    for (int32_t s = 0; s < SB; ++s) {
+        for (int32_t ch = 0; ch < NCH; ++ch) {
+            const int32_t t = s * NCH + ch;
+            const uint64_t d =
+                static_cast<uint64_t>(c0 + ch) * PC * PC + (s * M) * PC + s * M;
+            DataCopy(A32[d], af[t * M],
+                     DataCopyParams(M, M / 8, (NC - 1) * (M / 8), (PC - M) / 8));
+            DataCopy(A16[d], ab[t * M],
+                     DataCopyParams(M, M / 16, (NC - 1) * (M / 16), (PC - M) / 16));
+#if KDA_SOLVE_WIDE_SUBB > 1
+            // The same tile again, contiguous, for the coupling kernel: it
+            // reads X11 / X22 as plain [M, M] operands.
+            DataCopy(Xb[static_cast<uint64_t>(c0 + ch) * SB * MM + s * MM], ab[t * M],
+                     DataCopyParams(M, M / 16, (NC - 1) * (M / 16), 0));
+#endif
+        }
+    }
+#if KDA_SOLVE_WIDE_SUBB > 1
+    // One call per row of the coupling block: the NCH chunks of that row are
+    // contiguous in l21b (M elements apart) and land M elements apart in each
+    // chunk's [M, M] tile, whose rows are MM elements apart.
+    for (int32_t i = 0; i < M; ++i) {
+        DataCopy(Lneg[static_cast<uint64_t>(c0) * MM + i * M], l21b[i * RW21],
+                 DataCopyParams(NCH, M / 16, 0, (MM - M) / 16));
+    }
+#endif
     PipeBarrier<PIPE_ALL>();
 }

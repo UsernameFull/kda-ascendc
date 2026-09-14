@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -200,6 +201,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 "-I" + ascBase + "/asc/impl/utils",
                 "-include" + cannHome + "/include/version/asc_devkit_version.h",
             };
+            // Extra compiler options for experiments, whitespace separated:
+            //   KDA_RTC_OPTS="--cce-disable-asc-reserved-ubuf -O2"
+            std::vector<std::string> extraOpts;
+            if (const char *extra = std::getenv("KDA_RTC_OPTS")) {
+                std::stringstream ss(extra);
+                std::string tok;
+                while (ss >> tok) {
+                    extraOpts.push_back(tok);
+                }
+                for (auto &o : extraOpts) {
+                    optStrs.push_back(o);
+                }
+            }
             std::vector<const char *> options;
             for (auto &o : optStrs) {
                 options.push_back(o.c_str());
