@@ -493,6 +493,14 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     TEventID ev3 = pipe.AllocEventID<HardEvent::V_MTE3>();
     TEventID evs = pipe.AllocEventID<HardEvent::V_S>();
     TEventID e3d = pipe.AllocEventID<HardEvent::MTE3_V>();
+    // The pass boundary.  "e3p" is a *self-paired* MTE3 -> V drain (set and
+    // wait adjacent, no state carried across iterations): the V pipe stalls
+    // until every MTE3 op issued before it has landed.  See the pass loop.
+    TEventID e3p = pipe.AllocEventID<HardEvent::MTE3_V>();
+    // The other half of the pass boundary: a self-paired V -> MTE2 marker
+    // that keeps the next pass's loads off the three landing buffers
+    // until this pass's V has read them (see the rv block).
+    TEventID em2 = pipe.AllocEventID<HardEvent::V_MTE2>();
     // R3: the band staging of "post_gram" is a two-deep ring, one queue per
     // stream (Gram tiles, masks, the fp32 result, the bf16 rounding), so that
     // the band drain can go (see there).  TQue storage is not merged with the
@@ -506,7 +514,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     TQue<TPosition::VECOUT, 2> qgout, qgo16;
     TBuf<TPosition::VECCALC> bQf, bKf, bT0, bT2, bEf, bRed,
         bQnb, bKnb, bRkb, bRvb, bQgb, bKgb, bBias, bBeta, bBb, bAlog, bZz,
-        bGef, bGefn, bGt, bMbits;
+        bGef, bQK, bRvo, bMbits;
     pipe.InitBuffer(bQf, NG * 4); pipe.InitBuffer(bKf, NG * 4);
     pipe.InitBuffer(bT0, N * 4); pipe.InitBuffer(bT2, NG * 4);
     pipe.InitBuffer(bEf, NG * 4); pipe.InitBuffer(bRed, 384 * 4);
@@ -517,9 +525,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // at bb[8 * k] and the consumers walk it with srcRepStride = 1.
     pipe.InitBuffer(bBb, M * 8 * 4); pipe.InitBuffer(bAlog, 8 * 4);
     pipe.InitBuffer(bZz, NG * 4);
+    // One tile for the first exponential of "zz" (the second one is built
+    // over it once the first has no readers left, see the Gram stage), and
+    // the two bf16 tiles that must not be the MTE2 landing buffers (below).
     pipe.InitBuffer(bGef, NG * 4);
-    pipe.InitBuffer(bGefn, NG * 4);
-    pipe.InitBuffer(bGt, NG * 4);
+    pipe.InitBuffer(bQK, 2 * NG * 2);
+    pipe.InitBuffer(bRvo, NG * 2);
     // 2 x 16 x M fp32 per queue slot = 8 KB at CHUNK = 64 for the Gram and
     // mask tiles; the fp32 result and its bf16 rounding are a third pair.
     pipe.InitBuffer(qgin, 2, 2 * 16 * M * 4);
@@ -546,10 +557,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     LocalTensor<float> bias = bBias.Get<float>(), beta = bBeta.Get<float>();
     LocalTensor<float> bb = bBb.Get<float>(), alog = bAlog.Get<float>();
     LocalTensor<float> zz = bZz.Get<float>();
-    LocalTensor<float> gef = bGef.Get<float>(), gefn = bGefn.Get<float>();
-    // One scratch for the three Gram operands: each is cast into the ring
-    // as soon as it is formed, so nothing but the ring holds them.
-    LocalTensor<float> gt = bGt.Get<float>();
+    LocalTensor<float> gef = bGef.Get<float>();
+    LocalTensor<bfloat16_t> qnb2 = bQK.Get<bfloat16_t>(), knb2 = bQK.Get<bfloat16_t>()[NG];
+    LocalTensor<bfloat16_t> rvbo = bRvo.Get<bfloat16_t>();
     LocalTensor<uint8_t> gmaskBits = bMbits.Get<uint8_t>();
 
     LocalTensor<bfloat16_t> qnb = bQnb.Get<bfloat16_t>(), knb = bKnb.Get<bfloat16_t>();
@@ -742,9 +752,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Mul(qf, qf, red[64], 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     Mul(qf[64], qf[64], red[64], 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
-    Cast(qnb, qf, RoundMode::CAST_RINT, NG);
+    Cast(qnb2, qf, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
-    Cast(qf, qnb, RoundMode::CAST_NONE, NG);
+    Cast(qf, qnb2, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
 
     // ---- k l2 norm -------------------------------------------------------
@@ -762,9 +772,9 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Mul(kf, kf, red[64], 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     Mul(kf[64], kf[64], red[64], 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
-    Cast(knb, kf, RoundMode::CAST_RINT, NG);
+    Cast(knb2, kf, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
-    Cast(kf, knb, RoundMode::CAST_NONE, NG);
+    Cast(kf, knb2, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
 
     // ---- gc = gate - gate[mid] ------------------------------------------
@@ -804,8 +814,19 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Mul(t2, t2, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     Mul(t2[64], t2[64], bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
-    Cast(rvb, t2, RoundMode::CAST_RINT, NG);
+    Cast(rvbo, t2, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
+    // Pass boundary, load side.  This is the last read of the three MTE2
+    // landing buffers (qnb and knb are read by the two norms above, rvb by the
+    // cast just before), so a *self-paired* V -> MTE2 marker here holds every
+    // later DataCopyPad - the next pass's three loads - until the V queue is
+    // past this point.  It has to be a marker and not the MTE3 drain's
+    // transitive effect: a WaitFlag on a pipe's event queue does not stall the
+    // scalar unit, so with the drain alone the loads ran a pass ahead and the
+    // rv tile - the late reader of the three - came back holding the next
+    // pass's V (6136/8192 elements wrong at CHUNK = 64, probe /tmp/pgqK.py;
+    // with the marker: bit-exact, and 0.004 ms = noise).
+    if (NP > 1) { SetFlag<HardEvent::V_MTE2>(em2); WaitFlag<HardEvent::V_MTE2>(em2); }
 
     // ---- kg = kn * exp2(gate_last - gate) --------------------------------
     Sub(t2, gf[(M - 1) * D], gfp, 64, MT, BinaryRepeatParams(1, 1, 1, 16, 0, 16));
@@ -825,42 +846,55 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     DataCopy(Qg[xh], qgb, DataCopyParams(MT, 8, 0, 0));
     DataCopy(Kg[xh], kgb, DataCopyParams(MT, 8, 0, 0));
     DataCopy(Rk[xh], rkb, DataCopyParams(MT, 8, 0, 0));
-    DataCopy(Rv[xh], rvb, DataCopyParams(MT, 8, 0, 0));
-    if (pQn != nullptr) DataCopy(Qn[xh], qnb, DataCopyParams(MT, 8, 0, 0));
-    if (pKn != nullptr) DataCopy(Kn[xh], knb, DataCopyParams(MT, 8, 0, 0));
+    DataCopy(Rv[xh], rvbo, DataCopyParams(MT, 8, 0, 0));
+    if (pQn != nullptr) DataCopy(Qn[xh], qnb2, DataCopyParams(MT, 8, 0, 0));
+    if (pKn != nullptr) DataCopy(Kn[xh], knb2, DataCopyParams(MT, 8, 0, 0));
 
     // ---- Gram half: bf16 operands for the paired Cube ---------------------
     // Each pass casts its own MT rows and stores them straight to GM, so the
     // operands never need a whole-chunk UB ring (see the buffer note).
+    // Neither the product scratch nor the second exponential needs a tile of
+    // its own: "t2" is dead after the kg cast above, and the -zz exponential
+    // is built over "gef" once its last reader has gone.  Both are pure
+    // reorganisations - same arithmetic, same rounding points.
     Muls(gef, zz, LN2, NG);
     Exp(gef, gef, NG);
-    Muls(gefn, zz, -LN2, NG);
-    Exp(gefn, gefn, NG);
     PipeBarrier<PIPE_V>();
-    Mul(gt, qf, gef, NG);
+    Mul(t2, qf, gef, NG);
     PipeBarrier<PIPE_V>();
-    Cast(pga, gt, RoundMode::CAST_RINT, NG);
-    Mul(gt, kf, gef, NG);
+    Cast(pga, t2, RoundMode::CAST_RINT, NG);
+    Mul(t2, kf, gef, NG);
     PipeBarrier<PIPE_V>();
-    Mul(gt, gt, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
-    Mul(gt[64], gt[64], bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(t2, t2, bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
+    Mul(t2[64], t2[64], bbp, 64, MT, BinaryRepeatParams(1, 1, 0, 16, 16, 1));
     PipeBarrier<PIPE_V>();
-    Cast(pgk, gt, RoundMode::CAST_RINT, NG);
-    Mul(gt, kf, gefn, NG);
+    Cast(pgk, t2, RoundMode::CAST_RINT, NG);
+    Muls(gef, zz, -LN2, NG);
+    Exp(gef, gef, NG);
     PipeBarrier<PIPE_V>();
-    Cast(pgb, gt, RoundMode::CAST_RINT, NG);
+    Mul(t2, kf, gef, NG);
+    PipeBarrier<PIPE_V>();
+    Cast(pgb, t2, RoundMode::CAST_RINT, NG);
     PipeBarrier<PIPE_V>();
     SetFlag<HardEvent::V_MTE3>(ev3);
     WaitFlag<HardEvent::V_MTE3>(ev3);
     DataCopy(Ga[xh], pga, DataCopyParams(MT, 8, 0, 0));
     DataCopy(Gk[xh], pgk, DataCopyParams(MT, 8, 0, 0));
     DataCopy(Gb[xh], pgb, DataCopyParams(MT, 8, 0, 0));
-    // The next pass reuses qnb/knb/rvb and zz while this pass's MTE3 stores
-    // are still reading them, so the pass boundary needs a drain; a PIPE_ALL
-    // is the only formulation that works here (the MTE3->MTE2 flag pair is
-    // the same one the chunk loop could not make survive, see the header).
-    // At KDA_CHUNK = 16 there is a single pass and the branch compiles away.
-    if (NP > 1) { PipeBarrier<PIPE_ALL>(); }
+    // Pass boundary, store side: every tile the next pass overwrites is
+    // written by V (qgb/kgb/rkb/rvbo/pga/pgk/pgb), so a self-paired MTE3 -> V
+    // drain - V waits until the stores that read those tiles have landed -
+    // closes the MTE3-read -> V-write half of the boundary.  The MTE2 half
+    // (V-read -> load-write) is a separate pair at the last landing-buffer
+    // read, see the rv block; the three store-only bf16 tiles are what makes
+    // the two halves independent, and the MTE3-read -> MTE2-write path that
+    // needed the PIPE_ALL (probe /tmp/pgq8.py, 13 debug tensors diffed: only
+    // Qn/Kn/Rv moved) no longer exists.  A full PipeBarrier<PIPE_ALL> here is
+    // 0.49 ms of the stage; a loop-carried MTE3->MTE2 / MTE3->V *pair*
+    // instead hangs or traps even when primed (3 attempts, /tmp/pgq5.py +
+    // pgq6.py + pgq7.py).  At KDA_CHUNK = 16 there is one pass and both
+    // branches compile away, as before.
+    if (NP > 1) { SetFlag<HardEvent::MTE3_V>(e3p); WaitFlag<HardEvent::MTE3_V>(e3p); }
     }
     // ---- previous chunk's Gram: mask, scale, round, store -----------------
     if (cprev >= 0) {
