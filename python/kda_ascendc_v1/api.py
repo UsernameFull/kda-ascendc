@@ -57,7 +57,11 @@ ASM_NCHUNK = int(os.environ.get("KDA_ASM_NCHUNK", "0")) or 4
 # wide slices go on one stream and the assemble+Cube slices on another behind
 # a per-slice event.  Measured at [1,8192,96,128]/CHUNK=64: 3.22 -> 2.51 ms
 # for the whole solve, bit-identical outputs.  0 keeps a single stream.
-SOLVE_OVERLAP = int(os.environ.get("KDA_SOLVE_OVERLAP", "16"))
+# R3: 16 -> 24 slices.  Two same-process interleaved sweeps (MIN of 3) put
+# solve_ms at 2.650 (16) / 2.525 (24) / 2.742 (8) / 3.463 (48): the AIV and
+# AIC halves overlap better with smaller slices, but only down to the point
+# where the per-slice launch pair (and the AIC side's tail) starts to show.
+SOLVE_OVERLAP = int(os.environ.get("KDA_SOLVE_OVERLAP", "24"))
 # Heads per block in the persistent K2 loop, and therefore the KDA_MAXH the
 # kernel is compiled with (they must agree: the kernel's head map only walks
 # MAXH heads per block, so a smaller define silently drops heads).
@@ -442,12 +446,22 @@ def kda_bt16_fwd_ascendc(
     pre_tail = [aqk32, aqk16, L, mask_s, mask_l]
     # One block walks `pre_unroll` consecutive chunks.  The stage is issue-bound
     # and pays a fixed per-block setup cost, so unrolling is worth 8-12% from a
-    # few hundred chunks up (measured 2.679 -> 2.342 ms at [1,8192,32]); it is
-    # capped at 8 chunks so at least ~256 blocks stay in flight, and tiny grids
-    # (fewer than 256 chunks) stay at 1 because the loop wrapper itself costs a
-    # few percent there.
+    # few hundred chunks up (measured 2.679 -> 2.342 ms at [1,8192,32]); tiny
+    # grids (fewer than 256 chunks) stay at 1 because the loop wrapper itself
+    # costs a few percent there.
+    # R3: the cap was 8, which at [1,8192,96,128]/CHUNK=64 leaves 768 blocks -
+    # 32 waves of the 24 AICs - and every wave re-pays the block prologue.
+    # Measured same-process grid (interleaved MIN of 3, pre_gram ms):
+    # 768 blocks (pu 8) 4.163, 384 (16) 4.099, 256 (24) 4.16, 192 (32) 4.043,
+    # 96 (64) 4.031, 48 (128) 4.160 - i.e. it is the *wave count* that costs
+    # (~0.01 ms/wave) and a partial last wave costs a whole one (128 and 64
+    # blocks are 5.33 and 2.67 waves and land at 4.563/4.561).  So target a
+    # few integral waves rather than a block-count floor: c // 384 is 32 at
+    # c = 12288 (192 blocks = 8 waves) and 64 at c = 49152 (CHUNK=16, 384
+    # blocks, measured 4.551 (pu 8) -> 4.078).  Below c = 768 both formulas
+    # agree, so the medium shapes do not move.
     pre_unroll = (int(os.environ.get("KDA_PRE_UNROLL", "0"))
-                  or (1 if c < 256 else min(8, max(2, c // 512))))
+                  or (1 if c < 256 else min(64, max(2, c // 384))))
     mark("pre_gram_start")
     if os.environ.get("KDA_PRE_GRAM", "mix") == "aiv":
         pre_args = _pack_ptrs(pre_head + pre_tail)
