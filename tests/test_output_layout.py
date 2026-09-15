@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "src"))
 
 from kda_bt16 import kda_bt16_fwd  # noqa: E402
-from kda_ascendc_v1.api import kda_bt16_fwd_ascendc  # noqa: E402
+from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental as kda_bt16_fwd_ascendc  # noqa: E402
 
 
 @pytest.mark.npu

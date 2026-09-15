@@ -978,3 +978,53 @@ pre_gram 的账本变平（§11.16）之后，剩下的猜想是"三段的并行
 **结论：当前算法在这台 910B3 上的吞吐地板是 8.2–8.3 ms，而本轮 R3 已经从 8.96 走到 8.279**
 （pre_gram 3.275 / solve 2.524 / k2 2.480）。5 ms 不是"再调一调"能到的，
 需要一次"少算 40%"级别的算法或精度改动——那是一条要用户拍板的路线，不是排流水能解决的。
+
+## 11.18. P0-1 + P0-2：公开 API 收口到 `persistent_loop`，历史 mode 移入 experimental（2026-09-15）
+
+TODO 表的第一条是**正确性**问题，不是性能问题：`kda_bt16_fwd_ascendc` 的
+`k2_mode` 默认值还是 `"separated"`，而 `separated` 那一串 kernel 是 **C=16 实现**
+——它们的 `M` 不是 `KDA_CHUNK`，而是字面量 16：
+
+| kernel | M 的来源 |
+|---|---|
+| `k2_d12.cpp` / `k2_vnew.cpp` / `k2_d34.cpp` / `k2_outstate*.cpp` | `constexpr int32_t M = 16` |
+| `k2_mix_all_cube.cpp` / `k2_mix_d12_vnew.cpp` / `k2_mix_d4_outstate.cpp` | `constexpr int32_t M = 16` |
+| `k2_persistent.cpp` / `k2_persistent_scan.cpp` / `k2_triton_aiv.cpp` | `M = 16` |
+| `k2_d3_cube_bv64.cpp` / `k2_d4_full.cpp` / `k2_d4_only.cpp` | `M = 16, K = 16` |
+| **`k2_persistent_loop.cpp`（唯一）** | **`#ifndef KDA_CHUNK` + `constexpr int32_t M = KDA_CHUNK`** |
+
+所以在 CHUNK=64 的构建里走 `separated`，kernel 每 chunk 只读 16 行、只写 16 行：
+**输出看起来合理、跑得飞快、但是错的**。§11.15 记的那次"1.45 ms 的优化"就是这个坑
+（探针漏了 `_defines()`，kernel 退回默认 C=16）。默认值挂在这条路上，任何一个
+"先不管 K2，把 K1 调好"的人都会踩到。
+
+**改动**（`python/kda_ascendc_v1/api.py` + 新增 `experimental.py`）：
+
+1. 公开入口 `kda_bt16_fwd_ascendc(..., k2_mode=None)`：`None` → `"persistent_loop"`，
+   其余一律 `ValueError`（C=16-only 的 mode 报错文案指向 experimental）。
+2. 实现体搬到私有 `_kda_fwd_impl`，公开/实验两个入口都走它；**C=16-only 的检查在
+   实现体里**（`k2_mode in C16_ONLY_K2_MODES and CHUNK != 16` → 报错），所以没有任何
+   调用路径能绕过它。
+3. `C16_ONLY_K2_MODES` / `K2_MODES` / `PERSISTENT_LOOP` 成为模块常量，mode 名单只有
+   一处定义。
+4. 历史 mode 全部留在 `kda_ascendc_v1.experimental.kda_bt16_fwd_ascendc_experimental`，
+   S12–S15 的对照测试和 `tools/bench_s*` 脚本改成 import 它（19 个文件，只改 import 行）；
+   `benchmarks/bench_fla_compare.py` 按 mode 自动选入口，`--ascendc-modes` 两边的名字
+   都能跑。
+
+**验证**（两个 chunk 尺寸各一次全量进程）：
+
+| 进程 | 内容 | 结果 |
+|---|---|---|
+| 默认（C=16） | `tests/test_api_k2_mode.py` + `tests/test_persistent_loop.py` | 22 passed，exit 0 |
+| `KDA_CHUNK=64` | `tests/test_api_k2_mode.py` | 16 passed |
+
+新测试 `tests/test_api_k2_mode.py` 钉住四件事：默认签名是 `None`（即推荐实现）、
+公开入口对 10 个历史 mode 全部报错、未知 mode 报错、默认路径的 launch 账本是
+"1 个 `kda_k2_persistent_loop` + 0 个 `kda_k2_d12_kernel` / `kda_k2_init_kernel` /
+`kda_kg_transpose`"；并且在 C=16 构建下用 `persistent` 真跑一次、在 C=32/64 构建下
+断言它按 `KDA_CHUNK=...` 报错。
+
+**性能**：0 变化。生产路径本来就是 `persistent_loop`（`bench_fla_compare.py` 的默认
+`--ascendc-modes` 就是它），本 commit 只把"别人也能踩到的那条路"关掉。
+基线仍为 `[1,8192,96,128]`、CHUNK=64：**8.279 ms**（pre_gram 3.275 / solve 2.524 / k2 2.480）。

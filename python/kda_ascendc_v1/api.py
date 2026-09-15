@@ -99,6 +99,25 @@ WU_NCHUNK = int(os.environ.get("KDA_WU_NCHUNK", "0")) or (4 if CHUNK <= 32 else 
 D = 128
 BV = 64
 NV = 2
+# The K2 recurrence has exactly one implementation that is part of the API:
+# the device-side chunk loop walks KDA_CHUNK rows at a time, so it is the only
+# one that follows the build (kernels/v1/k2_persistent_loop.cpp).  Every other
+# mode in this file is a checkpoint of the S12-S15 experiments and carries the
+# 16-row tile as a literal (``constexpr int32_t M = 16`` in k2_d12.cpp,
+# k2_vnew.cpp, k2_d34.cpp, k2_outstate*.cpp, the k2_mix_* trio and the two
+# persistent_scan kernels): they *are* the C=16 implementation, so at any
+# other chunk size they would read 16 rows of a CHUNK-row chunk and return a
+# plausible-looking wrong answer - which is how a C=64 build once got a
+# "1.45 ms" number that was really the C=16 kernel.  They stay reachable for
+# benchmarking through kda_ascendc_v1.experimental, and the C=16 check is
+# enforced centrally in _kda_fwd_impl so no caller can bypass it.
+PERSISTENT_LOOP = "persistent_loop"
+C16_ONLY_K2_MODES = frozenset({
+    "separated", "cube_separated", "cube_d3_separated", "cube_full_d4",
+    "mix_aic_1_2", "mix_d12_vnew", "persistent", "persistent_scan",
+    "persistent_scan_cube", "triton_aiv",
+})
+K2_MODES = frozenset(C16_ONLY_K2_MODES | {PERSISTENT_LOOP})
 _COMPILED = False
 _PERSISTENT_COMPILED = False
 _PERSISTENT_SCAN_COMPILED = False
@@ -364,9 +383,62 @@ def kda_bt16_fwd_ascendc(
     bias: torch.Tensor | None = None,
     lower_bound: float = -5.0,
     return_intermediates: bool = False,
-    k2_mode: str = "separated",
+    k2_mode: str | None = None,
 ):
-    """Run an opt-in AscendC KDA path; all KDA arithmetic stays on device."""
+    """Run an opt-in AscendC KDA path; all KDA arithmetic stays on device.
+
+    ``q/k/v`` are BF16 ``[B, T, H, 128]``, ``g`` is FP32 ``[B, T, H, 128]``,
+    ``beta`` and ``A_log``/``bias`` are FP32; returns ``(out, final_state)``,
+    plus the stage tensors when ``return_intermediates`` is set.
+
+    ``k2_mode`` names the K2 (state recurrence) implementation and defaults to
+    ``"persistent_loop"``: one MIX launch runs the whole chunk loop and keeps
+    the fp32 state in UB, and it is the only implementation that follows the
+    build's ``KDA_CHUNK``.  The historical per-chunk modes are C=16-only
+    kernels; they are reachable through ``kda_ascendc_v1.experimental`` and
+    are rejected here so that a caller cannot silently run one at another
+    chunk size.
+    """
+    if k2_mode is None:
+        k2_mode = PERSISTENT_LOOP
+    if k2_mode != PERSISTENT_LOOP:
+        if k2_mode in C16_ONLY_K2_MODES:
+            raise ValueError(
+                "k2_mode=%r is an experimental C=16-only kernel; the public "
+                "API serves %r only (use "
+                "kda_ascendc_v1.experimental.kda_bt16_fwd_ascendc_experimental "
+                "to benchmark the historical modes)" % (k2_mode, PERSISTENT_LOOP))
+        raise ValueError("unsupported k2_mode %r (choose from %s)"
+                         % (k2_mode, ", ".join(sorted(K2_MODES))))
+    return _kda_fwd_impl(
+        q, k, v, g, beta, scale=scale, initial_state=initial_state,
+        output_final_state=output_final_state, A_log=A_log, bias=bias,
+        lower_bound=lower_bound, return_intermediates=return_intermediates,
+        k2_mode=k2_mode)
+
+
+def _kda_fwd_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    A_log: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    lower_bound: float = -5.0,
+    return_intermediates: bool = False,
+    k2_mode: str = PERSISTENT_LOOP,
+):
+    """The one implementation both entry points call; ``k2_mode`` is validated.
+
+    The public wrapper only lets ``persistent_loop`` through; this is where the
+    remaining modes are checked against the build, because the C=16-only
+    kernels would otherwise silently compute a 16-row answer.
+    """
     global _LAST_PROFILE
     global _LAUNCH_COUNTS, _LAUNCH_BLOCKS
     _LAUNCH_COUNTS = {}
@@ -382,8 +454,14 @@ def kda_bt16_fwd_ascendc(
             torch.npu.synchronize()
             prof[name] = (time.perf_counter() - prof[start_name]) * 1e3
     b, t, h = _check_inputs(q, k, v, g, beta, A_log, bias, initial_state)
-    if k2_mode not in {"separated", "cube_separated", "cube_d3_separated", "cube_full_d4", "mix_aic_1_2", "mix_d12_vnew", "persistent", "persistent_scan", "persistent_loop", "persistent_scan_cube", "triton_aiv"}:
-        raise ValueError("unsupported k2_mode")
+    if k2_mode not in K2_MODES:
+        raise ValueError("unsupported k2_mode %r" % (k2_mode,))
+    if k2_mode in C16_ONLY_K2_MODES and CHUNK != 16:
+        raise ValueError(
+            "k2_mode=%r is a C=16 implementation (M = 16 is a literal in its "
+            "kernels) but this build has KDA_CHUNK=%d: it would solve 16 rows "
+            "of every %d-row chunk.  Rebuild with KDA_CHUNK=16 or use %r."
+            % (k2_mode, CHUNK, CHUNK, PERSISTENT_LOOP))
     if scale is None:
         scale = D ** -0.5
     nt = t // CHUNK

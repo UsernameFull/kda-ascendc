@@ -9,7 +9,7 @@ import torch_npu
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
-from kda_ascendc_v1.api import kda_bt16_fwd_ascendc
+from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental as kda_bt16_fwd_ascendc
 
 torch.npu.set_device(0)
 device = torch.device('npu:0')

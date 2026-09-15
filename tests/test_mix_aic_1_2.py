@@ -21,7 +21,7 @@ def check(b,t,h):
     bias=torch.randn(h,128,device=dev)*.03
     h0=torch.zeros(b,h,128,128,device=dev)
     kw=dict(A_log=alog,bias=bias,lower_bound=-1.,initial_state=h0,output_final_state=True)
-    from kda_ascendc_v1.api import kda_bt16_fwd_ascendc
+    from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental as kda_bt16_fwd_ascendc
     out,st,dbg=kda_bt16_fwd_ascendc(q,k,v,g,beta,k2_mode='mix_aic_1_2',return_intermediates=True,**kw)
     torch.npu.synchronize()
     ref,rs=kda_bt16_fwd_ascendc(q,k,v,g,beta,k2_mode='cube_full_d4',**kw)

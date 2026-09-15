@@ -9,7 +9,7 @@ ROOT=Path(os.environ.get("KDA_ASCENDC_ROOT", Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'python'))
 if not (ROOT / "python" / "kda_ascendc_v1").exists():
     pytest.skip("AscendC v1 sources are not present", allow_module_level=True)
-from kda_ascendc_v1.api import kda_bt16_fwd_ascendc
+from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental as kda_bt16_fwd_ascendc
 DEV=torch.device('npu:0'); D=128
 
 def main():

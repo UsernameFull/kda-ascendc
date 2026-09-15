@@ -106,10 +106,19 @@ def proto_call(inp):
 
 
 def ascendc_call(inp, mode, lower_bound=LOWER_BOUND):
-    from kda_ascendc_v1.api import kda_bt16_fwd_ascendc
+    from kda_ascendc_v1.api import C16_ONLY_K2_MODES, kda_bt16_fwd_ascendc
+
+    # The public entry point serves the chunk-generic loop; the S12-S15 modes
+    # are C=16 kernels and only run under a C=16 build, so they go through the
+    # experimental entry point (which refuses them at any other KDA_CHUNK).
+    if mode in C16_ONLY_K2_MODES:
+        from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental
+        run = kda_bt16_fwd_ascendc_experimental
+    else:
+        run = kda_bt16_fwd_ascendc
 
     b, t, h, d = inp["q"].shape
-    return kda_bt16_fwd_ascendc(
+    return run(
         inp["q"], inp["k"], inp["v"], inp["g"], inp["beta"],
         A_log=inp["A_log"], bias=inp["dt_bias"], lower_bound=lower_bound,
         output_final_state=True, k2_mode=mode,

@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'python'))
-from kda_ascendc_v1.api import kda_bt16_fwd_ascendc, get_last_profile
+from kda_ascendc_v1.experimental import get_last_profile, kda_bt16_fwd_ascendc_experimental as kda_bt16_fwd_ascendc
 torch.npu.set_device(0); dev=torch.device('npu:0'); D=128
 for b,t,h in [(1,16,2),(1,64,2)]:
     torch.manual_seed(9000+b+t+h)

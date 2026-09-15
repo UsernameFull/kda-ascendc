@@ -29,7 +29,7 @@ def check(b: int, t: int, h: int) -> tuple[float, float]:
     initial_state = torch.randn(b, h, 128, 128, device=DEVICE) * 0.01
     common = dict(A_log=a_log, bias=bias, lower_bound=-1.0,
                   initial_state=initial_state, output_final_state=True)
-    from kda_ascendc_v1.api import kda_bt16_fwd_ascendc
+    from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental as kda_bt16_fwd_ascendc
 
     out, state, dbg = kda_bt16_fwd_ascendc(
         q, k, v, g, beta, k2_mode="mix_d12_vnew",

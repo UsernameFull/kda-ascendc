@@ -11,6 +11,7 @@ if not (ROOT / "python" / "kda_ascendc_v1").exists():
     pytest.skip("AscendC v1 sources are not present", allow_module_level=True)
 sys.path.insert(0, str(ROOT / "python"))
 from kda_ascendc_v1.api import CHUNK, get_last_profile, kda_bt16_fwd_ascendc
+from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental
 
 
 def _inputs(b, t, h, d, device, seed=240911):
@@ -28,11 +29,14 @@ def _inputs(b, t, h, d, device, seed=240911):
 
 @pytest.mark.npu
 @pytest.mark.parametrize("chunks,h", [(1, 2), (4, 2), (2, 2)])
-def test_persistent_loop_matches_separated(chunks, h):
-    """The single-launch device-side chunk loop must agree with the per-chunk path.
+def test_default_mode_matches_separated_oracle(chunks, h):
+    """The public entry point defaults to the device-side chunk loop.
+
+    Called without ``k2_mode``, it must agree with the per-chunk path.
 
     ``k2_mode="separated"`` is a C=16 implementation (its kernels carry the
-    16-row tile as a literal), so this oracle only exists for a C=16 build.
+    16-row tile as a literal) and lives in ``kda_ascendc_v1.experimental``, so
+    this oracle only exists for a C=16 build.
     C=32/64 builds are covered by
     ``test_persistent_loop_matches_fp32_reference``, which is chunk-generic.
     """
@@ -44,9 +48,11 @@ def test_persistent_loop_matches_separated(chunks, h):
     q, k, v, g, beta, a_log, bias, initial_state = _inputs(b, t, h, 128, device)
     kw = dict(A_log=a_log, bias=bias, lower_bound=-1.0,
               initial_state=initial_state, output_final_state=True)
-    ref_out, ref_state = kda_bt16_fwd_ascendc(q, k, v, g, beta, k2_mode="separated", **kw)
+    ref_out, ref_state = kda_bt16_fwd_ascendc_experimental(
+        q, k, v, g, beta, k2_mode="separated", **kw)
     torch.npu.synchronize()
-    out, state = kda_bt16_fwd_ascendc(q, k, v, g, beta, k2_mode="persistent_loop", **kw)
+    # No k2_mode: this is what a caller of the public API gets.
+    out, state = kda_bt16_fwd_ascendc(q, k, v, g, beta, **kw)
     torch.npu.synchronize()
     profile = get_last_profile()
     assert profile["launch_counts"].get("kda_k2_persistent_loop") == 1
