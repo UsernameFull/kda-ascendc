@@ -1112,3 +1112,51 @@ C=32（本 commit 之前就存在，kernel 一个字节没动）的现象：
 | C=64 | 同上 | 13/13 ✅ |
 
 性能：0 变化，基线**8.28 ms**（本 commit 不碰 kernel 与默认几何）。
+
+## 11.20. P2-1 原型（一）：把 chunk 不变的工作搬出每 chunk 循环——以及 pre_gram 的真正瓶颈是"等 Cube"（2026-09-15 下午）
+
+§11.16 的账本说 pre_gram 是"六个 0.18–0.30 的小块之和、发射受限"。本轮用同进程交错
+A/B（`/tmp/pgqM.py` / `pgqN.py`，`[1,8192,96,128]`、CHUNK=64、MIN of 4–5）把其中
+最大的一块（post_gram，0.300 ms）拆开量了：
+
+| 变体 | pre_gram | 相对 | 数值 |
+|---|---:|---:|---|
+| ref（HEAD 的 kernel） | 3.576 / 3.652 | — | — |
+| **P2-1：mask 位掩码提到 per-block** | **3.532 / 3.636** | **−0.044 / −0.016** | **逐位一致**（13 个中间张量 + out + state 全 0 diff） |
+| 去掉 `CrossCoreWaitFlag(FL_DONE)`（结果错，只读时间） | 3.485 | **−0.167** | out-diff 8.1e-3 |
+| 整段 post_gram 删掉（§11.16 的老数） | — | −0.300 | 错 |
+
+也就是说 post_gram 的 0.30 ms 里：**~0.17 是等 Cube 的 flag，~0.13 才是 select/cast/store，
+mask 那部分（每个 band 2 次 GM 读 + 2 次 Compare）只值 0.04**。§11.16 的"发射受限"结论
+在这个位置上是错的：每 chunk 少 8 个 DataCopy + 128 条向量指令只换回 1.2%。
+
+### 落地的改动（`kernels/v1/k1_pre_gram_mix.cpp`）
+
+两个三角 mask 是**每 chunk 都一样**的 `[M, M]` 0/1 矩阵，而 select 只吃它的**位形式**。
+于是位掩码改为**每 block 构建一次**（`bMfull`，`2 * M * M / 8 + 64` 字节，C=16 时 128 B、
+C=64 时 1 KB），per-band 循环里直接按 `mbitsAll[mm * 16*M/8]` 取切片：
+
+- 删掉：每 band 的 2 次 `DataCopy`（MaskS/MaskL，各 16×M fp32）+ 2 次 `Compares`；
+- 保留：同样的 2 次 `Select`（bit-identical 的原因）；
+- 顺带把每 chunk 32 KB 的 mask GM 读（12288 chunk × 32 KB = 393 MB/call）降到每 block 32 KB。
+
+`bMbits`（旧的 per-band scratch）随之删除，UB 占用净减 512 B − 1 KB。
+
+### 验证
+
+- 交错 A/B 逐位一致（上面那张表）；refcmp 数值闸门**完全不变**：
+  `out rel=8.620e-03 abs=5.490e-04 | state rel=4.245e-03 abs=2.453e-03`；
+- e2e（CHUNK=64，MIN of 4）：**8.284 ms**，其中 pre_gram **3.251**（此前 3.275–3.283,
+  这是 §11.16 以来的最好值）；
+- C=16 矩阵 + 稳定性门禁复核（见 11.19 的 runner）。
+
+### 这一轮的结论（对 5 ms 路线的影响）
+
+pre_gram 剩下的账本是"每 chunk 的延迟链"：AIV 发完 chunk c 的 operand → 等 Cube 的
+FL_DONE（**0.17 ms**，per-chunk ~1.3 µs 的实打实的 stall）→ post_gram。要拿这 0.17 只能
+动那个 depth-one 的 flag 协议（"a subcore that runs a step ahead … the pairing drifts one
+step per chunk"——代码注释里记的两次挂死就是它），风险极高、收益 2%；而**减指令**这条
+路已经被本轮证伪（少 128 条/chunk 只换 1.2%）。所以 pre_gram 的可动空间只剩：
+
+1. 协议加深（0.17 ms，有挂死风险，暂不动）；
+2. 与 K1 下游合并（少一次 GM 往返级的工作，需要新的代数）。
