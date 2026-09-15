@@ -10,8 +10,13 @@ ROOT = Path(os.environ.get("KDA_ASCENDC_ROOT", Path(__file__).resolve().parents[
 if not (ROOT / "python" / "kda_ascendc_v1").exists():
     pytest.skip("AscendC v1 sources are not present", allow_module_level=True)
 sys.path.insert(0, str(ROOT / "python"))
-from kda_ascendc_v1.api import CHUNK, get_last_profile, kda_bt16_fwd_ascendc
+from kda_ascendc_v1.api import (CHUNK, SUPPORTED_CHUNKS, get_last_profile,
+                                kda_bt16_fwd_ascendc)
 from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental
+
+if CHUNK not in SUPPORTED_CHUNKS:
+    pytest.skip("KDA_CHUNK=%d is a known-broken build (see "
+                "api.SUPPORTED_CHUNKS)" % CHUNK, allow_module_level=True)
 
 
 def _inputs(b, t, h, d, device, seed=240911):

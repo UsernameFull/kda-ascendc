@@ -7,11 +7,13 @@ import torch_npu
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'python'))
-from kda_ascendc_v1.api import launch_argsarray_engine, rtc_compile
+from kda_ascendc_v1.api import _rtc, launch_argsarray_engine
 
 torch.npu.set_device(0)
-rtc_compile((ROOT / 'kernels/v1/k2_triton_cube_aic_probe.cpp').read_text(),
-            'kda_k2_triton_cube_aic_probe', '')
+# Every RTC compile of a kernels/v1 source goes through _rtc, which prefixes
+# the geometry defines (see api._defines): a bare rtc_compile of a KDA_CHUNK
+# kernel silently falls back to the kernel's #ifndef default of 16.
+_rtc('kernels/v1/k2_triton_cube_aic_probe.cpp', 'kda_k2_triton_cube_aic_probe')
 device = torch.device('npu:0')
 blocks, m, n, k = 2, 16, 64, 128
 a = (torch.randn(blocks, m, k, device=device) * 0.2).to(torch.bfloat16)

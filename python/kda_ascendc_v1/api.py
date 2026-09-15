@@ -21,11 +21,20 @@ if str(EXT) not in sys.path:
 from kda_ascendc_v1_launcher import launch_argsarray_engine, rtc_compile
 
 # Chunk size of the whole pipeline.  It has to match the kernels' KDA_CHUNK
-# (see _DEFINES below): the AIV/Cube block sizes, the triangular masks and the
-# identity tile all follow it.  32 is the faster setting at [1,8192,96,128]
-# (the per-chunk setup and the gate cumsum are amortised over twice the rows
-# while K2 does half the chunk hand-offs), 16 is the long-standing default.
+# (see _defines below): the AIV/Cube block sizes, the triangular masks and the
+# identity tile all follow it.  16 is the default because it is the widest
+# supported shape (T % CHUNK == 0, so C=16 accepts four times the sequence
+# lengths of C=64); 64 is what every R3 number and the production baseline are
+# measured at - there the per-chunk setup, the gate cumsum and the K2 chunk
+# hand-offs are amortised over four times the rows, and the two-level solve
+# (SOLVE_WIDE_SUBB = 2) only exists at C >= 64.  Long sequences should build
+# with KDA_CHUNK=64.
 CHUNK = int(os.environ.get("KDA_CHUNK", "16"))
+# Chunk sizes the pipeline is actually checked at.  C=16 and C=64 pass the
+# whole matrix of tests/test_chunk_shape_matrix.py (B = 1/2, H = 2/32/48/96,
+# short and long T, with and without an initial state, plus determinism);
+# C=32 does not, and the failure is not subtle - see _kda_fwd_impl's guard.
+SUPPORTED_CHUNKS = frozenset({16, 64})
 SOLVE_NCHUNK = 8
 # The wide solve keeps four live [NC, CHUNK, CHUNK] tiles plus the Brcb
 # expansion, so the 192 KB of UB cap NC at 32/16/4 chunks for CHUNK =
@@ -256,6 +265,13 @@ def _defines() -> str:
     chunk-dependent block sizes ride in front of the kernel source; every
     guarded kernel (KDA_CHUNK, KDA_SOLVE_WIDE_NCHUNK, KDA_WU_NCHUNK) picks
     them up through its own #ifndef default.
+
+    Compiling a KDA_CHUNK kernel without this prefix is not a build error: the
+    kernel silently keeps its ``#ifndef KDA_CHUNK 16`` default and answers a
+    C=32/64 host call with 16 rows per chunk (fast, plausible, wrong).  Every
+    compile in this package therefore goes through ``_rtc``, and
+    ``tests/test_rtc_compile_config.py`` fails the build if a call site
+    compiles a kernel without the prefix.
     """
     return ("#define KDA_CHUNK %d\n#define KDA_SOLVE_WIDE_NCHUNK %d\n"
             "#define KDA_SOLVE_WIDE_SUBB %d\n#define KDA_ASM_NCHUNK %d\n"
@@ -264,38 +280,69 @@ def _defines() -> str:
                WU_NCHUNK, PERSIST_MAXH))
 
 
+def compile_config() -> dict[str, int]:
+    """The geometry the kernels were compiled with, as a plain dict.
+
+    ``get_last_profile()`` carries this next to the timings: the RTC compile
+    leaves no trace in the .o of how big KDA_CHUNK / KDA_MAXH / the solve block
+    sizes were, so a measurement without them cannot be compared against
+    another one.
+    """
+    return {
+        "KDA_CHUNK": CHUNK,
+        "KDA_MAXH": PERSIST_MAXH,
+        "KDA_SOLVE_WIDE_NCHUNK": SOLVE_WIDE_NCHUNK,
+        "KDA_SOLVE_WIDE_SUBB": SOLVE_WIDE_SUBB,
+        "KDA_ASM_NCHUNK": ASM_NCHUNK,
+        "KDA_WU_NCHUNK": WU_NCHUNK,
+        "KDA_SOLVE_OVERLAP": SOLVE_OVERLAP,
+        "nv": NV,
+    }
+
+
+def _rtc(rel: str, name: str) -> None:
+    """Compile ``kernels/v1/<rel>`` as ``name``, defines prefix included.
+
+    Every RTC compile of this package has to come through here (see
+    ``_defines``); the C=16-only kernels of the S12-S15 experiments ignore the
+    prefix, but they get it too so that the invariant is mechanical.
+    """
+    rtc_compile(_defines() + (ROOT / rel).read_text(), name, "")
+
+
+_SOURCES: list[tuple[str, str]] = [
+    ("kernels/v1/preprocess.cpp", "kda_preprocess_kernel"),
+    ("kernels/v1/k1_gram.cpp", "kda_gram_kernel"),
+    ("kernels/v1/k1_pre_gram.cpp", "kda_pre_gram_kernel"),
+    ("kernels/v1/k1_pre_gram_mix.cpp", "kda_pre_gram_mix"),
+    ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
+    ("kernels/v1/k1_solve_wu_wide.cpp", "kda_solve_wu_wide"),
+    ("kernels/v1/k1_solve_assemble.cpp", "kda_solve_assemble"),
+    ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
+    ("kernels/v1/k2_init.cpp", "kda_k2_init_kernel"),
+    ("kernels/v1/k2_d12.cpp", "kda_k2_d12_kernel"),
+    ("kernels/v1/k2_d12_cube.cpp", "kda_k2_d12_cube_kernel"),
+    ("kernels/v1/k2_vnew.cpp", "kda_k2_vnew_kernel"),
+    ("kernels/v1/k2_d34.cpp", "kda_k2_d34_kernel"),
+    ("kernels/v1/k2_d3_cube_bv64.cpp", "kda_k2_d3_cube_bv64"),
+    ("kernels/v1/k2_d4_only.cpp", "kda_k2_d4_only_kernel"),
+    ("kernels/v1/k2_kg_transpose.cpp", "kda_kg_transpose"),
+    ("kernels/v1/k2_d4_full.cpp", "kda_k2_d4_full"),
+    ("kernels/v1/k2_mix_d4_outstate.cpp", "kda_k2_mix_d4_outstate"),
+    ("kernels/v1/k2_mix_d12_vnew.cpp", "kda_k2_mix_d12_vnew"),
+    ("kernels/v1/k2_mix_all_cube.cpp", "kda_k2_mix_all_cube"),
+    ("kernels/v1/k2_persistent_loop.cpp", "kda_k2_persistent_loop"),
+    ("kernels/v1/k2_outstate_full.cpp", "kda_k2_outstate_full_kernel"),
+    ("kernels/v1/k2_outstate.cpp", "kda_k2_outstate_kernel"),
+]
+
+
 def _compile_all() -> None:
     global _COMPILED
     if _COMPILED:
         return
-    sources = [
-        ("kernels/v1/preprocess.cpp", "kda_preprocess_kernel"),
-        ("kernels/v1/k1_gram.cpp", "kda_gram_kernel"),
-        ("kernels/v1/k1_pre_gram.cpp", "kda_pre_gram_kernel"),
-        ("kernels/v1/k1_pre_gram_mix.cpp", "kda_pre_gram_mix"),
-        ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
-        ("kernels/v1/k1_solve_wu_wide.cpp", "kda_solve_wu_wide"),
-        ("kernels/v1/k1_solve_assemble.cpp", "kda_solve_assemble"),
-        ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
-        ("kernels/v1/k2_init.cpp", "kda_k2_init_kernel"),
-        ("kernels/v1/k2_d12.cpp", "kda_k2_d12_kernel"),
-        ("kernels/v1/k2_d12_cube.cpp", "kda_k2_d12_cube_kernel"),
-        ("kernels/v1/k2_vnew.cpp", "kda_k2_vnew_kernel"),
-        ("kernels/v1/k2_d34.cpp", "kda_k2_d34_kernel"),
-        ("kernels/v1/k2_d3_cube_bv64.cpp", "kda_k2_d3_cube_bv64"),
-        ("kernels/v1/k2_d4_only.cpp", "kda_k2_d4_only_kernel"),
-        ("kernels/v1/k2_kg_transpose.cpp", "kda_kg_transpose"),
-        ("kernels/v1/k2_d4_full.cpp", "kda_k2_d4_full"),
-        ("kernels/v1/k2_mix_d4_outstate.cpp", "kda_k2_mix_d4_outstate"),
-        ("kernels/v1/k2_mix_d12_vnew.cpp", "kda_k2_mix_d12_vnew"),
-        ("kernels/v1/k2_mix_all_cube.cpp", "kda_k2_mix_all_cube"),
-        ("kernels/v1/k2_persistent_loop.cpp", "kda_k2_persistent_loop"),
-        ("kernels/v1/k2_outstate_full.cpp", "kda_k2_outstate_full_kernel"),
-        ("kernels/v1/k2_outstate.cpp", "kda_k2_outstate_kernel"),
-    ]
-    head = _defines()
-    for rel, name in sources:
-        rtc_compile(head + (ROOT / rel).read_text(), name, "")
+    for rel, name in _SOURCES:
+        _rtc(rel, name)
     _COMPILED = True
 
 
@@ -303,8 +350,7 @@ def _compile_persistent() -> None:
     global _PERSISTENT_COMPILED
     if _PERSISTENT_COMPILED:
         return
-    rtc_compile((ROOT / "kernels/v1/k2_persistent.cpp").read_text(),
-                "kda_k2_persistent_kernel", "")
+    _rtc("kernels/v1/k2_persistent.cpp", "kda_k2_persistent_kernel")
     _PERSISTENT_COMPILED = True
 
 
@@ -312,16 +358,14 @@ def _compile_persistent_scan() -> None:
     global _PERSISTENT_SCAN_COMPILED
     if _PERSISTENT_SCAN_COMPILED:
         return
-    rtc_compile((ROOT / "kernels/v1/k2_persistent_scan.cpp").read_text(),
-                "kda_k2_persistent_scan_kernel", "")
+    _rtc("kernels/v1/k2_persistent_scan.cpp", "kda_k2_persistent_scan_kernel")
     _PERSISTENT_SCAN_COMPILED = True
 
 def _compile_triton_aiv() -> None:
     global _TRITON_AIV_COMPILED
     if _TRITON_AIV_COMPILED:
         return
-    rtc_compile((ROOT / "kernels/v1/k2_triton_aiv.cpp").read_text(),
-                "kda_k2_triton_aiv", "")
+    _rtc("kernels/v1/k2_triton_aiv.cpp", "kda_k2_triton_aiv")
     _TRITON_AIV_COMPILED = True
 
 def _tri_masks(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -366,6 +410,10 @@ def get_last_profile() -> dict[str, object]:
     profile["launch_counts"] = dict(_LAUNCH_COUNTS)
     profile["launch_blocks"] = dict(_LAUNCH_BLOCKS)
     profile["launch_total"] = sum(_LAUNCH_COUNTS.values())
+    # The compile geometry rides with every profile: an RTC kernel carries no
+    # trace of the defines it was built with, and a timing without them cannot
+    # be compared against another one.
+    profile["compile"] = compile_config()
     return profile
 
 
@@ -439,6 +487,20 @@ def _kda_fwd_impl(
     remaining modes are checked against the build, because the C=16-only
     kernels would otherwise silently compute a 16-row answer.
     """
+    # Builds that are known to be wrong are refused before anything is compiled
+    # or launched: a silently wrong answer is the one failure mode this package
+    # cannot afford (see C16_ONLY_K2_MODES for the other half of the same rule).
+    if CHUNK not in SUPPORTED_CHUNKS and os.environ.get(
+            "KDA_ALLOW_UNSUPPORTED_CHUNK", "0") != "1":
+        raise ValueError(
+            "KDA_CHUNK=%d is a known-broken build: the matrix that passes 13/13 "
+            "at C=16 and at C=64 fails every case at C=32 (NaN, run-to-run "
+            "drift, and a 1.4 relative error against the fp32 reference with the "
+            "first chunk already wrong).  K1 is cleared - the intra-chunk Gram, "
+            "W and U all match the host at C=32 - so the fault is inside "
+            "k2_persistent_loop's CHUNK=32 path.  Build with KDA_CHUNK=16 or "
+            "KDA_CHUNK=64; set KDA_ALLOW_UNSUPPORTED_CHUNK=1 to run it anyway "
+            "(debugging only)." % CHUNK)
     global _LAST_PROFILE
     global _LAUNCH_COUNTS, _LAUNCH_BLOCKS
     _LAUNCH_COUNTS = {}

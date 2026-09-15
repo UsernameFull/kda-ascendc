@@ -10,7 +10,9 @@ EXT=ROOT/'build/S02_clean/torch_extensions/kda_ascendc_v1_launcher'
 if not EXT.exists():
     pytest.skip("AscendC launcher extension is not built", allow_module_level=True)
 sys.path.insert(0,str(EXT))
-from kda_ascendc_v1_launcher import rtc_compile, launch_argsarray_engine
+from kda_ascendc_v1_launcher import launch_argsarray_engine
+sys.path.insert(0,str(ROOT/'python'))
+from kda_ascendc_v1.api import _rtc
 DEV=torch.device('npu:0'); M=16; BV=64; D=128; NV=2
 def ptr(x): return struct.pack('<Q',int(x.data_ptr()))
 def si(x): return struct.pack('<i',int(x))
@@ -22,7 +24,7 @@ def main():
  S=(torch.randn(tasks,BV,D)*.05).to(torch.bfloat16).to(DEV)
  d1=torch.full((tasks,NT,M,BV),-777.,dtype=torch.float32,device=DEV)
  d2=torch.full_like(d1,-777.)
- rtc_compile((ROOT/'kernels/v1/k2_d12_cube.cpp').read_text(),'kda_k2_d12_cube_kernel','')
+ _rtc('kernels/v1/k2_d12_cube.cpp','kda_k2_d12_cube_kernel')
  args=[ptr(W),ptr(Q),ptr(S),ptr(d1),ptr(d2),si(BH),si(NT),si(NV),si(0)]
  launch_argsarray_engine('kda_k2_d12_cube_kernel',tasks,torch_npu.npu.current_stream().npu_stream,args,0)
  torch.npu.synchronize()

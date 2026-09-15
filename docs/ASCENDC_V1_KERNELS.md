@@ -142,6 +142,13 @@ an odd slice then hands its last chunk to a Cube unit that would read the
 
 ## K2: d12 -> vnew -> d3 -> d4 -> out/state
 
+Everything in this table except ``k2_persistent_loop.cpp`` is a **C=16-only**
+kernel: ``M = 16`` is a literal in its source, not the build's ``KDA_CHUNK``.
+They are reachable through ``kda_ascendc_v1.experimental`` only, which refuses
+them unless the process was built with ``KDA_CHUNK=16`` - at any other chunk
+size they would read 16 rows of a CHUNK-row chunk (fast, plausible, wrong).
+``kda_bt16_fwd_ascendc`` (the public entry point) serves ``persistent_loop``.
+
 | Source | Kernel | Blocks | Output layout |
 |---|---|---|---|
 | `k2_init.cpp` | `kda_k2_init_kernel` | `BH*NV` | `s32`/`s16` `[task,64,128]` |
@@ -159,6 +166,13 @@ an odd slice then hands its last chunk to a Cube unit that would read the
 | `k2_persistent_loop.cpp` | `kda_k2_persistent_loop` | `ceil(BH / MAXH)` | one launch for all `NT` chunks (see below) |
 
 ### `persistent_loop`: the whole K2 recurrence in one launch
+
+It is chunk-generic (`M = KDA_CHUNK`) and is the only K2 the public entry point
+serves.  Note that the C=32 *build* is a known-broken configuration: the
+correctness matrix in `tests/test_chunk_shape_matrix.py` passes 13/13 at C=16
+and C=64 and fails every case at C=32 (NaN, run-to-run drift; K1 was checked
+against the host and is clean, so the fault is in this kernel's CHUNK=32 path).
+`api.SUPPORTED_CHUNKS` therefore refuses it.
 
 `k2_mode="persistent_loop"` runs `d12 -> vnew -> d34 -> outstate` for every
 chunk inside a single `KERNEL_TYPE_MIX_AIC_1_2` launch, so the host-side chunk
@@ -969,18 +983,29 @@ per-launch and per-stage latency, not by FLOPs:
 
 ```bash
 python tools/compile_all_server.py                     # RTC compile of every kernel
+python -m pytest tests/test_api_k2_mode.py tests/test_persistent_loop.py
+python -m pytest tests/test_rtc_compile_config.py      # host-only: define hygiene
+python -m pytest tests/test_chunk_shape_matrix.py      # per chunk size, see below
+python -m pytest tests/test_stability_gate.py          # 30 consecutive calls
 python -m pytest tests/test_persistent_scan.py tests/test_persistent_scan_cube.py
-python -m pytest tests/test_persistent_loop.py           # single-launch device loop
-python tests/test_mix_aic_1_2.py                       # script-style checks
-python tests/test_d12_cube.py
+python tests/test_d12_cube.py                          # C=16 kernels, script style
+python tests/test_mix_aic_1_2.py
 python tests/test_s15_mix_d12_vnew.py
 python tests/test_cube_separated.py
 ```
 
-`tests/test_cube_separated.py` compares `separated` against `cube_separated`
-for `[1,32,2]`, `[2,1024,4]`, `[2,4096,8]` and `[1,8192,32]`; both must be
-finite and agree within 1e-3 / 1e-4. All ten `k2_mode` values are also checked
-against the Triton reference (`src/kda_bt16`) on `[1,64,2,128]` with
+The correctness gate of the public path is `tests/test_chunk_shape_matrix.py`,
+which compares `[B, T, H, 128]` against the fp64/fp32 host reference in
+`tests/test_torch_reference.py` for B = 1/2, H = 2/32/48/96, short and long T,
+with and without an initial state, plus a determinism check per case.  The
+chunk size is a compile-time constant, so that file is run once per build
+(`python -m pytest tests/test_chunk_shape_matrix.py -q`, then with
+`KDA_CHUNK=32` and `KDA_CHUNK=64`).
+
+`tests/test_persistent_loop.py` additionally pins the C=16 path against the
+`separated` oracle (through `kda_ascendc_v1.experimental`); the S12-S15 modes
+are otherwise only covered by their own scripts above, which compare against
+the Triton reference (`src/kda_bt16`) on `[1,64,2,128]` with
 `state_v_first=True`.
 
 ## Reproducibility note

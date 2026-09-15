@@ -1028,3 +1028,87 @@ TODO 表的第一条是**正确性**问题，不是性能问题：`kda_bt16_fwd_
 **性能**：0 变化。生产路径本来就是 `persistent_loop`（`bench_fla_compare.py` 的默认
 `--ascendc-modes` 就是它），本 commit 只把"别人也能踩到的那条路"关掉。
 基线仍为 `[1,8192,96,128]`、CHUNK=64：**8.279 ms**（pre_gram 3.275 / solve 2.524 / k2 2.480）。
+
+## 11.19. P0-3/P0-4/P0-5/P0-6：正确性与稳定性门禁，以及矩阵抓到的 C=32 是坏的（2026-09-15 上午）
+
+这一轮不加性能改动，全部是"让错误答案无法静默通过"的机制。
+
+### P0-5：所有 RTC 编译统一走 `_rtc()`，几何进 profile
+
+`aclrtcCreateProg` 没有 `-D`，所以 `KDA_CHUNK` 等参数只能贴在源码前面（`_defines()`）。
+漏贴不会编译报错——kernel 会退回自己的 `#ifndef KDA_CHUNK 16`，对着 C=64 的
+host 调用只算 16 行（§11.15 那次"1.45 ms"的假优化）。现在：
+
+- `api._rtc(rel, name)` 是**唯一**把源码交给编译器的入口（`_compile_all` /
+  `_compile_persistent*` / `_compile_triton_aiv` 都改走它），
+  `tests/test_d12_cube.py`、`tools/bench_d12_cube.py`、
+  `tools/{compile,run}_cube_aic_probe_server.py` 这四处裸 `rtc_compile` 也改过来了；
+- `tests/test_rtc_compile_config.py`（**纯 host，3 passed**）用 AST 扫描全仓库：
+  任何地方出现直接 `rtc_compile(` 调用即失败；`kernels/v1/*.cpp` 里凡是读
+  `KDA_CHUNK` 的文件都必须在 api.py 的编译表里出现，否则失败；
+- `compile_config()` 把 `KDA_CHUNK / KDA_MAXH / KDA_SOLVE_WIDE_NCHUNK / SUPPORTED
+  _SUBB / ASM_NCHUNK / WU_NCHUNK / SOLVE_OVERLAP` 写进每一份 `get_last_profile()`，
+  并且测试断言它与 `_defines()` 逐项一致——测量和几何不再可能对不上。
+
+### P0-3/P0-4：矩阵与稳定性门禁
+
+- `tests/test_chunk_shape_matrix.py`：B∈{1,2} × H∈{2,32,48,96} × 短/长 T ×
+  initial state 有/无，共 10 例，每例跑两次（determinism）+ 对 `test_torch_reference`
+  的 fp32 参考比对（out/state 相对误差 < 2e-2）。chunk 是编译期常量，所以**每个
+  build 跑一遍**：`bash tools/run_chunk_matrix.sh` 依次跑 C=16/32/64。
+- `tests/test_stability_gate.py`：`[1,8192,96,128]` 连续 30 次（`KDA_STRESS_ITERS`
+  可调）+ 两个 side shape 各 5 次，逐位一致 + 有限性；side shape 在循环之后还要过一遍
+  fp32 参考，用来抓"单次调用没问题、设备被留在坏状态"的形态。
+
+### 矩阵的结果：C=16 ✅ 13/13，C=64 ✅ 13/13，**C=32 ❌ 13/13**
+
+C=32（本 commit 之前就存在，kernel 一个字节没动）的现象：
+
+| 现象 | 数值 |
+|---|---|
+| 与 fp32 参考的相对误差 | out **1.27**、state **1.76**（单个 chunk 就已经错） |
+| 同进程重复调用 | 第 2 次差 3.6e-3、第 3 次直接 **NaN** |
+| `KDA_PRE_GRAM=aiv` | 同样 NaN（该路径在 C=64 本来就是坏的） |
+
+逐段对照（host 复算 kernel 的公式，同进程、同一份输入）：
+
+| 段 | C=64 | C=32 |
+|---|---:|---:|
+| gate cumsum + recentering + chunk 内 Gram（`Aqk`） | 1.3e-4 | **8.3e-5**（对） |
+| solve：`A32` | 5.9e-2（两级 solve 的 bf16 耦合块） | 4.3e-4（对） |
+| solve：`W` / `U` | 4.3e-4 / 1.9e-3 | **4.3e-4 / 1.3e-3**（对） |
+
+也就是说 **K1 在 C=32 是干净的**（Gram、inverse、W/U 全部对上 host），故障在
+`kernels/v1/k2_persistent_loop.cpp` 的 CHUNK=32 路径上（NaN + run-to-run 漂移 =
+典型的边界/同步问题）。C=32 既不是默认（16）也不是生产配置（64），所以本轮的处置是
+**收口而不是现场修**：
+
+- `api.SUPPORTED_CHUNKS = {16, 64}`，`_kda_fwd_impl` 在**任何编译/下发之前**对
+  `KDA_CHUNK=32` 直接报错，错误信息里写明现象、K1 已洗清、故障在 K2；
+  `KDA_ALLOW_UNSUPPORTED_CHUNK=1` 留给后续调试用；
+- 测试在这个 build 下变成"断言必须报错 + skip"，所以
+  `bash tools/run_chunk_matrix.sh` 的 C=32 leg 输出
+  `REFUSED`（不再伪装成 pass）；`tests/test_persistent_loop.py`、
+  `tests/test_api_k2_mode.py` 的 device 用例同样加了模块级 skip；
+- 记一笔待办：C=32 的 K2 需要的是一次 `ascendc-op-debug` 式的定位
+  （K1 已排除、范围已缩到单个 kernel 的单个 chunk 尺寸）。
+
+### P0-6：注释/文档对齐现状
+
+- `api.py` 顶部 CHUNK 注释从"32 是更快的设置 / 16 是历史默认"改成现状：16 是默认
+  （T%16 支持面最宽）、64 是全部 R3 数字和生产基线的配置（且 C>=64 才有两级 solve）、
+  长序列请用 `KDA_CHUNK=64`；
+- `docs/ASCENDC_V1_KERNELS.md`：K2 表头标明除 `k2_persistent_loop` 外全是 C=16-only
+  kernel，只从 `experimental` 入口可达；verification 章节换成当前的命令与门禁说明。
+
+### 本轮的验证
+
+| 进程 | 内容 | 结果 |
+|---|---|---|
+| host | `test_rtc_compile_config.py` | 3 passed |
+| host | `test_api_k2_mode.py -m "not npu"` | 13 passed |
+| C=16 | matrix + stability + api + persistent_loop | 见上表 13/13 ✅ |
+| C=32 | 同上 | 2 passed / 14 skipped（全部是"必须被拒绝"） |
+| C=64 | 同上 | 13/13 ✅ |
+
+性能：0 变化，基线**8.28 ms**（本 commit 不碰 kernel 与默认几何）。

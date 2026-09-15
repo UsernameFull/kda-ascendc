@@ -21,7 +21,8 @@ if not (ROOT / "python" / "kda_ascendc_v1").exists():
     pytest.skip("AscendC v1 sources are not present", allow_module_level=True)
 sys.path.insert(0, str(ROOT / "python"))
 from kda_ascendc_v1.api import (CHUNK, C16_ONLY_K2_MODES, PERSISTENT_LOOP,
-                                get_last_profile, kda_bt16_fwd_ascendc)
+                                SUPPORTED_CHUNKS, get_last_profile,
+                                kda_bt16_fwd_ascendc)
 from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental
 
 D = 128
@@ -38,6 +39,13 @@ def _inputs(b, t, h, device, seed=240915):
     bias = torch.randn(h, D, device=device) * 0.03
     initial_state = torch.randn(b, h, D, D, device=device) * 0.01
     return q, k, v, g, beta, a_log, bias, initial_state
+
+
+def _skip_unless_supported():
+    if CHUNK in SUPPORTED_CHUNKS:
+        return
+    pytest.skip("KDA_CHUNK=%d is a known-broken build (see api.SUPPORTED_CHUNKS)"
+                % CHUNK)
 
 
 def test_public_default_is_the_recommended_mode():
@@ -73,6 +81,7 @@ def test_experimental_api_rejects_unknown_mode():
 @pytest.mark.npu
 def test_default_is_the_device_side_chunk_loop():
     """No ``k2_mode`` means one persistent_loop launch and no per-chunk launch."""
+    _skip_unless_supported()
     torch.npu.set_device(0)
     device = torch.device("npu:0")
     q, k, v, g, beta, a_log, bias, initial_state = _inputs(1, 2 * CHUNK, 2, device)
@@ -97,6 +106,7 @@ def test_default_is_the_device_side_chunk_loop():
 @pytest.mark.npu
 def test_experimental_entry_serves_the_chunk_generic_loop_too():
     """The C=16-free modes stay bit-identical across the two entry points."""
+    _skip_unless_supported()
     torch.npu.set_device(0)
     device = torch.device("npu:0")
     q, k, v, g, beta, a_log, bias, initial_state = _inputs(1, 2 * CHUNK, 2, device)
@@ -113,6 +123,7 @@ def test_experimental_entry_serves_the_chunk_generic_loop_too():
 @pytest.mark.npu
 def test_experimental_c16_modes_are_gated_on_the_build():
     """A C=16-only kernel is legal at KDA_CHUNK=16 and refused everywhere else."""
+    _skip_unless_supported()
     torch.npu.set_device(0)
     device = torch.device("npu:0")
     q, k, v, g, beta, a_log, bias, initial_state = _inputs(1, 2 * CHUNK, 2, device)
