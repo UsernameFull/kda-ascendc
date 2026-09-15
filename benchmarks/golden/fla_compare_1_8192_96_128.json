@@ -1,0 +1,93 @@
+{
+  "compile": {
+    "KDA_ASM_NCHUNK": 4,
+    "KDA_CHUNK": 64,
+    "KDA_MAXH": 4,
+    "KDA_SOLVE_OVERLAP": 24,
+    "KDA_SOLVE_WIDE_NCHUNK": 8,
+    "KDA_SOLVE_WIDE_SUBB": 2,
+    "KDA_WU_NCHUNK": 2,
+    "nv": 2
+  },
+  "config": {
+    "KDA_CHUNK": 64,
+    "ascendc_mode": "persistent_loop",
+    "quantiles": [
+      0.5,
+      0.2,
+      0.8
+    ],
+    "rep_ms": 1000,
+    "warmup_ms": 100
+  },
+  "device": "Ascend910_9382",
+  "fla": {
+    "fla-alog chunk64": {
+      "median_ms": 80.96395111083984
+    },
+    "fla-bench chunk64": {
+      "median_ms": 80.93008422851562
+    },
+    "published_h100_ms": 2.722
+  },
+  "gate": {
+    "diff_tol": 1.5,
+    "median_ms": 8.003499984741211,
+    "median_ms_max": 8.5,
+    "median_tol": 1.05,
+    "mode": "persistent_loop",
+    "o_max_abs_diff": 0.0009765625,
+    "p80_ms": 8.015104293823242,
+    "p80_tol": 1.1,
+    "stage_tol": 1.1,
+    "state_max_abs_diff": 0.004745125770568848,
+    "subject": "ascendc persistent_loop"
+  },
+  "git_commit": "dbdf480",
+  "inputs": {
+    "config": "kda-model",
+    "note": "q/k/v ~ N(0,1) bf16, g = logsigmoid(N(0,1)).clamp_min(-5) fp32, beta raw ~ N(0,1), A_log ~ N(0,1), dt_bias ~ N(0,0.1); the values do not drive the kernels (0.3% measured), but a raw N(0,1) gate is not a model input and breaks C=64 - see tests/test_c64_gate_overflow.py",
+    "seed": 1312
+  },
+  "note": "ratio vs this golden, plus the absolute ceiling; device 0 is shared, so a failing number on a busy device is not proof of a regression",
+  "recorded_utc": "2026-09-15T12:50:22Z",
+  "schema": 1,
+  "shape": [
+    1,
+    8192,
+    96,
+    128
+  ],
+  "stages": {
+    "k2_ms": 2.440269003272988,
+    "pre_gram_ms": 3.2259309955406934,
+    "solve_ms": 2.50835700717289,
+    "total_ms": 8.174557005986571
+  },
+  "timings": {
+    "compile": {
+      "KDA_ASM_NCHUNK": 4,
+      "KDA_CHUNK": 64,
+      "KDA_MAXH": 4,
+      "KDA_SOLVE_OVERLAP": 24,
+      "KDA_SOLVE_WIDE_NCHUNK": 8,
+      "KDA_SOLVE_WIDE_SUBB": 2,
+      "KDA_WU_NCHUNK": 2,
+      "nv": 2
+    },
+    "first_call_s": 48.26,
+    "launch_counts": {
+      "kda_k2_persistent_loop": 1,
+      "kda_pre_gram_mix": 1,
+      "kda_solve_assemble": 24,
+      "kda_solve_wu_cube_kernel": 24,
+      "kda_solve_wu_wide": 24
+    },
+    "launch_total": 74,
+    "median_ms": 8.003499984741211,
+    "o_max_abs_diff_vs_fla": 0.0009765625,
+    "p20_ms": 7.992716312408447,
+    "p80_ms": 8.015104293823242,
+    "state_max_abs_diff_vs_fla": 0.004745125770568848
+  }
+}

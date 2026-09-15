@@ -7,6 +7,10 @@
 # known-broken build (see api.SUPPORTED_CHUNKS), so the host refuses it and its
 # leg reports the refusal rather than a pass.
 #
+# The raw-gate overflow of tests/test_c64_gate_overflow.py rides along: it
+# xfails at C=64 (the two-level solve overflows, see its docstring) and passes
+# at C=16, so the pair of legs is the contrast that makes it a C=64 fault.
+#
 #   bash tools/run_chunk_matrix.sh            # matrix + stability gate
 #   KDA_STRESS_ITERS=100 bash tools/run_chunk_matrix.sh
 set -u
@@ -15,7 +19,8 @@ rc=0
 for chunk in 16 32 64; do
     echo "=== KDA_CHUNK=${chunk} ==="
     if KDA_CHUNK="${chunk}" python3 -m pytest \
-            tests/test_chunk_shape_matrix.py tests/test_stability_gate.py -q; then
+            tests/test_chunk_shape_matrix.py tests/test_stability_gate.py \
+            tests/test_c64_gate_overflow.py -q; then
         if [ "${chunk}" = "32" ]; then
             echo "REFUSED KDA_CHUNK=32 (known-broken build: the api guard fires and the tests skip)"
         else

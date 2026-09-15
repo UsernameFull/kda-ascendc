@@ -9,6 +9,14 @@ benchmark config (`fla/benchmarks/ops/registry.py`), bf16 q/k/v, fwd only,
 `[1, 8192, 96, 128]` 是 FLA 官方 benchmark 的六个默认 shape 之一，因此下面的
 数字可以直接和 FLA 公开的 H100/H200 CI 数字对照。
 
+**Current numbers live in the gate, not here**: `benchmarks/golden/fla_compare_1_8192_96_128.json`
+(`bash tools/run_bench_gate.sh` re-measures and checks them).  As of 2026-09-15 the C=64
+`persistent_loop` build is **8.003 ms** (stages 3.226 / 2.508 / 2.440) against FLA's
+triton-ascend 80.93 ms on this device - 10.1x faster here, 2.95x slower than FLA's published
+H100 row.  The table below is the 2026-09-12 snapshot (14.82 ms, `KDA_PRE_GRAM=aiv`); the
+`A_log` config in it uses a raw gate whose C=64 build overflows to NaN, see
+`tests/test_c64_gate_overflow.py`.
+
 ## Numbers (median of `triton.testing.do_bench`, warmup 100 ms / rep 2000 ms)
 
 | implementation | ms |

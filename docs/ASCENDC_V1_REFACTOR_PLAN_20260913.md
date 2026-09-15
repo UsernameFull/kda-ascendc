@@ -1198,3 +1198,93 @@ step per chunk"——代码注释里记的两次挂死就是它），风险极�
 - 正确性/稳定性门禁（P0-3/P0-4）：10 例 × B/H/T/state 矩阵 + 30 次连续稳定性，
   一次跑出**C=32 是坏构建**这个既有 bug；
 - 性能（P2-1）：pre_gram 3.275 → **3.251**，e2e **8.284 ms**（MIN of 4），数值闸门逐位不变。
+
+## 11.22. P1-1：生产 benchmark 的 golden 与 gate——以及它抓到的 C=64 raw-gate 溢出（2026-09-15 下午）
+
+目标（P1-1）：把 `[1,8192,96,128]`、C=64、`persistent_loop` 的生产数字**钉在仓库里**，
+让"功能改好了但性能悄悄退 20%"变成一次非零退出，而不是一段没人复现的日志。
+
+### 加了什么
+
+| 部件 | 内容 |
+|---|---|
+| `benchmarks/golden/fla_compare_1_8192_96_128.json` | golden：median/p20/p80、stage 分解、first-call、几何（`compile`）、输入构造、FLA 对照、以及 gate 阈值 |
+| `--update-golden` / `--gate` | 录制 / 检查；`--gate` 失败即 `exit 1`；`--kda-chunk` 决定构建几何 |
+| `tools/run_bench_gate.sh` | 生产闸门一行命令（`--impl fla-alog,ascendc`，几何由 golden 定） |
+| `tests/test_bench_gate.py` | 12 条 host 测试：20% 中位数回归、几何变化、数值漂移、stage 回归、NaN、缺参考各自必须失败，容差内的小幅变慢只能出 note |
+| `tests/test_c64_gate_overflow.py` | 本轮新 fault 的最小复现（strict xfail） |
+
+gate 检查四层，任何一层不过就 `FAIL`：**几何**（`compile` 逐键相等，RTC kernel 不带
+编译期几何的自证，两个几何的耗时不可比）、**中位数**（golden×1.05 与绝对 8.5 ms 两条，
+谁更严谁生效）、**p80**（×1.10，抖动）、**数值**（`o`/`state` 对 FLA 的 max-abs ≤ golden×1.5）。
+stage 分解只做**归因**（×1.10 才报错），因为它是带 device sync 的 profile 数字。
+
+关键取舍（都写进代码注释）：device 0 是共享的，同一构建在安静时 8.00 ms、别的租户忙时
+能到 ~9.0 ms，所以中位数同时给"相对 golden 的比例"和"绝对天花板"两条，报告里点名是哪条
+触发；而**几何不同一律硬失败**——"更快但是错的"是这个仓库已经发生过的失效模式
+（C=16 kernel 回答 C=64 调用，1.45 ms）。
+
+### 录制的第一个教训：几何必须显式
+
+第一次录制我忘了 `KDA_CHUNK=64`，于是**录到了 C=16 构建的数字**：同一个 shape、
+同一份输入，C=16 是 **11.565 ms**（pre_gram 3.549 / solve 2.129 / k2 **5.970**），
+C=64 是 **8.003 ms**（pre_gram 3.226 / solve 2.508 / k2 **2.440**）—— 差的就是 K2 的步数
+（T/CHUNK 从 128 变成 512）。所以 `--update-golden` 现在**拒绝**在没有 `--kda-chunk`
+（或 `KDA_CHUNK`）的情况下录制，理由写进了拒绝消息。这条正好是 gate 自己存在的意义：
+它检查的就是"数字和几何是不是一对"。（顺带一个可信度数据点：同一天先跑 `--impl ascendc`
+再跑 `--kda-chunk 64`，两边的 `solve`/`pre_gram` 差 <2%，只有 chunk 是变量。）
+
+### golden 的当前数字（2026-09-15 12:50 UTC，Ascend910_9382）
+
+| 项 | 值 |
+|---|---|
+| ascendc `persistent_loop`，C=64 | **8.003 ms**（p20 7.993 / p80 8.015），first-call 48.3 s（RTC 编译） |
+| stage（MIN of 4，`KDA_PROFILE=1`） | pre_gram 3.226 + solve 2.508 + k2 2.440 = 8.175 |
+| 数值 vs FLA chunk64（A_log 配置） | `o` 9.766e-04 / `state` 4.745e-03 |
+| FLA（本机，triton-ascend） | fla-bench chunk64 80.93 ms / fla-alog chunk64 80.96 ms |
+| 比值 | 比 FLA 本机快 **10.08x**；比 FLA 公开的 H100 行（2.722 ms）慢 **2.95x** |
+| gate 复核（新一轮进程） | 8.029 ms（+0.3%），stage 3.227/2.511/2.472，**PASS**，exit 0 |
+
+### 它抓到的 fault：C=64 的 solve 在一个合法 raw gate 上溢出
+
+golden 第一次录制出来的 `o-diff` 是 **nan**。追下去：
+
+- 同一个进程里 `[1,8192,96,128]`、同一份输入：**C=16 有限（对 FLA 9.77e-4），C=64 全 NaN**；
+- `return_intermediates` 定位：`Qn/Kn/Gate/Gc/Beta/Decay/Rk/Rv/Qg/Kg` **全部有限**，
+  `Aqk32` 出现 `inf`（50.3M 项里 7402 个），下游 `L/W/U/out/state` 全是 NaN
+  ——**溢出在 solve 自己组装 intra-chunk 矩阵的那一步**，不在它拿到的数据里
+  （`k` 已 l2 归一化、`beta`/gate 都出自 sigmoid，量级都有界）；
+- 最小复现只要 **T=128、H=2**（`tests/test_c64_gate_overflow.py`）：C=64 的 out NaN 16384 项、
+  `Aqk32` inf 2 项；C=16 同样输入 0 项。C=16 是单个 16×16 solve，C=64 是两级块组装，
+  这与 §11.5 记的"两级 solve"是同一条路；
+- 触发条件是 **gate 的量程**，不是 shape：raw `g ~ N(0,1)` 经 `-5*sigmoid(exp(A_log)(g+dt_bias))`
+  后有一半 token 顶到 −5 地板，chunk 内 `Gc` 走到 −320 量级；FLA 自己的 harness 生成的是
+  `logsigmoid(...).clamp_min(-5)`（≈ −0.7/token），同一份张量 FLA 结果是有限的。
+  实测四组（C=64，`[1,8192,96,128]`）：
+
+  | gate 构造 | A_log | out |
+  |---|---|---|
+  | raw `N(0,1)` | `N(0,1)` | NaN 83.4M 项 |
+  | raw `N(0,1)` | `linspace(-1,0.2)` | NaN 91.0M 项 |
+  | raw `N(0,1)*0.1` | `linspace(-1,0.2)` | NaN 19.7M 项 |
+  | `logsigmoid`（FLA harness 同款） | `N(0,1)` | **有限**（absmax 9.5e-2） |
+
+处理方式（本轮）：
+1. benchmark 的 `kda-model` 输入改用模型口径的 gate（`logsigmoid`），golden 的数值臂因此是活的，
+   并在 golden 的 `inputs.note` 里写明；
+2. 新 fault 用 **strict xfail** 钉住（C=64 必须 xfail、C=16 必须 pass，两腿一起构成对照），
+   修好那天会变成 XPASS 强制更新；
+3. gate 侧补硬规则：数值距离 **非有限** 就是 FAIL（`nan > x` 恒为 False，不显式判会**静默放过**
+   一个 NaN 的运行——这正是本轮差点发生的事），golden 自己录到非有限值也要重录；
+4. `tools/run_chunk_matrix.sh` 现在把这条对照跑进 C=16/C=32/C=64 三腿里。
+
+**下一步**：这条 C=64 溢出是一个**未修的正确性 fault**（优先级等同 P0-3 抓到的 C=32），
+量级不大（真实模型口径的 gate 不触发），但它意味着 C=64 的 solve 对输入量程没有余量；
+修法大概率在两级组装的中间量上做缩放/钳位（或改用稳定的相对衰减形式），
+开工前按 skill 的诊断协议走。
+
+### P1-1 之后还剩什么
+
+- **C=64 solve 溢出**（上面的新 fault）——正确性优先；
+- **P2-2 代数重写**（唯一能一次砍 20–40% 工作的路线）；
+- P1-2 形状矩阵、P1-4 workspace 精简、P2-3/P2-4/P2-5、P3-x；gate 本身是后续所有性能 PR 的入口。
