@@ -14,8 +14,9 @@ benchmark config (`fla/benchmarks/ops/registry.py`), bf16 q/k/v, fwd only,
 `persistent_loop` build is **8.003 ms** (stages 3.226 / 2.508 / 2.440) against FLA's
 triton-ascend 80.93 ms on this device - 10.1x faster here, 2.95x slower than FLA's published
 H100 row.  The table below is the 2026-09-12 snapshot (14.82 ms, `KDA_PRE_GRAM=aiv`); the
-`A_log` config in it uses a raw gate whose C=64 build overflows to NaN, see
-`tests/test_c64_gate_overflow.py`.
+`A_log` config in it uses a raw gate that used to overflow the C=64 build to NaN -
+fixed by the per-band gate reference of docs section 11.23, with
+`tests/test_c64_gate_overflow.py` as its regression gate.
 
 ## Numbers (median of `triton.testing.do_bench`, warmup 100 ms / rep 2000 ms)
 

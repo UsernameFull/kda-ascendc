@@ -615,7 +615,15 @@ def _kda_fwd_impl(
         # the Cube's work is hidden behind the AIV's remaining ~3.3 us per chunk
         # (see kernels/v1/k1_pre_gram_mix.cpp).
         gram_ops = torch.empty((3, c, CHUNK, D), dtype=torch.bfloat16, device=q.device)
-        pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2]] + pre_tail)
+        # The cross-band k side of the (1, 0) Gram block: a CHUNK = 64 gate
+        # needs one decay reference per 32-row band, and the Gram block that
+        # spans two bands is served by a second copy of band 0's k rows
+        # published under band 1's centre (the kernel note).  A single-band
+        # chunk writes no tile here, so CHUNK <= 32 keeps a one-row stand-in.
+        gram_x = torch.empty((c, max(1, CHUNK // 2), D), dtype=torch.bfloat16,
+                             device=q.device)
+        pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
+                              + pre_tail)
         pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
                      _i(qk_row_bytes), _i(g_row_bytes)]
         # One MIX block pairs an AIC with two AIV subcores, so it covers

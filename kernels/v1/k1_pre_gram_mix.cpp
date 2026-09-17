@@ -168,6 +168,22 @@ constexpr int32_t NP = M / MT;      // passes over one chunk
 constexpr int32_t NG = MT * D;      // elements in one pass tile
 constexpr int32_t KF = M / 16;      // 16-row fractal bands of a chunk tile
 constexpr int32_t DF = D / 16;
+// The gate reference has to sit inside the *band* its rows belong to.  One
+// reference for the whole chunk gives both Gram operands exponents of +-M/2
+// rows' worth of gate; the gate cumsum can drop the full lower bound (-5) per
+// row, so at CHUNK = 64 that reaches exp(+-160) - past the fp32 and bf16 exp
+// range of exp(88) - and the operands of every element of the A/L tiles turn
+// into inf or 0 (measured: Aqk32 -> inf -> W/U/out NaN on a legal raw gate,
+// C=16 finite on the same tensors, docs section 11.22).  Bands of BS rows cap
+// the exponent at BS/2 rows' worth, which at BS = 32 is exp(+-80) = 5.5e34 and
+// keeps ~2000x of headroom.  The Gram's (1, 0) block is the one block whose two
+// operands come from *different* bands, so its k side is published a second
+// time under band 1's centre (see the header note).  At M <= 32 there is a
+// single band, the reference row is M/2 = MID0 exactly as before, and every
+// branch below compiles away - the C=16 build is bit-identical.
+constexpr int32_t BS = M > 32 ? 32 : M;   // rows per gate band
+constexpr int32_t MID0 = BS / 2;          // band 0's reference row
+constexpr bool XBAND = M > BS;            // is there a second gate band?
 constexpr float RCP_LN2 = 1.4426950216f;
 constexpr float LN2 = 0.6931471805599453f;
 constexpr float EPS = 1e-6f;
@@ -315,6 +331,7 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
 // L = gk1 @ gb^T), writing the raw fp32 results into the Aqk32/L slots that
 // the AIV then masks, scales and rounds.
 static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb,
+                                           GM_ADDR pGx,
                                            GM_ADDR pAqk32, GM_ADDR pL,
                                            int32_t nchunk, int32_t unroll) {
     const int32_t base = GetBlockIdx() * 2 * unroll;
@@ -328,14 +345,20 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
     pipe.InitBuffer(qb, 4, M * D * 2);
     TQue<QuePosition::CO1, 2> qc;
     pipe.InitBuffer(qc, 2, M * M * 4);
-    // L0A/L0B slots: two per chunk (ga, gk1) and one shared gb.
+    // The cross-band k side of the (1, 0) block: BS rows of one chunk, only
+    // ever touched when the gate has two bands (see the constants).
+    TQue<QuePosition::B1, 2> qx;
+    pipe.InitBuffer(qx, 2, BS * D * 2);
+    // L0A/L0B slots: two per chunk (ga, gk1) and one shared gb, plus the two
+    // cross-band tiles (one per chunk) in L0B.
     LocalTensor<uint8_t> a8(TPosition::A2, 0, 4 * M * D * 2);
-    LocalTensor<uint8_t> b8(TPosition::B2, 0, 2 * M * D * 2);
-    GlobalTensor<bfloat16_t> Ga, Gk, Gb;
+    LocalTensor<uint8_t> b8(TPosition::B2, 0, 2 * M * D * 2 + (XBAND ? 2 * BS * D * 2 : 0));
+    GlobalTensor<bfloat16_t> Ga, Gk, Gb, Gx;
     GlobalTensor<float> Aqk32, L;
     Ga.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGa));
     Gk.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGk));
     Gb.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGb));
+    Gx.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGx));
     Aqk32.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pAqk32));
     L.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pL));
 
@@ -363,6 +386,14 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
         auto tk1 = qa.AllocTensor<bfloat16_t>();
         auto tb0 = qb.AllocTensor<bfloat16_t>();
         auto tb1 = qb.AllocTensor<bfloat16_t>();
+        // The two cross-band tiles (BS rows each) ride their own queue so the
+        // two shared L0B slots keep their size; at one gate band this alloc /
+        // load / free pair compiles away.
+        LocalTensor<bfloat16_t> tx0, tx1;
+        if (XBAND) {
+            tx0 = qx.AllocTensor<bfloat16_t>();
+            tx1 = qx.AllocTensor<bfloat16_t>();
+        }
         for (int32_t mm = 0; mm < KF; ++mm) {
             DataCopy(ta0[mm * DF * 256], Ga[o0 + mm * 16 * D],
                      Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
@@ -387,12 +418,22 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
             DataCopy(tb1[mm * DF * 256], Gb[o1 + mm * 16 * D],
                      Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
         }
+        for (int32_t mm = 0; XBAND && mm < BS / 16; ++mm) {
+            DataCopy(tx0[mm * DF * 256], Gx[static_cast<uint64_t>(c0) * BS * D + mm * 16 * D],
+                     Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+            DataCopy(tx1[mm * DF * 256], Gx[static_cast<uint64_t>(c1) * BS * D + mm * 16 * D],
+                     Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
+        }
         qa.EnQue(ta0);
         qa.EnQue(tk0);
         qa.EnQue(ta1);
         qa.EnQue(tk1);
         qb.EnQue(tb0);
         qb.EnQue(tb1);
+        if (XBAND) {
+            qx.EnQue(tx0);
+            qx.EnQue(tx1);
+        }
         SetFlag<HardEvent::MTE2_MTE1>(e21);
         WaitFlag<HardEvent::MTE2_MTE1>(e21);
         ta0 = qa.DeQue<bfloat16_t>();
@@ -401,12 +442,23 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
         tk1 = qa.DeQue<bfloat16_t>();
         tb0 = qb.DeQue<bfloat16_t>();
         tb1 = qb.DeQue<bfloat16_t>();
+        if (XBAND) {
+            tx0 = qx.DeQue<bfloat16_t>();
+            tx1 = qx.DeQue<bfloat16_t>();
+        }
         LocalTensor<bfloat16_t> la0 = a8[0].ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> lk0 = a8[M * D * 2].ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> la1 = a8[2 * M * D * 2].ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> lk1 = a8[3 * M * D * 2].ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> lb0 = b8[0].ReinterpretCast<bfloat16_t>();
         LocalTensor<bfloat16_t> lb1 = b8[M * D * 2].ReinterpretCast<bfloat16_t>();
+        // The cross-band k side: BS rows, so the L0B fractal order is
+        // [k block][16-row block] exactly as the full tiles' (n/16 = 2).
+        constexpr int32_t KX = BS / 16;
+        LocalTensor<bfloat16_t> lx0 =
+            b8[2 * M * D * 2].ReinterpretCast<bfloat16_t>();
+        LocalTensor<bfloat16_t> lx1 =
+            b8[2 * M * D * 2 + (XBAND ? BS * D * 2 : 0)].ReinterpretCast<bfloat16_t>();
         for (int32_t dd = 0; dd < DF; ++dd) {
             for (int32_t mm = 0; mm < KF; ++mm) {
                 LoadData(la0[(mm * DF + dd) * 256], ta0[(mm * DF + dd) * 256],
@@ -443,6 +495,18 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
                          LoadData2dParams(0, 1, 1, 0, 0, false, 0));
             }
         }
+        for (int32_t dd = 0; XBAND && dd < DF; ++dd) {
+            for (int32_t mm = 0; mm < KX; ++mm) {
+                LoadData(lx0[(dd * KX + mm) * 256], tx0[(mm * DF + dd) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
+        }
+        for (int32_t dd = 0; XBAND && dd < DF; ++dd) {
+            for (int32_t mm = 0; mm < KX; ++mm) {
+                LoadData(lx1[(dd * KX + mm) * 256], tx1[(mm * DF + dd) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
+        }
         SetFlag<HardEvent::MTE1_M>(e1m);
         WaitFlag<HardEvent::MTE1_M>(e1m);
         // srcStride counts C0 (16-element) units between the n-blocks of one
@@ -455,6 +519,12 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
         auto ip = FixpipeParamsV220(M, M, FX_SRC_STRIDE, M, false);
         ip.quantPre = QuantMode_t::NoQuant;
         ip.unitFlag = 0;
+        // The (1, 0) block is a BS x BS square of the same [M, M] tile: same
+        // destination row stride (M) and the accumulator's n-blocks BS C0
+        // units apart - FX_SRC_STRIDE's rule at m = BS.
+        auto ipx = FixpipeParamsV220(BS, BS, BS, M, false);
+        ipx.quantPre = QuantMode_t::NoQuant;
+        ipx.unitFlag = 0;
         for (int32_t s = 0; s < 2; ++s) {
             LocalTensor<float> cf0 = qc.AllocTensor<float>();
             LocalTensor<float> cf1 = qc.AllocTensor<float>();
@@ -474,6 +544,30 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
             WaitFlag<HardEvent::FIX_M>(efm);
             qc.FreeTensor(cf0);
             qc.FreeTensor(cf1);
+            if (XBAND) {
+                // Band 1's q / k rows (referenced to band 1's centre, as
+                // published) against band 0's k rows, which the AIV published
+                // a second time under that same centre.  This is the one Gram
+                // block a single reference cannot serve: with band 0's own
+                // centre the band-1 rows would run past the fp32 exp range.
+                // The Fixpipe below lands after the full tile's and so
+                // overwrites the block the band split gets wrong.
+                LocalTensor<bfloat16_t> laX = s == 0 ? la0[2 * DF * 256] : la1[2 * DF * 256];
+                LocalTensor<bfloat16_t> lkX = s == 0 ? lk0[2 * DF * 256] : lk1[2 * DF * 256];
+                LocalTensor<bfloat16_t> lx = s == 0 ? lx0 : lx1;
+                LocalTensor<float> cf2 = qc.AllocTensor<float>();
+                LocalTensor<float> cf3 = qc.AllocTensor<float>();
+                Mmad(cf2, laX, lx, MmadParams(BS, BS, D, 0, false, true));
+                Mmad(cf3, lkX, lx, MmadParams(BS, BS, D, 0, false, true));
+                SetFlag<HardEvent::M_FIX>(emf);
+                WaitFlag<HardEvent::M_FIX>(emf);
+                Fixpipe<float, float, CFG_ROW_MAJOR>(Aqk32[m0 + BS * M], cf2, ipx);
+                Fixpipe<float, float, CFG_ROW_MAJOR>(L[m0 + BS * M], cf3, ipx);
+                SetFlag<HardEvent::FIX_M>(efm);
+                WaitFlag<HardEvent::FIX_M>(efm);
+                qc.FreeTensor(cf2);
+                qc.FreeTensor(cf3);
+            }
         }
         qa.FreeTensor(ta0);
         qa.FreeTensor(tk0);
@@ -481,6 +575,10 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
         qa.FreeTensor(tk1);
         qb.FreeTensor(tb0);
         qb.FreeTensor(tb1);
+        if (XBAND) {
+            qx.FreeTensor(tx0);
+            qx.FreeTensor(tx1);
+        }
         CrossCoreSetFlag<2, PIPE_FIX>(FL_DONE);
     }
 }
@@ -490,13 +588,13 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     GM_ADDR pAlog, GM_ADDR pBias,
     GM_ADDR pQn, GM_ADDR pKn, GM_ADDR pGate, GM_ADDR pGc, GM_ADDR pBetaOut,
     GM_ADDR pDecay, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pQg, GM_ADDR pKg,
-    GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb,
+    GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb, GM_ADDR pGx,
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
     int32_t xRowBytes, int32_t gRowBytes) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIC {
-        run_gram_aic(pGa, pGk, pGb, pAqk32, pL, B * H * (T / M), unroll);
+        run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * (T / M), unroll);
     }
     if ASCEND_IS_AIV {
     const int32_t nt = T / M;
@@ -518,6 +616,10 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // wait adjacent, no state carried across iterations): the V pipe stalls
     // until every MTE3 op issued before it has landed.  See the pass loop.
     TEventID e3p = pipe.AllocEventID<HardEvent::MTE3_V>();
+    // The cross-band k side's landing tile is "rvbo", whose next writer is
+    // the *next* pass's rv cast - after the pass-boundary drain, which
+    // therefore cannot close that WAR (see the store below).
+    TEventID e3x = pipe.AllocEventID<HardEvent::MTE3_V>();
     // The other half of the pass boundary: a self-paired V -> MTE2 marker
     // that keeps the next pass's loads off the three landing buffers
     // until this pass's V has read them (see the rv block).
@@ -591,7 +693,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     LocalTensor<bfloat16_t> rkb = bRkb.Get<bfloat16_t>(), rvb = bRvb.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> qgb = bQgb.Get<bfloat16_t>(), kgb = bKgb.Get<bfloat16_t>();
 
-    GlobalTensor<bfloat16_t> Q, K, V, Qn, Kn, Rk, Rv, Qg, Kg, Ga, Gk, Gb;
+    GlobalTensor<bfloat16_t> Q, K, V, Qn, Kn, Rk, Rv, Qg, Kg, Ga, Gk, Gb, Gx;
     GlobalTensor<float> G, Beta, Alog, Bias, Gate, Gc, BetaOut, Decay;
     Q.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pQ));
     K.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pK));
@@ -605,6 +707,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Ga.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGa));
     Gk.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGk));
     Gb.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGb));
+    Gx.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pGx));
     G.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pG));
     Beta.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pBeta));
     Alog.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pAlog));
@@ -644,6 +747,8 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     const int32_t head = bh % H;
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     const uint64_t x0 = static_cast<uint64_t>(c) * N;
+    // The cross-band k side's ring is BS rows per chunk (see the constants).
+    const uint64_t xg = static_cast<uint64_t>(c) * BS * D;
     const uint64_t cm = static_cast<uint64_t>(c) * M;
     // The four stage-1 inputs are read straight out of the public [B, T, H, D]
     // layout instead of a packed [c, M, D] copy: one token is D contiguous
@@ -802,13 +907,28 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Cast(kf, knb2, RoundMode::CAST_NONE, NG);
     PipeBarrier<PIPE_V>();
 
-    // ---- gc = gate - gate[mid] ------------------------------------------
-    Sub(zz, gfp, gf[(M / 2) * D], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-    Sub(zz[64], gfp[64], gf[(M / 2) * D + 64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    // ---- gc = gate - gate[the pass's band reference] ---------------------
+    // The reference is the middle row of the pass's *gate band* (M/2 at a
+    // single band, 16 / 48 at CHUNK = 64): the exponents below are the only
+    // place the gate's absolute size enters, and a band-wide reference is what
+    // keeps them inside fp32 (see the constants).
+    const int32_t mid = MID0 + (hp * MT / BS) * BS;
+    Sub(zz, gfp, gf[mid * D], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+    Sub(zz[64], gfp[64], gf[mid * D + 64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
     if (pGc != nullptr) {
+        // "Gc" is documented as the chunk-centred gate, so at CHUNK = 64 -
+        // where the reference above is band-centred - the debug tile is
+        // rebuilt against the chunk's middle row instead of storing the
+        // band's (the debug path only; the Gram never reads this, and "gef"
+        // is this pass's free fp32 scratch at this point).
+        if (mid != M / 2) {
+            Sub(gef, gfp, gf[(M / 2) * D], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+            Sub(gef[64], gfp[64], gf[(M / 2) * D + 64], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+            PipeBarrier<PIPE_V>();
+        }
         SetFlag<HardEvent::V_MTE3>(ev3);
         WaitFlag<HardEvent::V_MTE3>(ev3);
-        DataCopy(Gc[xh], zz, DataCopyParams(MT, 16, 0, 0));
+        DataCopy(Gc[xh], mid == M / 2 ? zz : gef, DataCopyParams(MT, 16, 0, 0));
         PipeBarrier<PIPE_ALL>();
     }
 
@@ -920,6 +1040,46 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // pgq6.py + pgq7.py).  At KDA_CHUNK = 16 there is one pass and both
     // branches compile away, as before.
     SetFlag<HardEvent::MTE3_V>(e3p); WaitFlag<HardEvent::MTE3_V>(e3p);
+
+    // ---- cross-band k side of the (1, 0) Gram block -----------------------
+    // Band 0's rows are read against band 1's q rows, whose exponents are
+    // referenced to band 1's centre (the mid above); a Gram block is only
+    // what it should be if both of its operands carry the *same* reference
+    // (any fixed one is exact - the exponentials cancel, only their
+    // difference means anything), so band 0's k side is published a second
+    // time under band 1's centre.  Band 1's centre is the reference that
+    // keeps both sides inside the fp32/bf16 exp range: with band 0's own
+    // centre the band-1 operands would run to exp(-160) and vanish.  The two
+    // band-0 passes each publish their own 16 rows, and "rvbo" - the pass's
+    // V->MTE3 store tile, whose Rv copy is behind the drain just closed -
+    // doubles as their landing buffer.
+    if (XBAND && mid == MID0) {
+        Sub(t2, gfp, gf[(MID0 + BS) * D], 64, MT, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+        Sub(t2[64], gfp[64], gf[(MID0 + BS) * D + 64], 64, MT,
+            BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+        PipeBarrier<PIPE_V>();
+        Muls(t2, t2, -LN2, NG);
+        Exp(t2, t2, NG);
+        PipeBarrier<PIPE_V>();
+        Mul(t2, t2, kf, NG);
+        PipeBarrier<PIPE_V>();
+        Cast(rvbo, t2, RoundMode::CAST_RINT, NG);
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_MTE3>(ev3);
+        WaitFlag<HardEvent::V_MTE3>(ev3);
+        DataCopy(Gx[xg + gh], rvbo, DataCopyParams(MT, 8, 0, 0));
+        // "rvbo" carries the next pass's rv cast, and the pass-boundary
+        // drain above sits *before* this store, so this WAR needs a pair of
+        // its own: without it the next pass's V write can land in the tile
+        // before this MTE3 read has taken it.  Measured before the pair was
+        // added: the published tile came back 2.7e-1 wide instead of 8.8e-5
+        // (rows 0..23 holding the next band's v * beta), the (1, 0) Gram
+        // block and the solve's L with it, and the whole pipeline's output
+        // at 1.2e+3 relative instead of 5.5e-3 - on one launch layout and
+        // not on another, which is what a landing-buffer race looks like.
+        SetFlag<HardEvent::MTE3_V>(e3x);
+        WaitFlag<HardEvent::MTE3_V>(e3x);
+    }
     }
     // ---- previous chunk's Gram: mask, scale, round, store -----------------
     if (cprev >= 0) {

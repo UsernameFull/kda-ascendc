@@ -80,9 +80,12 @@ def make_inputs(b, t, h, d, config, device, seed=1312):
     # The raw gate stays raw (the A_log + dt_bias transform happens in-kernel),
     # but it must be a *model* gate: FLA's harness and every trained model feed
     # a non-positive one.  A N(0,1) gate is not one - it saturates half the
-    # tokens at the -5 floor, and the C=64 solve then overflows to inf
-    # (tests/test_c64_gate_overflow.py is the minimal repro of that bug; it is
-    # not what the gate should be measuring).
+    # tokens at the -5 floor, a 320-wide chunk span against the ~45 a model
+    # gives - so it measures the gate's range rather than the kernel's steady
+    # state.  That regime is legal API input and is covered by
+    # tests/test_c64_gate_overflow.py: it used to overflow to inf at C=64, and
+    # the per-band gate reference of k1_pre_gram_mix.cpp fixed it (docs
+    # section 11.23).
     g = torch.nn.functional.logsigmoid(randn(b, t, h, d)).clamp_min(LOWER_BOUND)
     a_log = randn(h)
     dt_bias = randn(h, d) * 0.1

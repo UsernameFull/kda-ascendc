@@ -1,25 +1,23 @@
-"""[C=64 only] a legal raw gate overflows the two-level solve.
+"""A legal raw gate must keep the C=64 Gram (and everything after it) finite.
 
 Found while pinning P1-1's benchmark golden: the benchmark's own "model"
 inputs (raw ``g``, ``A_log`` ~ N(0,1), shape ``[1, 8192, 96, 128]``) made the
 C=64 build return NaN while the C=16 build returned a finite answer that
 matched FLA to 9.8e-4 on the very same tensors.  The minimal repro below needs
-no big shape: at T=128, H=2 the C=64 solve already blows up.
+no big shape: at T=128, H=2 the C=64 solve used to blow up.
 
-Localised by dumping the K1 intermediates (``return_intermediates=True``):
-``Qn/Kn/Gate/Gc/Beta/Decay/Rk/Rv/Qg/Kg`` are all finite, ``Aqk32`` (the
-intra-chunk matrix the solve assembles) holds ``inf``, and everything
-downstream of it (``L``, ``W``, ``U``, ``out``, ``state``) is NaN.  Bounded
-inputs - ``|k|`` is l2-normalised, ``beta`` and the gate both come out of
-sigmoids - so the growth is in the solve's own arithmetic, not in the data it
-is fed; C=16 (one 16x16 solve) is fine and C=64 (the two-level assembly) is
-not, which is why the existing C=64 numerics gates (tame gates, ~-2.5) never
-saw it and this one does.
-
-The gate transform is ``-5 * sigmoid(exp(A_log) * (g + dt_bias))``, i.e. any
-finite ``g`` is legal API input, and FLA answers the same tensors with a finite
-result.  Strict xfail: while the fault is open this documents it, and when
-someone fixes the solve this test turns into XPASS and has to be un-marked.
+The gate takes the full lower bound (-5) per row when its sigmoid saturates, so
+one chunk's cumsum can span 320 in the log domain.  K1's Gram folds the decay
+into its two operands (``q*e^gc`` and ``k*e^-gc``), and with one reference for
+the whole chunk those operands reach ``exp(+-160)`` - past the fp32/bf16 exp
+range of ``exp(88)`` - so ``Aqk32`` came out ``inf`` and ``L/W/U/out/state``
+NaN (C=16, whose chunk-span stays inside the range, was finite throughout).
+The fix gives each 32-row gate *band* its own reference row and publishes band
+0's k side a second time under band 1's centre, which is what the (1, 0) Gram
+block needs to have both of its operands in range; see the constants note in
+``kernels/v1/k1_pre_gram_mix.cpp`` and docs section 11.23.  This test is its
+regression gate: with the fix the C=64 build is finite and its (1, 0) block is
+genuinely populated rather than silently zeroed.
 """
 
 import os
@@ -37,12 +35,9 @@ if str(ROOT / "python") not in sys.path:
 from kda_ascendc_v1.api import CHUNK, SUPPORTED_CHUNKS, kda_bt16_fwd_ascendc  # noqa: E402
 
 D = 128
-REASON = ("C=64's two-level solve overflows on a legal raw gate: Aqk32 -> inf -> W/U/out NaN "
-          "(the same input at C=16 is finite)")
 
 
 @pytest.mark.npu
-@pytest.mark.xfail(CHUNK == 64, strict=True, reason=REASON)
 def test_a_raw_gate_keeps_the_solve_finite():
     if CHUNK not in SUPPORTED_CHUNKS:
         pytest.skip(f"this build's KDA_CHUNK={CHUNK} is not supported (see api.SUPPORTED_CHUNKS)")
@@ -74,3 +69,10 @@ def test_a_raw_gate_keeps_the_solve_finite():
     broken = {name: int(torch.isnan(x).sum() + torch.isinf(x).sum())
               for name, x in finite.items() if not torch.isfinite(x).all()}
     assert not broken, f"non-finite values in {broken}"
+    # The (1, 0) block is the one the band split has to publish twice; a fix
+    # that got its operands wrong shows up here long before it shows up in the
+    # output (its entries are ~1e-2 of the tile's largest, so it also catches a
+    # block that quietly became zero).
+    if CHUNK > 32:
+        blk = dbg["Aqk32"].float()[:, CHUNK // 2:, :CHUNK // 2]
+        assert blk.abs().max() > 1e-6, "the (1, 0) Gram block is empty"
