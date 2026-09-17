@@ -3,9 +3,9 @@
 #
 # The chunk size is a compile-time constant of the RTC kernels, so a build is
 # only ever checked against the shapes its CHUNK divides; this runs the same
-# matrix at C=16, C=32 and C=64 and reports which builds pass.  C=32 is a
-# known-broken build (see api.SUPPORTED_CHUNKS), so the host refuses it and its
-# leg reports the refusal rather than a pass.
+# matrix at C=16, C=32 and C=64 and reports which builds pass - all three are
+# supported (api.SUPPORTED_CHUNKS), and the C=32 leg is a real pass since plan
+# section 11.24 fixed stage 3's cross-band block walk.
 #
 # tests/test_c64_gate_overflow.py rides along: it pins the C=64 band split of
 # the gate reference (docs section 11.23) and its (1, 0) Gram block, so it has
@@ -21,11 +21,7 @@ for chunk in 16 32 64; do
     if KDA_CHUNK="${chunk}" python3 -m pytest \
             tests/test_chunk_shape_matrix.py tests/test_stability_gate.py \
             tests/test_c64_gate_overflow.py -q; then
-        if [ "${chunk}" = "32" ]; then
-            echo "REFUSED KDA_CHUNK=32 (known-broken build: the api guard fires and the tests skip)"
-        else
-            echo "PASS KDA_CHUNK=${chunk}"
-        fi
+        echo "PASS KDA_CHUNK=${chunk}"
     else
         echo "FAIL KDA_CHUNK=${chunk}"
         rc=1

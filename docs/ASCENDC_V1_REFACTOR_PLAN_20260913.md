@@ -1392,6 +1392,80 @@ device 当前租户负载（同一轮里未修版本自己也从 3.24 涨到 3.3
 
 ### 还剩什么
 
-- **C=32 `k2_persistent_loop`**：仍然坏（`api.SUPPORTED_CHUNKS` 里是已知不可用），与本轮无关；
+- ~~**C=32 `k2_persistent_loop`**：仍然坏（`api.SUPPORTED_CHUNKS` 里是已知不可用）~~ 已修，
+  见 §11.24；
+- `gram_x` 在 C=16/C=32 构建里仍占一行（`max(1, CHUNK // 2)`），未做 workspace 精简（P1-4）；
+- P1-2 形状矩阵、P1-4 workspace、P2-2 代数重写（唯一能一次砍 20–40% 工作、通向 5 ms 的路线）。
+
+## 11.24. 修 C=32：K2 stage 3 的跨带 B 操作数走错了带数（2026-09-17）
+
+§11.19 把 C=32 的故障缩到 `k2_persistent_loop` 的 CHUNK=32 路径（NaN + run-to-run
+漂移，K1 已逐个张量洗清），本轮就修它。
+
+**定位**（`/tmp/c32.py`，`b=1 h=2 chunks=2` 带初始状态；每个张量查 finite，并跑两次比
+determinism）：C=32 时从 `d1` 起 K2 的每张中间张量都带 NaN（`d1` 8192/16384、`d4`
+32768/32768），而 K1 的 `Beta/Decay/Rk/Rv/Qg/Kg/Aqk/L/A16/A32/W/U` 全部 finite 且对上
+host；同一个脚本在 C=64 干净。故障面是"整个 K2"而不是某一张输出 —— 共享的 L1 槽被写坏
+的样子，不是某条算法算错。
+
+**根因**：stage 3 的 `lx`（d34 的 B 操作数）装载。
+
+```cpp
+for (int32_t c = 0; c < BV / FR; ++c) {                  // ← 组数写成了 value 带数
+    DataCopy(lx[iv * BV * K + c * (BV / FR) * FR * FR],
+             Vt[t0 + c * FR * FR],
+             DataCopyParams(BV / FR, FR * FR / 16,
+                            (BV / FR) * FR * FR / 16 - FR * FR / 16, 0));  // ← 源跨距也按 4 算
+}
+```
+
+`Vt` 是按 **A 操作数的块序**存的（`Vt[j0 * NB + m0]`，`NB = K / FR`，`m0` 是 chunk 行带、
+`j0` 是 value 带），而 d34 的 B 操作数要的是 **[K, N] 的行主序分形** —— 和 A 操作数 [M, K]
+的行主序是同一套约定，内层步长是 **n 带数 `BV / 16`（与 chunk 无关）**，所以两者之间是
+**块转置**（`kb * (BV / FR) + nb`）而不是同一种下标写法。于是装载应当是：一次 burst 一个
+16 x 16 块，**组走 `K / FR` 个 chunk 行带**，每组里 `BV / FR` 个 burst 沿源跨距
+`K / FR` 个分形跳。代码把三处 `K / FR` 都写成了 `BV / FR`：
+
+- C=64（K = 64）时 `K / FR = BV / FR = 4` —— **逐字相同**，这就是它一路过门禁的原因；
+- C=16 走上面的 `K == FR` 直读分支（`NB = 1`，两种写法都退化成 identity），也看不见；
+- C=32（`K / FR = 2`）时：每组 4 个 burst、源跨距按 4 个分形算 → 一次 iv 迭代写
+  `4 x 4 x 256 x 2 B = 8 KB`，而 `qx` 的一个 iv 槽只有 `BV * K * 2 = 4 KB`。第一次迭代把
+  两个槽一起写掉，第二次**越过 `qx` 末尾 4 KB**，落在 L1 arena 里紧跟 `qx` 的 `qk`
+  （`kg^T`，8 KB）上。stage 1/3 共享这块 arena，所以 K2 的中间张量（`d1` 起）一起 NaN；
+  AIV stage 2 那两条 `PipeBarrier<PIPE_ALL>` 决定越界写与后续读的先后，故障是否显形就
+  随运行而变 —— 与观测到的 run-to-run 漂移一致。
+
+**修法**（`kernels/v1/k2_persistent_loop.cpp`，两处 token）：组数 `BV / FR` → `K / FR`，
+源跨距 `(BV / FR) * FR * FR / 16 - FR * FR / 16` → `(K / FR) * FR * FR / 16 - FR * FR / 16`。
+C=64 时两式同值 → 生产路径逐位不变；C=16 走直读分支 → 也不动。
+
+**实测**：
+
+| 项 | 结果 |
+|---|---|
+| 数值门禁（`/tmp/refcmp_full.py`，T=8192 H=8） | C=32 **与 C=64 逐位同数**：out rel 8.620e-03 abs 5.490e-04 / state rel 4.245e-03 abs 2.453e-03（chunk 不变性直接体现） |
+| `bash tools/run_chunk_matrix.sh` | C=16 / C=32 / C=64 三条腿全 **PASS**（C=32 从 `REFUSED` 变成真 pass） |
+| `pytest tests/`（全目录） | C=32 全过、C=64 全过；C=16 只剩 3 条 `test_persistent_scan.py`（既有问题：`k2_persistent_scan.cpp` 在当前 RTC 工具链下编不过，与本轮无关） |
+| 生产 gate（`tools/run_bench_gate.sh`，C=64） | **PASS**：median 8.235 ms（golden 8.003 x 1.05），`o` 9.766e-04 / `state` 4.544e-03 与 golden 一致 |
+| 端到端计时（`/tmp/final2.py`，MIN of 4，同机交替两轮，[1,8192,96,128]） | C=64 **8.477 / 8.464 ms**（pre_gram 3.445 / solve 2.548 / k2 2.462）；C=32 **8.905 / 8.905 ms**（pre_gram 3.189 / solve 2.294 / k2 3.405） |
+
+C=32 的取舍：K1 反而快 0.5 ms（pre_gram -0.26、solve -0.25，chunk 数翻倍换来更小的
+Gram/solve 块），K2 慢 0.94 ms（256 个 chunk 的 flag 与描述符账），合计 **+0.43 ms
+（+5%）**。**生产构建仍是 C=64**；C=32 现在的价值是"第三方形状需要更细的 chunk 时它可用"，
+以及 chunk 不变性多了一个非平凡验证点（C=16 与 C=64 恰好都无法验证 stage 3 的跨带走动）。
+
+**API/文档收口**：`SUPPORTED_CHUNKS = {16, 32, 64}`；拒绝文案从"C=32 已知坏"改成
+"未验证的 chunk 尺寸"（并举例：C=128 会把 L0C 队列与 L0A 分配各顶到 128 KB / 64 KB 的
+整块上限，而这类错误只会在核侧以 aivec error 或静默错值出现，host 不会报）；`tests/test_persistent_scan*.py` 与
+`test_output_layout.py`（钉的都是 C=16-only 的实验 mode）、`test_mix_aic_1_2.py` /
+`test_s15_mix_d12_vnew.py`（T = 16 的用例）在非 C=16 构建下改成模块级 skip —— 前两个
+之前是**收集期报错**，`pytest tests/` 在 C=32/64 下根本跑不起来；三个断言"不支持构建必须
+报错"的测试的 `match=` 文案同步更新；`tools/run_chunk_matrix.sh` 的 C=32 leg 不再打印
+`REFUSED`。
+
+### 还剩什么
+
+- C=32 的 K2 比 C=64 慢 0.94 ms（stage 3 现在 2 组各一次 DataCopy、C=64 是 4 组）：
+  若以后要常驻 C=32，值得按 §11.6.5 的描述符账再收一遍；
 - `gram_x` 在 C=16/C=32 构建里仍占一行（`max(1, CHUNK // 2)`），未做 workspace 精简（P1-4）；
 - P1-2 形状矩阵、P1-4 workspace、P2-2 代数重写（唯一能一次砍 20–40% 工作、通向 5 ms 的路线）。

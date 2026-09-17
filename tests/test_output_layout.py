@@ -26,7 +26,16 @@ sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "src"))
 
 from kda_bt16 import kda_bt16_fwd  # noqa: E402
+from kda_ascendc_v1.api import CHUNK  # noqa: E402
 from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental as kda_bt16_fwd_ascendc  # noqa: E402
+
+if CHUNK != 16:
+    pytest.skip("every mode this file pins is a C=16 implementation "
+                "(api.C16_ONLY_K2_MODES), so this build's KDA_CHUNK=%d cannot "
+                "run them; the [B,T,H,D] layout is covered there by "
+                "tests/test_chunk_shape_matrix.py, which compares the whole "
+                "tensor against the fp32 reference" % CHUNK,
+                allow_module_level=True)
 
 
 @pytest.mark.npu

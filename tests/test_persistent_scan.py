@@ -12,6 +12,12 @@ if not (ROOT / "python" / "kda_ascendc_v1").exists():
 sys.path.insert(0, str(ROOT / "python"))
 from kda_ascendc_v1.experimental import get_last_profile, kda_bt16_fwd_ascendc_experimental as kda_bt16_fwd_ascendc
 
+from kda_ascendc_v1.api import CHUNK
+if CHUNK != 16:
+    pytest.skip("C=16-only experiment mode: the persistent_scan kernels carry "
+                "M = 16 as a literal (api.C16_ONLY_K2_MODES), so this build's "
+                "KDA_CHUNK=%d cannot run them" % CHUNK, allow_module_level=True)
+
 torch.npu.set_device(0)
 DEVICE = torch.device("npu:0")
 D = 128

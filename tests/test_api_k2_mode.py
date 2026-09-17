@@ -44,7 +44,7 @@ def _inputs(b, t, h, device, seed=240915):
 def _skip_unless_supported():
     if CHUNK in SUPPORTED_CHUNKS:
         return
-    pytest.skip("KDA_CHUNK=%d is a known-broken build (see api.SUPPORTED_CHUNKS)"
+    pytest.skip("KDA_CHUNK=%d is an unsupported build (see api.SUPPORTED_CHUNKS)"
                 % CHUNK)
 
 

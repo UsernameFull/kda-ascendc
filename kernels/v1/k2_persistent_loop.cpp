@@ -314,12 +314,23 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                         // transpose, done here with explicit block strides
                         // instead of an Nd2Nz that re-packs the row-major
                         // tile.  See the stage-2 store and plan section 11.11.
+                        // The B operand's [K, N] fractal order is row-major
+                        // like the A operand's [M, K]: k band major, value
+                        // band minor, inner stride BV / FR.  So Vt's block
+                        // (nb, kb) has to land at kb * (BV / FR) + nb - the
+                        // walk is over the chunk's K / FR k bands with BV / FR
+                        // bursts each, and *not* over BV / FR groups with a
+                        // BV / FR source stride.  C=16 (NB = 1) and C=64
+                        // (K = BV = 64) cannot tell those two apart, which is
+                        // how the wrong one shipped; C=32 can, and did: there
+                        // it wrote 8 KB into a 4 KB slot and ran 4 KB past qx
+                        // (plan section 11.24).
                         DataCopy(lv[iv * BV * K], Vt[t0], BV * K);
-                        for (int32_t c = 0; c < BV / FR; ++c) {
+                        for (int32_t c = 0; c < K / FR; ++c) {
                             DataCopy(lx[iv * BV * K + c * (BV / FR) * FR * FR],
                                      Vt[t0 + c * FR * FR],
                                      DataCopyParams(BV / FR, FR * FR / 16,
-                                                    (BV / FR) * FR * FR / 16 - FR * FR / 16, 0));
+                                                    (K / FR) * FR * FR / 16 - FR * FR / 16, 0));
                         }
                     }
                 }

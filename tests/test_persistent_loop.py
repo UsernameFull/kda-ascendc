@@ -15,7 +15,7 @@ from kda_ascendc_v1.api import (CHUNK, SUPPORTED_CHUNKS, get_last_profile,
 from kda_ascendc_v1.experimental import kda_bt16_fwd_ascendc_experimental
 
 if CHUNK not in SUPPORTED_CHUNKS:
-    pytest.skip("KDA_CHUNK=%d is a known-broken build (see "
+    pytest.skip("KDA_CHUNK=%d is an unsupported build (see "
                 "api.SUPPORTED_CHUNKS)" % CHUNK, allow_module_level=True)
 
 

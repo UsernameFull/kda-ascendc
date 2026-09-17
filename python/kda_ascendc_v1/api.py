@@ -30,11 +30,12 @@ from kda_ascendc_v1_launcher import launch_argsarray_engine, rtc_compile
 # (SOLVE_WIDE_SUBB = 2) only exists at C >= 64.  Long sequences should build
 # with KDA_CHUNK=64.
 CHUNK = int(os.environ.get("KDA_CHUNK", "16"))
-# Chunk sizes the pipeline is actually checked at.  C=16 and C=64 pass the
-# whole matrix of tests/test_chunk_shape_matrix.py (B = 1/2, H = 2/32/48/96,
-# short and long T, with and without an initial state, plus determinism);
-# C=32 does not, and the failure is not subtle - see _kda_fwd_impl's guard.
-SUPPORTED_CHUNKS = frozenset({16, 64})
+# Chunk sizes the pipeline is actually checked at.  C=16, C=32 and C=64 all
+# pass the whole matrix of tests/test_chunk_shape_matrix.py (B = 1/2,
+# H = 2/32/48/96, short and long T, with and without an initial state, plus
+# determinism); anything else is refused before the RTC compile - see
+# _kda_fwd_impl's guard.
+SUPPORTED_CHUNKS = frozenset({16, 32, 64})
 SOLVE_NCHUNK = 8
 # The wide solve keeps four live [NC, CHUNK, CHUNK] tiles plus the Brcb
 # expansion, so the 192 KB of UB cap NC at 32/16/4 chunks for CHUNK =
@@ -487,20 +488,23 @@ def _kda_fwd_impl(
     remaining modes are checked against the build, because the C=16-only
     kernels would otherwise silently compute a 16-row answer.
     """
-    # Builds that are known to be wrong are refused before anything is compiled
+    # Builds outside the validated set are refused before anything is compiled
     # or launched: a silently wrong answer is the one failure mode this package
     # cannot afford (see C16_ONLY_K2_MODES for the other half of the same rule).
     if CHUNK not in SUPPORTED_CHUNKS and os.environ.get(
             "KDA_ALLOW_UNSUPPORTED_CHUNK", "0") != "1":
         raise ValueError(
-            "KDA_CHUNK=%d is a known-broken build: the matrix that passes 13/13 "
-            "at C=16 and at C=64 fails every case at C=32 (NaN, run-to-run "
-            "drift, and a 1.4 relative error against the fp32 reference with the "
-            "first chunk already wrong).  K1 is cleared - the intra-chunk Gram, "
-            "W and U all match the host at C=32 - so the fault is inside "
-            "k2_persistent_loop's CHUNK=32 path.  Build with KDA_CHUNK=16 or "
-            "KDA_CHUNK=64; set KDA_ALLOW_UNSUPPORTED_CHUNK=1 to run it anyway "
-            "(debugging only)." % CHUNK)
+            "KDA_CHUNK=%d is an unsupported build: the kernels do follow the "
+            "chunk size (M = KDA_CHUNK, and stage 3 contracts over K = M), but "
+            "only the sizes in api.SUPPORTED_CHUNKS (16, 32, 64) are gated by "
+            "the CHUNK x shape correctness matrix in "
+            "tests/test_chunk_shape_matrix.py.  Anything else is unchecked, and "
+            "a tile that is wrong for its chunk size is a silently wrong answer "
+            "here (or a kernel-side aivec error), never a host-side report - "
+            "C=128, for instance, sizes its L0C queue and its L0A allocation to "
+            "exactly 128 KB and 64 KB, the whole of both buffers.  Build with "
+            "KDA_CHUNK=16, 32 or 64; set KDA_ALLOW_UNSUPPORTED_CHUNK=1 to run it "
+            "anyway (debugging only)." % CHUNK)
     global _LAST_PROFILE
     global _LAUNCH_COUNTS, _LAUNCH_BLOCKS
     _LAUNCH_COUNTS = {}

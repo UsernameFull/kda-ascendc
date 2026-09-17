@@ -9,6 +9,12 @@ ROOT=Path(os.environ.get("KDA_ASCENDC_ROOT", Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'python'))
 if not (ROOT / "python" / "kda_ascendc_v1").exists():
     pytest.skip("AscendC v1 sources are not present", allow_module_level=True)
+from kda_ascendc_v1.api import CHUNK
+if CHUNK != 16:
+    pytest.skip("C=16-only experiment mode: these kernels hard-code a 16-row tile "
+                "and the api refuses them at KDA_CHUNK=%d" % CHUNK,
+                allow_module_level=True)
+
 torch.npu.set_device(0); dev=torch.device('npu:0')
 def check(b,t,h):
     torch.manual_seed(7000+b+t+h)

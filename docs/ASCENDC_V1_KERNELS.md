@@ -168,11 +168,14 @@ size they would read 16 rows of a CHUNK-row chunk (fast, plausible, wrong).
 ### `persistent_loop`: the whole K2 recurrence in one launch
 
 It is chunk-generic (`M = KDA_CHUNK`) and is the only K2 the public entry point
-serves.  Note that the C=32 *build* is a known-broken configuration: the
-correctness matrix in `tests/test_chunk_shape_matrix.py` passes 13/13 at C=16
-and C=64 and fails every case at C=32 (NaN, run-to-run drift; K1 was checked
-against the host and is clean, so the fault is in this kernel's CHUNK=32 path).
-`api.SUPPORTED_CHUNKS` therefore refuses it.
+serves, and all three builds the pipeline supports - C=16, C=32 and C=64 -
+pass the matrix in `tests/test_chunk_shape_matrix.py`.  C=32 used to fail every
+case (NaN, run-to-run drift) because stage 3's cross-band load walked the wrong
+band count: it wrote one 16 x 16 block per burst for each of the tile's *value*
+bands, while the d34 B operand's block order needs one burst per *chunk row*
+band, so at C=32 the second of its two bands landed 4 KB past the end of its
+L1 tile.  C=64 could not see it (there the two counts are both 4) - see the
+plan's section 11.24; `api.SUPPORTED_CHUNKS` now carries all three.
 
 `k2_mode="persistent_loop"` runs `d12 -> vnew -> d34 -> outstate` for every
 chunk inside a single `KERNEL_TYPE_MIX_AIC_1_2` launch, so the host-side chunk

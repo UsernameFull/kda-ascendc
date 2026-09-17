@@ -71,7 +71,7 @@ def _assert_unsupported_build_is_refused():
     """
     q = torch.zeros(1, 2 * CHUNK, 1, D)
     with pytest.raises(ValueError,
-                       match="KDA_CHUNK=%d is a known-broken" % CHUNK):
+                       match="KDA_CHUNK=%d is an unsupported build" % CHUNK):
         kda_bt16_fwd_ascendc(q, q, q, q.float(), torch.zeros(1, 2 * CHUNK, 1))
 
 
@@ -79,7 +79,7 @@ def _skip_unless_supported():
     if CHUNK in SUPPORTED_CHUNKS:
         return
     _assert_unsupported_build_is_refused()
-    pytest.skip("KDA_CHUNK=%d is a known-broken build (see api.SUPPORTED_CHUNKS)"
+    pytest.skip("KDA_CHUNK=%d is an unsupported build (see api.SUPPORTED_CHUNKS)"
                 % CHUNK)
 
 
