@@ -1,4 +1,4 @@
-﻿#include "kernel_operator.h"
+#include "kernel_operator.h"
 using namespace AscendC;
 constexpr int32_t BV=64,D=128,M=16,TILE=M*BV;
 extern "C" __global__ __aicore__ void kda_k2_persistent_scan_kernel(

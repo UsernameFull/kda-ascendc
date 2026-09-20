@@ -307,8 +307,17 @@ def _rtc(rel: str, name: str) -> None:
     Every RTC compile of this package has to come through here (see
     ``_defines``); the C=16-only kernels of the S12-S15 experiments ignore the
     prefix, but they get it too so that the invariant is mechanical.
+
+    The source is read as ``utf-8-sig``: a UTF-8 BOM in front of the first
+    ``#include`` is not a warning here but a hard compile error
+    (``unexpected character <U+FEFF>``, followed by every type name in the
+    file turning unknown), and it is invisible in an editor - a BOM once made
+    ``k2_persistent_scan.cpp`` uncompilable with no trace of why.  Reading it
+    away in the one place every compile goes through keeps that from coming
+    back through any of the kernels.
     """
-    rtc_compile(_defines() + (ROOT / rel).read_text(), name, "")
+    rtc_compile(_defines() + (ROOT / rel).read_text(encoding="utf-8-sig"),
+                name, "")
 
 
 _SOURCES: list[tuple[str, str]] = [

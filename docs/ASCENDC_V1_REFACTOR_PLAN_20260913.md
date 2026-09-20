@@ -1445,7 +1445,7 @@ C=64 时两式同值 → 生产路径逐位不变；C=16 走直读分支 → 也
 |---|---|
 | 数值门禁（`/tmp/refcmp_full.py`，T=8192 H=8） | C=32 **与 C=64 逐位同数**：out rel 8.620e-03 abs 5.490e-04 / state rel 4.245e-03 abs 2.453e-03（chunk 不变性直接体现） |
 | `bash tools/run_chunk_matrix.sh` | C=16 / C=32 / C=64 三条腿全 **PASS**（C=32 从 `REFUSED` 变成真 pass） |
-| `pytest tests/`（全目录） | C=32 全过、C=64 全过；C=16 只剩 3 条 `test_persistent_scan.py`（既有问题：`k2_persistent_scan.cpp` 在当前 RTC 工具链下编不过，与本轮无关） |
+| `pytest tests/`（全目录） | C=16 / C=32 / C=64 全过（C=16 那 3 条 `test_persistent_scan.py` 是 `k2_persistent_scan.cpp` 的 UTF-8 BOM 造成的 RTC 编译失败，已在后续修复中清零：v1 源码 BOM 剥离 + `api._rtc` 按 `utf-8-sig` 读取） |
 | 生产 gate（`tools/run_bench_gate.sh`，C=64） | **PASS**：median 8.235 ms（golden 8.003 x 1.05），`o` 9.766e-04 / `state` 4.544e-03 与 golden 一致 |
 | 端到端计时（`/tmp/final2.py`，MIN of 4，同机交替两轮，[1,8192,96,128]） | C=64 **8.477 / 8.464 ms**（pre_gram 3.445 / solve 2.548 / k2 2.462）；C=32 **8.905 / 8.905 ms**（pre_gram 3.189 / solve 2.294 / k2 3.405） |
 

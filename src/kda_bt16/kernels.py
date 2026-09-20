@@ -35,8 +35,8 @@ import triton.language as tl
 _WORKSPACE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
 
 # RCP_LN2 = 1 / ln(2): gate cumsum is carried in the log2 domain.
-_RCP_LN2: tl.constexpr = 1.4426950216
-_EPS: tl.constexpr = 1e-6
+_RCP_LN2 = tl.constexpr(1.4426950216)
+_EPS = tl.constexpr(1e-6)
 _BT = 16
 
 

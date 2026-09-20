@@ -1,4 +1,4 @@
-﻿#include "kernel_operator.h"
+#include "kernel_operator.h"
 using namespace AscendC;
 
 extern "C" __global__ __aicore__ void kda_k2_triton_cube_aic_probe(

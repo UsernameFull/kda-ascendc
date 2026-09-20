@@ -52,6 +52,28 @@ It is inert on CANN releases that still define the old name and only affects
 the `set_device_limit(...)` helper, which the KDA kernels do not call. The
 file is backed up next to the original as `npu_utils.cpp.bak-<timestamp>`.
 
+## 3. `tl.constexpr` annotation rejected
+
+**Symptom** (any launch of a kernel that reads one, including every case of
+`pytest tests/test_torch_reference.py`):
+
+```
+NameError("Cannot access global variable _EPS from within @jit'ed function.
+Triton kernels can only access global variables that are instanstiated as
+constexpr (`x = triton.language.constexpr(42)`). ...")
+```
+
+**Cause**: `src/kda_bt16/kernels.py` declared its module-level constants as
+`_RCP_LN2: tl.constexpr = 1.4426950216` / `_EPS: tl.constexpr = 1e-6`.  The
+*toolkit* version accepted that annotation; the triton-ascend build in use
+does not - it wants the value wrapped in `tl.constexpr(...)`.  The build was
+still runnable by exporting `TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1`, which is
+what earlier sessions did, but that is a debugging escape hatch and not a fix.
+
+**Fix**: the two declarations are now `tl.constexpr(...)` calls, so the kernels
+compile with no environment variable set.  Verified on the 20-case
+`tests/test_torch_reference.py` with the variable unset.
+
 ## Verify
 
 ```bash
