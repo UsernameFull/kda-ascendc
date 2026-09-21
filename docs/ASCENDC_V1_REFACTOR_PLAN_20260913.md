@@ -1469,3 +1469,182 @@ Gram/solve 块），K2 慢 0.94 ms（256 个 chunk 的 flag 与描述符账）�
   若以后要常驻 C=32，值得按 §11.6.5 的描述符账再收一遍；
 - `gram_x` 在 C=16/C=32 构建里仍占一行（`max(1, CHUNK // 2)`），未做 workspace 精简（P1-4）；
 - P1-2 形状矩阵、P1-4 workspace、P2-2 代数重写（唯一能一次砍 20–40% 工作、通向 5 ms 的路线）。
+
+## 11.25. 吞吐侧第二轮：三条候选的实测判决，以及一处落地（2026-09-21）
+
+§11.21 冻结的清单之后，唯一没被实测否掉的吞吐方向是"少算工作"（P2-2 代数重写）。本轮
+把它连同两条相邻路线一起量了，并落地了其中唯一一条干净收益。所有数字都是**同进程交错
+A/B**（K2 单独计时 = 直接重放捕获的 launch args；pre_gram 单独计时 = 同法），因为本机
+绝对值受设备影响（见 §11.26）。
+
+### 1. P2-2 的数学成立，但收益来源是错的（判决：冻结）
+
+**代数复核**（`/tmp/p22_state.py`、`/tmp/p22_shallow.py`）。把 `v_new` 代入它的两个消费者：
+
+```
+o      = scale*(qg @ S^T) + Aqk @ v_new   = R @ S^T + Ao
+S_new  = S*d + v_new^T @ kg               = S*d - S @ G + Ukg
+         R = scale*qg - Aqk@W   Ao = Aqk@u   G = W^T@kg   Ukg = u^T@kg
+```
+
+fp64 恒等式残差 6.245e-17，四个 chunk 常量按 bf16 存储后的数值：
+
+| gate 深度 | max\|G\| | max\|W\| | out_rel | state_rel | 判定（闸门 2e-2） |
+|---|---:|---:|---:|---:|---|
+| near-zero gate | 4.847e-01 | 2.962e-01 | 2.391e-03 | 2.122e-03 | PASS |
+| 浅 gate (LB=-0.5) | 4.151e-12 | 1.645e-01 | 2.505e-03 | 2.907e-03 | PASS |
+| 生产 (LB=-5) | 2.619e-18 | 1.377e-01 | 2.541e-03 | 2.422e-03 | PASS |
+
+深度扫描是**必要的**：第一版只在生产 gate 上跑，`max|G| = 1.6e-16` 说明 `-S@G` 项
+根本没被走到——那是假阳性。补浅 gate 才确认 G 为 O(1) 时也成立。
+
+**收益来源被证伪**（`/tmp/k2hop.py`、`/tmp/k2hop2.py`、`/tmp/k2hop3.py`）。文档 §11.7 的
+`k2_ms ≈ 512 steps x 4 phases x nh x 0.65 us` 模型暗示"四跳降到两跳"能省一半协议时间。
+同进程交错、MIN of 11：
+
+| 变体 | min_ms | Δ | 说明 |
+|---|---:|---:|---|
+| stock | 4.090 | — | 512 head-steps，7.99 µs/step |
+| V0 stock 重新编译 | 4.101 | +0.012 | **噪声底 ±0.014** |
+| V1 2-hop（v_new 折叠后的握手） | 4.050 | **−0.039** | 不是一半协议时间 |
+| V3 所有跨核 flag 全删 | 4.404 | **+0.314** | 反而更慢 |
+| V4 删两个 v_new store | 3.967 | −0.123 | |
+| V4b 删 store + 16 次 Transpose | 3.877 | **−0.214** | 结构地板 |
+
+两条读数：**V3 是决定性的**——把跨核 flag 全删掉 K2 反而慢 0.314 ms，与 §11.7 那句
+"handshakes coarsened 16/step → 4/step = 12.14（更慢）"同现象：这些 flag 不是同步开销，
+而是**给两个引擎让出节奏**。所以 hop 数不是可优化维度，§11.7 的相位模型在 2.46 ms 形态下
+已经失效。**P2-2 的代价仍然是 +0.3 ms 流量（G+Ukg 各 32 KB/chunk-head = 786 MB 往返），
+净收益为负。**
+
+### 2. 方案 C（host 侧预排 chunk 连续布局）：负的（判决：冻结）
+
+思路：把 q/k/v/g 在 host 端 permute 成 chunk 连续，让 kernel 的 gather 变成连续读。先量
+**kernel 侧上界**——把四次 `DataCopyPad` 的行间距改成 0（数值会错，只读时间）：
+
+| | min_ms | median |
+|---|---:|---:|
+| stock | 4.182 | 4.191 |
+| 连续读 | 4.160 | 4.178 |
+| **差值** | **−0.022** | ← 噪声量级 |
+
+host 侧预排实测 **2.104 ms**（2.01 GB 搬运）。**净 −2.082 ms。** 与 §11.12 的
+"1 GB 流量只值 0.2 ms"完全一致：C=64 时读全在 L2，gather 形态无所谓。
+
+### 3. pre_gram 的 pass 边界：找到 0.230 ms，但收不了（判决：冻结）
+
+§11.12 把 pass 边界的整机排水记成 0.54 ms；§11.13 用两对自配对事件 marker 替掉了它。
+本轮量的是**替掉之后还剩多少**（`/tmp/passmark.py`，MIN of 11）：
+
+| 变体 | min_ms | Δ |
+|---|---:|---:|
+| stock | 4.171 | — |
+| V0 重新编译 | 4.165 | −0.006（噪声底） |
+| D1 删 load 侧 `V_MTE2` marker | 4.150 | **−0.021** |
+| **D2 删 store 侧 `MTE3_V` marker** | **3.941** | **−0.230** |
+| D3 删 `FL_DONE` 等待 | 4.157 | −0.014 |
+| D4 两个 marker 都删 | 3.935 | −0.236 |
+
+**D4 ≈ D2** → load 侧那对已经是死的。**D3 是过期数字**：§11.20 记的 0.167 ms 现在只值
+0.014，后续改动早已把它盖住，该条从待办划掉。
+
+**D2 的 0.230 ms 收不了**（`/tmp/d2num.py`）。按仓库规矩"先看逐位一致，再看时间"，
+删掉 marker 后跑全流程 diff 全部中间张量：
+
+```
+Rv 3.145e-01   U 3.203e-01   Vnew/VnewT 3.203e-01   out 5.830e-03
+A16/A32 4.932e-02   L 4.949e-02   Aqk 1.364e-02   W 1.4e-15
+```
+
+**marker 是负载承载的。** 安全收掉它需要把跨 pass 复用的 4 个 tile
+（`qgb/kgb/rkb/rvbo`）双缓冲 = **16 KB**，而实测 UB 余量只有 **4 KB**：
+
+| 量法 | 结果 |
+|---|---|
+| 新加 1 KB dummy | FAIL（新分配有额外对齐开销） |
+| 扩大已有活 buffer（`bEf`） | +4 KB OK，**+5 KB FAIL** |
+| 名义账（逐个 `InitBuffer` 求和） | 185.34 KB / 192 → 6.66 KB |
+
+唯一能腾 16 KB 的大块是 `bT0`（整 chunk gate，32 KB），但它**切不了**：`gf` 的读者里
+cumsum 需要整 chunk 的顺序链、`kg` 需要第 `M-1` 行、`XBAND` 需要第 `MID0+BS` 行。按 band
+切就得每 band 重跑 cumsum，而 cumsum 实测 0.225 ms → **净收益 ≈ 0**，还引入跨 band 进位
+的正确性风险。
+
+### 4. 落地：`V` 死 store 的守卫
+
+`k2_persistent_loop.cpp` 每个 chunk-head 写**两份** `v_new`：`V`（row-major `[M, BV]`）
+和 `Vt`（packed 块序）。grep 证实**这份 kernel 从不读 `V`**——AIC 的每个操作数都取自
+`Vt`（stage 1/3），唯一的消费者是 host，且只在 `return_intermediates` 下。所以按
+`k1_pre_gram_mix.cpp` 的 `pQn/pKn` 模式加守卫：
+
+```cpp
+if (pVnew != nullptr) DataCopy(V[out0], vb, DataCopyParams(M, BV / 16, 0, 0));
+```
+
+`api.py` 生产路径传 `nullptr`，只在 `return_intermediates` 时分配（顺带省掉 201 MB 分配）。
+
+| 量法 | old | new | Δ |
+|---|---:|---:|---:|
+| K2 单独（捕获 args 重放，MIN of 11 交错） | 4.088 | 4.017 | **−0.070** |
+| 端到端（同进程交错，MIN of 9） | 14.583 | 14.467 | **−0.117** |
+
+逐位一致（`return_intermediates` 下 out/state diff = 0.000e+00，Vnew 仍可读出）；
+`bash tools/run_chunk_matrix.sh` C=16/32/64 三腿全 **PASS**；
+`test_persistent_loop.py` / `test_c64_gate_overflow.py` / `test_output_layout.py` /
+`test_api_k2_mode.py` 全 PASS。
+
+### 5. 本轮之后还剩什么
+
+| 方向 | 上界 | 状态 |
+|---|---:|---|
+| P2-2 代数重写 | 相位零收益，代价 +0.3 ms | **冻结** |
+| 方案 C host 预排 | −2.082 ms（负） | **冻结** |
+| K1 pass 双缓冲 | 0.230，需 16 KB | **冻结**（UB 只有 4 KB，腾空间的代价 ≈ 收益） |
+| K1 更多工作搬给空闲 Cube | 0.05–0.3 | 只剩零头（gate cumsum ~0.05） |
+| solve 重叠深度 | 0.6 | 只能靠 slice 粒度重构 |
+
+到 5 ms 量级仍然需要一次"少算 40%"级别的算法或精度改动（§11.17 的结论未变），而 P2-2
+这条唯一的候选路线已在本轮被证伪。
+
+## 11.26. 本机绝对时间为什么与 golden 差 1.35x——以及一个测量口径的坑（2026-09-21）
+
+排查一次"端到端 14 ms vs golden 8.0 ms"的表象，结论：**三个因素叠加，前两个是口径问题。**
+
+**① 探针的 `KDA_PROFILE=1` 代价 +2.94 ms。** 它每个 stage 边界做一次
+`torch.npu.synchronize()`，阻断 host 对下一段的预投：
+
+```
+KDA_PROFILE=1   wall 14.179   (pre_gram 4.303 + solve 4.924 + k2 4.019 = 13.246)
+KDA_PROFILE=0   wall 11.240
+差               +2.939 ms
+```
+
+**② 单调用 `perf_counter` 取 MIN 不等于仓库口径。** 生产 benchmark 用
+`triton.testing.do_bench`（warmup 100 ms / rep 1000 ms，报中位数与 p20/p80）。
+`bench_fla_compare.py --gate` 同机同 build 读数 **10.773 ms（p20 10.745 / p80 10.808）**
+——p20 与 p80 只差 0.06 ms，说明这一次测量内部很稳，10.773 是可信的当前值。
+
+**③ 设备不同。** golden 记录于 `Ascend910_9382`，现在跑在 `Ascend910B3`；bench 自己
+就会打印 `note: device Ascend910B3 != golden's Ascend910_9382 (timings are
+device-specific)`。本机负载在 9–183 之间波动，同一天同一份代码量到过 18.9 ms
+（`/tmp/segA_hsweep.log`）和 10.8 ms。
+
+**口径规则（写给未来的自己）**：
+
+- 与 golden 比绝对时间只在**同设备**下有意义；跨设备只能比同一格式内的比值；
+- 报"优化了多少"必须用**同进程交错 A/B**，噪声底用"stock 重新编译一遍"标定
+  （本轮 K2 的底是 ±0.014 ms，pre_gram 是 ±0.006 ms）；
+- 阶段计时一律带 `KDA_PROFILE=1` 说明，别把它当端到端时间报。
+
+**分段对照**（golden vs 本机同口径，比值仅供参考）：
+
+| stage | golden | now | 比值 |
+|---|---:|---:|---:|
+| pre_gram | 3.226 | 4.300 | 1.33x |
+| solve | 2.508 | 5.057 | 2.02x |
+| k2 | 2.440 | 4.082 | 1.67x |
+| total | 8.003 | 10.773 | 1.35x |
+
+`solve` 的 2.02x 与已落地的改动无关（本轮只动了 K2 的 `V` store，solve 不碰那份 kernel），
+且同一天的日志里 solve 量到过 2.495 ms（与 golden 的 2.508 几乎一致）——solve 靠 AIV/AIC
+双流重叠，负载高时重叠最先受损，符合"设备/负载差异"而非回归。

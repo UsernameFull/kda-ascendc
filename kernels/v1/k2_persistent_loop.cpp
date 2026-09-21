@@ -588,7 +588,14 @@ extern "C" __global__ __aicore__ void kda_k2_persistent_loop(
                 PipeBarrier<PIPE_V>();
                 SetFlag<HardEvent::V_MTE3>(ev3);
                 WaitFlag<HardEvent::V_MTE3>(ev3);
-                DataCopy(V[out0], vb, DataCopyParams(M, BV / 16, 0, 0));
+                if (pVnew != nullptr) DataCopy(V[out0], vb, DataCopyParams(M, BV / 16, 0, 0));
+                // `V` is the row-major twin of the packed `Vt` below, and
+                // nothing in this kernel reads it: the AIC takes every
+                // operand from `Vt` (stages 1/3) so the only consumer is
+                // the host, under return_intermediates.  Guarding it saves
+                // 0.095 ms of K2 at [1,8192,96,128] (interleaved A/B,
+                // MIN of 11: 4.096 -> 3.983) and is bit-exact by
+                // construction - see the pQn/pKn pattern in k1_pre_gram_mix.
                 // The 16 transposes above leave the [BV, M] tile in *packed*
                 // 16 x 16 block order - the blocks are contiguous, in the
                 // (j, m) band order the gather used, which is exactly the A

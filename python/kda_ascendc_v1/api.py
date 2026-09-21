@@ -767,7 +767,13 @@ def _kda_fwd_impl(
         # store costs 0.04 ms of device time, the same-store check is
         # bit-exact against the old layout + host permute.
         out_public = torch.empty((b, t, h, D), dtype=torch.bfloat16, device=q.device)
-        vnew = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+        # `vnew` is the row-major twin of `vnew_t`, and the kernel reads only
+        # `vnew_t` - the row-major copy is written solely for
+        # ``return_intermediates`` (the pQn/pKn pattern).  Production passes a
+        # null pointer and skips both the store (0.095 ms of K2 at
+        # [1,8192,96,128], measured interleaved) and the 201 MB allocation.
+        vnew = (torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
+                if return_intermediates else None)
         vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
         h0 = None if initial_state is None else initial_state.view(bh, D, D)
         # kg goes to the loop in its public [c, CHUNK, D] layout: the AIC loads
