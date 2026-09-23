@@ -219,17 +219,41 @@ def a16_mode() -> int:
 
 
 def asm_load_mode() -> int:
-    """L1 load shape for the coupling block (kda_solve_assemble).
+    """Load and intermediate shape for the coupling block (kda_solve_assemble).
 
-    0 is the shipped form: one B1 queue per operand, six ND2NZ calls per chunk.
-    1 batches the same bytes - one call per block for the A operand, a chunk's
-    two B bands merged, and pass 1's whole B operand in one call.  Both land
-    byte-identical operands in L1 (tools/probe_solve_assemble_coalesce.py
-    checks P and A16 are equal before it times either), so this is a scheduling
-    knob, not a numeric one.  Read per call rather than frozen at import so a
-    probe can flip it between two arms of one process.
+    0 is the shipped form: one B1 queue per operand, six ND2NZ calls per chunk,
+    and P through its own GM tile.  1 batches the same bytes - one call per
+    block for the A operand, a chunk's two B bands merged, and pass 1's whole B
+    operand in one call.  2 is 1 plus P on chip: pass 0's fixpipe writes P into
+    L1 in NZ instead of GM and pass 1 builds L0B from it, which drops the tile's
+    50.3 MB (151.0 -> 100.7 MB per call).  2 is production: measured in
+    tools/probe_solve_assemble_loads.py at [1,8192,96,128], the three arms come
+    out 0.902 / 0.692 / 0.512 ms isolated, AIC 2.614 / 2.305 / 2.197 and e2e
+    10.624 / 10.445 / 10.408 ms.  All three land byte-identical
+    operands (tools/probe_solve_assemble_coalesce.py and
+    tools/probe_solve_assemble_l1p.py check P and A16 are equal before timing
+    anything), so this is a scheduling knob, not a numeric one.  Read per call
+    rather than frozen at import so a probe can flip it between arms of one
+    process.
     """
-    return int(os.environ.get("KDA_ASM_LOADS", "1"))
+    return int(os.environ.get("KDA_ASM_LOADS", "2"))
+
+
+def cube_a16_resident() -> int:
+    """A16 residency for the solve's Cube kernel (kda_solve_wu_cube_kernel).
+
+    0 re-reads the block's A16 tile at the top of each of the two passes - the
+    second read is an L2 hit (docs section 11.35 priced it at 0.070 ms).  1
+    keeps the block's NC tiles in L1 for both passes, which is the same bytes
+    of L1 as the queue it replaces.  1 is production: measured in
+    tools/probe_solve_cube_a16_resident.py at [1,8192,96,128], the cube half
+    goes 1.577 -> 1.511 ms and the stage 2.346 -> 2.327, with the pipeline
+    bit-identical (a first attempt at this mode spun the block - its slots were
+    still AllocTensor'd, which the kernel header records).  Read per call so a
+    probe can flip it between two arms of one process; the arithmetic is
+    identical either way.
+    """
+    return int(os.environ.get("KDA_CUBE_A16_RESIDENT", "1"))
 
 
 def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
@@ -275,7 +299,8 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
                             lneg[lo:]]) + [_i(n), _i(a16_mode()), _i(1 if debug_stores else 0)]
         aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:], pmid[lo:]]) + \
             [_i(n), _i(asm_load_mode())]
-        cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + [_i(n)]
+        cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + \
+            [_i(n), _i(cube_a16_resident())]
         ncube = min(n, c - lo)
         if ovl:
             _launch("kda_solve_wu_wide", n // nch, wargs, sa.npu_stream)
@@ -735,7 +760,8 @@ def _kda_fwd_impl(
         # The Cube needs the bf16 A_inv the substitution just wrote, so the two
         # launches stay ordered on the stream.
         _launch("kda_solve_wu_cube_kernel", (c + WU_NCHUNK - 1) // WU_NCHUNK,
-                _pack_ptrs([a16, rk, rv, W, U]) + [_i(c)], stream)
+                _pack_ptrs([a16, rk, rv, W, U]) + [_i(c), _i(cube_a16_resident())],
+                stream)
     finish("solve_ms", "solve_start")
 
     # Historical name: ``persistent_scan_cube`` has always been served by the

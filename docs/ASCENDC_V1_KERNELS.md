@@ -87,20 +87,39 @@ path.  Both operands go in through `Nd2Nz` (whole tile for A, per-band for B,
 which `LoadDataWithTranspose` wants band-major), and the load *pattern* is a
 runtime argument (`api.asm_load_mode()`, `KDA_ASM_LOADS`, read per call):
 
-* `1` (production, docs section 11.37) - one explicit B1 buffer per operand and
-  the same bytes in fewer calls: the A operand's `NC` tiles in one `Nd2Nz`
+* `1` (docs section 11.37) - one explicit B1 buffer per operand and the same
+  bytes in fewer calls: the A operand's `NC` tiles in one `Nd2Nz`
   (`ndNum = nch`; `Lneg` is chunk-contiguous and `Xb`'s pass-1 block is `2*MM`
   apart), a chunk's two B bands merged (`ndNum = KF`), and pass 1's whole B
   operand in one call (`ndNum = KF*nch` - `P` is chunk-contiguous).  1 + NC
-  calls for pass 0 and 2 for pass 1, against 3 per chunk.  Outputs are
-  bit-identical to mode 0 and it is 0.189 ms off the kernel (0.846 -> 0.657 ms
-  at `[1,8192,96,128]`, 0.178 off the stage).
+  calls for pass 0 and 2 for pass 1, against 3 per chunk.
+* `2` (production; docs section 11.39) - mode 1 plus `P` on chip: pass 0's
+  fixpipe writes `P` into an L1 tile in `CFG_NZ` instead of its own GM tile and
+  pass 1 builds L0B from that region, so the GM tile is neither written nor
+  read (151.0 -> 100.7 MB per call).  The NZ fractals come out `[n-block]
+  [k-block]` where the `Nd2Nz` band-major source was `[k-block][n-block]`, so
+  the four 16x16 fractals enter L0B in the order 0, 2, 1, 3; the probe checks
+  A16 is bit-identical, which is what verifies that mapping.  Measured at
+  `[1,8192,96,128]`: ASM 0.866 / 0.665 / 0.513 ms for the three modes, AIC
+  2.552 / 2.242 / 2.141, stage 2.505 / 2.323 / 2.322, e2e 10.593 / 10.418 /
+  10.408 ms, all bit-identical.
 * `0` - the shipped per-chunk queue form.  Its L1 queue has to be `NC` deep:
   the loads of a whole pass are issued before its arithmetic starts, and a
   2-deep queue **deadlocks** on the third `AllocTensor` (measured:
   `KDA_ASM_NCHUNK = 2` runs, 4 and 8 hang the block).  That depth constraint is
   the queue's; mode 1 has an explicit buffer and no such depth, so re-testing
   `KDA_ASM_NCHUNK = 6/8` is open again.
+
+`kda_solve_wu_cube_kernel` reads the same A16 tiles in both of its passes, and
+a second argument (`api.cube_a16_resident()`, `KDA_CUBE_A16_RESIDENT`, read per
+call, production `1`) says whether the block keeps them: `0` reloads per pass
+through the `qa` queue, `1` fills one L1 buffer of `NC * M * K * 2` bytes once
+and both passes read it (docs section 11.38; the second read is an L2 hit, so
+the earlier bandwidth projection overpriced it).  Mode 1 must not draw from
+`qa` at all - slots that are `AllocTensor`'d but never `EnQueue`'d still leave
+the queue, and the second pass then hangs (measured: the block spins at 100%
+AICore).  The mode is bit-identical to `0`, worth 0.066 ms of the cube and 0.019
+of the stage.
 
 Numerically the two-level path is a *bf16 chain*: `Xb` and `Lneg` are bf16, `P`
 is bf16, and the parent tile is bf16.  Against the fp64 inverse of the same

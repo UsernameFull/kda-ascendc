@@ -41,6 +41,16 @@
 //           call per block, a chunk's two B bands merged (ndNum = KF), and in
 //           pass 1 the whole block's B operand in one 8 KB call.  Pass 0 is
 //           1 + NC calls and pass 1 is 2, against 3 * NC each.
+//   mode 2  mode 1 plus P on chip (docs section 11.39): pass 0's fixpipe
+//           writes P into L1 in NZ (CFG_NZ, the same F322BF16 quantization)
+//           instead of its own GM tile, pass 1 builds L0B from that region
+//           with LoadDataWithTranspose, and the GM tile is neither written nor
+//           read - 100.7 MB per call instead of 151.0, and the probe measured
+//           0.096 ms of the round trip's 0.107 ms ceiling.  The NZ fractal
+//           order is [n-block][k-block] where the Nd2Nz band-major source was
+//           [k-block][n-block], so the four 16x16 fractals go into L0B in the
+//           order 0, 2, 1, 3 - A16 is bit-identical to mode 0, which is what
+//           says the mapping is right.
 //
 // Both paths are the same arithmetic in the same L1 layout;
 // tools/probe_solve_assemble_coalesce.py checks the two are bit-identical
@@ -78,7 +88,8 @@ constexpr int32_t SLOTS = PASSES * NC;  // one L0 slot per (pass, chunk) unit
 
 // One chunk's L0 chain and store, shared by both load paths.
 static __aicore__ inline void assemble_chunk(
-    int32_t pass, int32_t slot, LocalTensor<bfloat16_t> la, LocalTensor<bfloat16_t> lb,
+    int32_t pass, int32_t slot, bool onchip, LocalTensor<bfloat16_t> la,
+    LocalTensor<bfloat16_t> lb, LocalTensor<bfloat16_t> lp,
     LocalTensor<uint8_t>& a8, LocalTensor<uint8_t>& b8, LocalTensor<float>& cfall,
     GlobalTensor<bfloat16_t>& P, GlobalTensor<bfloat16_t>& A16,
     int32_t c0, int32_t ch, TEventID e1m, TEventID emf) {
@@ -90,7 +101,21 @@ static __aicore__ inline void assemble_chunk(
                      LoadData2dParams(0, 1, 1, 0, 0, false, 0));
         }
     }
-    LoadDataWithTranspose(b, lb, LoadData2dTransposeParams(0, KF * KF, 1, 0, 0));
+    if (pass == 0 || !onchip) {
+        LoadDataWithTranspose(b, lb, LoadData2dTransposeParams(0, KF * KF, 1, 0, 0));
+    } else {
+        // P out of L1 in NZ order: the four 512-byte fractals are ordered
+        // [n-block][k-block] instead of the Nd2Nz source's [k-block][n-block],
+        // so L0B's slots take source blocks 0, 2, 1, 3.
+        const int32_t src = ch * MM;
+        LoadDataWithTranspose(b, lp[src], LoadData2dTransposeParams(0, 1, 1, 0, 0));
+        LoadDataWithTranspose(b[2 * 256], lp[src + 256],
+                              LoadData2dTransposeParams(0, 1, 1, 0, 0));
+        LoadDataWithTranspose(b[1 * 256], lp[src + 512],
+                              LoadData2dTransposeParams(0, 1, 1, 0, 0));
+        LoadDataWithTranspose(b[3 * 256], lp[src + 768],
+                              LoadData2dTransposeParams(0, 1, 1, 0, 0));
+    }
     SetFlag<HardEvent::MTE1_M>(e1m);
     WaitFlag<HardEvent::MTE1_M>(e1m);
     LocalTensor<float> cf = cfall[slot * MM];
@@ -102,7 +127,12 @@ static __aicore__ inline void assemble_chunk(
     auto ip = FixpipeParamsV220(M, M, M, (pass == 0) ? M : PC, false);
     ip.quantPre = QuantMode_t::F322BF16;
     ip.unitFlag = 0;
-    if (pass == 0) {
+    if (pass == 0 && onchip) {
+        auto ipnz = FixpipeParamsV220(M, M, M, M, false);
+        ipnz.quantPre = QuantMode_t::F322BF16;
+        ipnz.unitFlag = 0;
+        Fixpipe<bfloat16_t, float, CFG_NZ>(lp[ch * MM], cf, ipnz);
+    } else if (pass == 0) {
         Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(
             P[static_cast<uint64_t>(c0 + ch) * MM], cf, ip);
     } else {
@@ -119,6 +149,7 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     if (c0 >= C) return;
     const int32_t nch = ((C - c0) < NC) ? (C - c0) : NC;
     const bool batched = (loadMode != 0);
+    const bool onchip = (loadMode >= 2);
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
@@ -136,6 +167,12 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     TBuf<TPosition::B1> bufA, bufB;
     pipe.InitBuffer(bufA, NC * LBSZ);
     pipe.InitBuffer(bufB, NC * LBSZ);
+    // Mode 2's P tiles, one [M, M] bf16 per chunk of the block (8 KB at NC = 4,
+    // M = 32): written by pass 0's fixpipe, read by pass 1's L0B fill.  It
+    // replaces the GM round trip, not L1 - the buffer only exists when the mode
+    // is on, so mode 0/1 leave it as 8 KB of unused L1.
+    TBuf<TPosition::B1> bufP;
+    pipe.InitBuffer(bufP, NC * LBSZ);
     // One L0 slot per (pass, chunk) unit: 2 * NC * 4 KB = 32 KB of the 128 KB
     // L0C, 16 KB of each of the 64 KB L0A/L0B.
     LocalTensor<float> cfall(TPosition::CO1, 0, SLOTS * MM);
@@ -148,6 +185,7 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     P.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pP));
     LocalTensor<bfloat16_t> laAll = bufA.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> lbAll = bufB.Get<bfloat16_t>();
+    LocalTensor<bfloat16_t> lpAll = bufP.Get<bfloat16_t>();
 
     for (int32_t pass = 0; pass < PASSES; ++pass) {
         if (batched) {
@@ -168,14 +206,19 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
             } else {
                 DataCopy(laAll, Xb[static_cast<uint64_t>(c0) * 2 * MM + MM],
                          Nd2NzParams(nch, M, M, 2 * MM, M, M, 1, MM));
-                DataCopy(lbAll, P[static_cast<uint64_t>(c0) * MM],
-                         Nd2NzParams(KF * nch, 16, M, BANDE, M, 16, 1, BANDE));
+                if (!onchip) {
+                    // Mode 2 has no P in GM: pass 1's B operand comes from the
+                    // L1 tiles pass 0's fixpipe just wrote.
+                    DataCopy(lbAll, P[static_cast<uint64_t>(c0) * MM],
+                             Nd2NzParams(KF * nch, 16, M, BANDE, M, 16, 1, BANDE));
+                }
             }
             SetFlag<HardEvent::MTE2_MTE1>(e21);
             WaitFlag<HardEvent::MTE2_MTE1>(e21);
             for (int32_t ch = 0; ch < nch; ++ch) {
-                assemble_chunk(pass, pass * NC + ch, laAll[ch * MM], lbAll[ch * MM],
-                               a8, b8, cfall, P, A16, c0, ch, e1m, emf);
+                assemble_chunk(pass, pass * NC + ch, onchip, laAll[ch * MM],
+                               lbAll[ch * MM], lpAll, a8, b8, cfall, P, A16,
+                               c0, ch, e1m, emf);
             }
         } else {
             for (int32_t ch = 0; ch < nch; ++ch) {
@@ -210,8 +253,8 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
             for (int32_t ch = 0; ch < nch; ++ch) {
                 auto la = qa.DeQue<bfloat16_t>();
                 auto lb = qb.DeQue<bfloat16_t>();
-                assemble_chunk(pass, pass * NC + ch, la, lb, a8, b8, cfall, P, A16,
-                               c0, ch, e1m, emf);
+                assemble_chunk(pass, pass * NC + ch, false, la, lb, lpAll, a8, b8,
+                               cfall, P, A16, c0, ch, e1m, emf);
                 qa.FreeTensor(la);
                 qb.FreeTensor(lb);
             }

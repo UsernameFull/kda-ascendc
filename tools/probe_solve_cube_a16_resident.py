@@ -1,28 +1,23 @@
-"""The assemble's batched load path (plan 11.37), measured in production.
+"""The Cube solve's A16 re-read (plan 11.38), measured in production.
 
-The coalescing probe (kernels/v1/k1_solve_assemble_coalesce_probe.cpp) held the
-bytes fixed at 100.7 MB and varied only the call count: 6 calls per chunk
-(0.313 ms of traffic alone), 4 with the two B bands merged (0.252), 2.5 with the
-A operand batched over the block (0.217), and 0.157 for the re-laid-out ceiling.
-It also separated the two L1 structures, and the pairing that wins is the
-batched calls *with* an explicit buffer rather than the shipped queue: 0.531 vs
-0.606 ms for the same calls, against 0.706 ms for the shipped structure overall
-- and P/A16 were bit-identical in all of them.
+Section 11.35 built the candidate in a transcription of the kernel and priced it
+at 0.070 ms (1.465 -> 1.395 ms: the block's A16 tile read once instead of once
+per pass; only the second read is worth removing, and it is an L2 hit at
+1439 GB/s marginal against the first read's 839 GB/s cold rate).  This is the
+same candidate in ``kda_solve_wu_cube_kernel`` itself, which is what decides it:
+the kernel now takes a second argument (api.cube_a16_resident(),
+KDA_CUBE_A16_RESIDENT, read per call so one process can flip it) and the arms
+are
 
-This probe is that candidate in the production kernel, which is what decides it:
-`kda_solve_assemble` now takes a second argument (api.asm_load_mode(),
-KDA_ASM_LOADS, read per call so one process can flip it) and the arms are
+  mode 0  the block's A16 re-read at the top of each pass
+  mode 1  the block's A16 kept in L1 for both passes (NC * M * K * 2 bytes of
+          L1, the same bytes as the queue it replaces)
 
-  mode 0  shipped: per-chunk queue, six ND2NZ calls per chunk, P through GM
-  mode 1  batched: explicit B1 buffers, 1 + NC calls for pass 0 and 2 for pass 1
-  mode 2  batched plus P on chip (section 11.39): pass 0's fixpipe writes P into
-          L1 in NZ, pass 1 builds L0B from it, and the GM tile is untouched
+Both are the same arithmetic on the same operands, so the probe first checks
+the *outputs* are identical (not just close), then measures e2e round-robin, the
+isolated solve replays, and the profiled stage.
 
-Both are the same arithmetic and land byte-identical operands in L1, so the
-probe first checks the *outputs* are identical (not just close), then measures
-e2e round-robin, the isolated solve replays, and the profiled stage.
-
-  KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=1 python3 -u tools/probe_solve_assemble_loads.py
+  KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=1 python3 -u tools/probe_solve_cube_a16_resident.py
 """
 from __future__ import annotations
 
@@ -43,9 +38,8 @@ import kda_ascendc_v1.api as api  # noqa: E402
 
 D, DEV = 128, torch.device("npu:0")
 B, T, H = 1, 8192, 96
-MODES = [(0, "shipped (queue, P in GM)"), (1, "batched (P in GM)"),
-         (2, "batched, P via L0C->L1->L0B")]
-ENV = "KDA_ASM_LOADS"
+MODES = [(0, "A16 per pass (shipped)"), (1, "A16 resident in L1")]
+ENV = "KDA_CUBE_A16_RESIDENT"
 
 
 def inputs():

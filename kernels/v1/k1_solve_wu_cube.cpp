@@ -12,6 +12,16 @@
 // One AIC block handles NCHUNK chunks: the matmul itself is far too small to
 // hide a block's fixed cost (measured 1.26 us per block at [1,8192,32]), so the
 // loads of every chunk are issued up front and the mmads follow.
+//
+// A16 residency (docs section 11.38): both passes of a block read the same
+// A16 tiles, so `a16Mode` (api.cube_a16_resident(), KDA_CUBE_A16_RESIDENT,
+// read per call) picks whether the second read happens at all.  0 keeps the
+// shipped per-pass load through the qa queue; 1 fills one L1 buffer of
+// NC * M * K * 2 bytes once, before the pass loop, and both passes read it.
+// The candidate is the second pass's read only - section 11.35 measured it as
+// an L2 hit at 1439 GB/s marginal against the first read's 839 GB/s cold rate,
+// which is why the transcription priced the whole thing at 0.070 ms rather
+// than the 0.16 a flat bandwidth projection gave.
 #include "kernel_operator.h"
 using namespace AscendC;
 #ifndef KDA_CHUNK
@@ -26,11 +36,18 @@ constexpr int32_t DF = D / 16;
 constexpr int32_t NC = KDA_WU_NCHUNK;
 
 extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
-    GM_ADDR pA16, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pW, GM_ADDR pU, int32_t C) {
+    GM_ADDR pA16, GM_ADDR pRk, GM_ADDR pRv, GM_ADDR pW, GM_ADDR pU, int32_t C,
+    int32_t a16Mode) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
     const int32_t c0 = GetBlockIdx() * NC;
     if (c0 >= C) return;
     const int32_t nch = ((C - c0) < NC) ? (C - c0) : NC;
+    // a16Mode (docs section 11.38): 0 re-reads the block's A16 tile at the top
+    // of each of the two passes, 1 keeps the block's NC tiles in L1 for both.
+    // tools/probe_solve_cube_a16.py priced the candidate at 0.070 ms in a
+    // transcription of this kernel; tools/probe_solve_cube_a16_resident.py is
+    // the same candidate in the kernel itself, which is what decides it.
+    const bool a16res = (a16Mode != 0);
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
@@ -38,6 +55,10 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
     TQue<QuePosition::B1, NC> qa, qb;
     pipe.InitBuffer(qa, NC, M * K * 2);
     pipe.InitBuffer(qb, NC, D * K * 2);
+    // a16Mode 1's resident copy: the same NC * M * K * 2 bytes as the qa queue
+    // it replaces, filled once per block instead of once per pass.
+    TBuf<TPosition::B1> bufA16;
+    pipe.InitBuffer(bufA16, NC * M * K * 2);
     // One L0C slot per (pass, chunk) unit: 2 * NC * 8 KB = 64 KB of the 128 KB
     // L0C.  Slots are never reused inside a block, so no FIX_M -> M ordering is
     // needed between a Fixpipe and the next Mmad; with the old NC-deep queue
@@ -46,6 +67,7 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
     LocalTensor<float> cfall(TPosition::CO1, 0, 2 * NC * M * D);
     LocalTensor<uint8_t> a8(TPosition::A2, 0, 2 * NC * M * K * 2);
     LocalTensor<uint8_t> b8(TPosition::B2, 0, 2 * NC * D * K * 2);
+    LocalTensor<bfloat16_t> a16l1 = bufA16.Get<bfloat16_t>();
     GlobalTensor<bfloat16_t> A16, Rk, Rv, W, U;
     A16.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pA16));
     Rk.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pRk));
@@ -53,23 +75,56 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
     W.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pW));
     U.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(pU));
 
+    if (a16res) {
+        // One read of the block's A16 for both passes - the second pass's read
+        // is the L2 hit section 11.35 priced at 0.070 ms.
+        for (int32_t ch = 0; ch < nch; ++ch) {
+#if KDA_CHUNK > 16
+            DataCopy(a16l1[ch * M * K], A16[static_cast<uint64_t>(c0 + ch) * M * K],
+                     Nd2NzParams(1, M, K, 0, K, M, 1, 0));
+#else
+            DataCopy(a16l1[ch * M * K], A16[static_cast<uint64_t>(c0 + ch) * M * K], M * K);
+#endif
+        }
+        SetFlag<HardEvent::MTE2_MTE1>(e21);
+        WaitFlag<HardEvent::MTE2_MTE1>(e21);
+    }
     for (int32_t pass = 0; pass < 2; ++pass) {
         // Issue every chunk's L1 load before touching L0: the GM round trips of
         // one chunk then overlap the arithmetic of the previous one.  Each pass
         // loads its own right-hand side (pass 0 = rk -> W, pass 1 = rv -> U).
         for (int32_t ch = 0; ch < nch; ++ch) {
-            auto la = qa.AllocTensor<bfloat16_t>();
+            // a16Mode 1 must not draw from qa at all: slots that are
+            // AllocTensor'd but never EnQueued are still taken out of the
+            // queue, and the second pass then blocks on it (measured: the
+            // kernel spins at 100% AICore instead of failing).
+            if (!a16res) {
+                auto la = qa.AllocTensor<bfloat16_t>();
+#if KDA_CHUNK > 16
+                // One whole-tile call, whose dstNzC0Stride = nValue layout is
+                // column-block-major (probe /tmp/nzprobe.py), so the L0A read
+                // below crosses its indices.  That crossing is free; the
+                // per-band form would be KF calls and a "Nd2Nz-shaped" copy
+                // costs ~600 ns more per call than the plain one on this part
+                // (measured at KDA_CHUNK = 16: 8 such calls per block are worth
+                // 2.6 ms of the 4.4 ms solve), and this kernel is wave-bound.
+                DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K],
+                         Nd2NzParams(1, M, K, 0, K, M, 1, 0));
+#else
+                // KF == 1 (the 16-row chunk): the band loop below would run
+                // once and convert exactly one fractal, but the
+                // Nd2Nz-parameterised copy costs ~600 ns more per call than
+                // the plain one on this part and this kernel is wave-bound,
+                // not bandwidth-bound: measured at [1,8192,96,128], the
+                // per-band form costs 4.39 ms of the solve against 1.75 for
+                // the plain form (both correct).  So the 16-row build keeps
+                // the original single calls.
+                DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K], M * K);
+#endif
+                qa.EnQue(la);
+            }
             auto lb = qb.AllocTensor<bfloat16_t>();
 #if KDA_CHUNK > 16
-            // One whole-tile call, whose dstNzC0Stride = nValue layout is
-            // column-block-major (probe /tmp/nzprobe.py), so the L0A read
-            // below crosses its indices.  That crossing is free; the per-band
-            // form would be KF calls and a "Nd2Nz-shaped" copy costs ~600 ns
-            // more per call than the plain one on this part (measured at
-            // KDA_CHUNK = 16: 8 such calls per block are worth 2.6 ms of the
-            // 4.4 ms solve), and this kernel is wave-bound.
-            DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K],
-                     Nd2NzParams(1, M, K, 0, K, M, 1, 0));
             GlobalTensor<bfloat16_t> &rhs = (pass == 0) ? Rk : Rv;
             for (int32_t mm = 0; mm < KF; ++mm) {
                 DataCopy(lb[mm * DF * 256],
@@ -77,14 +132,6 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
                          Nd2NzParams(1, 16, D, 0, D, 16, 1, 0));
             }
 #else
-            // KF == 1 (the 16-row chunk): the band loop above would run once
-            // and convert exactly one fractal, but the Nd2Nz-parameterised
-            // copy costs ~600 ns more per call than the plain one on this part
-            // and this kernel is wave-bound, not bandwidth-bound: measured at
-            // [1,8192,96,128], the per-band form costs 4.39 ms of the solve
-            // against 1.75 for the plain form (both correct).  So the 16-row
-            // build keeps the original single calls.
-            DataCopy(la, A16[static_cast<uint64_t>(c0 + ch) * M * K], M * K);
             if (pass == 0) {
                 DataCopy(lb, Rk[static_cast<uint64_t>(c0 + ch) * M * D],
                          Nd2NzParams(1, M, D, 0, D, M, 1, 0));
@@ -93,14 +140,18 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
                          Nd2NzParams(1, M, D, 0, D, M, 1, 0));
             }
 #endif
-            qa.EnQue(la);
             qb.EnQue(lb);
         }
         SetFlag<HardEvent::MTE2_MTE1>(e21);
         WaitFlag<HardEvent::MTE2_MTE1>(e21);
 
         for (int32_t ch = 0; ch < nch; ++ch) {
-            auto la = qa.DeQue<bfloat16_t>();
+            LocalTensor<bfloat16_t> la;
+            if (a16res) {
+                la = a16l1[ch * M * K];
+            } else {
+                la = qa.DeQue<bfloat16_t>();
+            }
             auto lb = qb.DeQue<bfloat16_t>();
             // L0A/L0B are indexed by the pass as well: the previous pass's mmads
             // may still be reading the same chunk slot.
@@ -133,7 +184,9 @@ extern "C" __global__ __aicore__ void kda_solve_wu_cube_kernel(
             } else {
                 Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(U[static_cast<uint64_t>(c0 + ch) * M * D], cf, ip);
             }
-            qa.FreeTensor(la);
+            if (!a16res) {
+                qa.FreeTensor(la);
+            }
             qb.FreeTensor(lb);
         }
     }

@@ -2452,3 +2452,87 @@ chunk 顺序、同步（CrossCoreFlag / PipeBarrier / 每次 pass 的 MTE2→MTE
 新增 `tests/test_solve_assemble_loads.py` 钉住这根旋钮的接线（默认 1、每个 slice 都带、每次调用重读、
 两臂输出位一致），C=64 下 3 passed。注意 assemble 只在 C=64 上线（`SOLVE_WIDE_SUBB = 2` 的入场条件），
 C=16/32 只会编译它、不会启动它，所以三档矩阵里只有 C=64 那一 leg 真正覆盖新代码路径。
+
+## 11.38. cube 的 A16 常驻落地：转录里值 0.070，生产里 cube −0.066，但 stage 只拿到 −0.019（2026-09-23 深夜）
+
+§11.35 在转录 kernel 上量到"每块把 A16 读一次而不是每 pass 读一次"值 0.070 ms（1.465 → 1.395），
+另一半是 L2 命中的那一遍。本轮把它做进生产 kernel：`kda_solve_wu_cube_kernel` 新增运行期参数
+`a16Mode`（`api.cube_a16_resident()`，`KDA_CUBE_A16_RESIDENT`，每次调用读一次），0 = shipped
+（两遍各读一次，走 `qa` 队列），1 = 每块一次读进 L1 常驻（`TBuf`，`NC*M*K*2` 字节，和它替掉的队列
+同字节数），两个 pass 都读它。
+
+**第一次尝试直接挂核**：1 号模式仍然对 `qa` 调了 `AllocTensor` 却从不 `EnQueue`，槽位照样被占满，
+第二个 pass 就卡死在队列上（AICore 100% 空转，无输出）——这与 §11.34 记录的 `KDA_ASM_NCHUNK=6/8`
+同类：**"AllocTensor 而不 EnQue" 也是一种队列泄漏**。修法是 1 号模式完全不碰 `qa`。
+
+生产 A/B（`tools/probe_solve_cube_a16_resident.py`，三段交错 MIN of 5；本轮运行时 assemble 还是
+`KDA_ASM_LOADS=1`）：
+
+| 口径 | mode 0 每 pass 读 | mode 1 常驻 | Δ |
+|---|---:|---:|---:|
+| 输出 | — | 0/100663296 个不同，max\|d\| 0，final state identical | 位一致 |
+| CUBE（24 launch 重放） | 1.577 | **1.511** | −0.066 |
+| AIC（ASM+CUBE） | 2.297 | 2.241 | −0.056 |
+| sliced（生产 schedule 重放） | 2.346 | 2.327 | **−0.019** |
+| e2e | 10.445 | **10.421** | −0.023 |
+
+判读：隔离赢 0.066、stage 只拿 0.019（29%）。这和 §11.34 是同一台机器上的同一件事——sliced 重放把
+AIC 的尾巴和 AIV 的重叠吃掉了一部分差值。**默认已切到 1**（严格更好、位一致）。
+
+## 11.39. assemble 的 P 上片（L0C→L1→L0B）落地：拿到 0.107 上限里的 0.096，生产 e2e −0.184，且两半已经配平（2026-09-23 深夜）
+
+§11.36 用"删掉 P 往还"量到它的价格（0.137），§11.37 又把装载改成合并式（stage −0.178）。本轮把
+"删掉"变成"搬到片上"——这才是能进生产的形态，因为删掉 P 就没有第二个 Mmad 的操作数。
+
+**探针**（`kernels/v1/k1_solve_assemble_l1p_probe.cpp` + `tools/probe_solve_assemble_l1p.py`，
+12288 chunk，装载用 §11.37 的合并形态，三臂只差 P 住哪）：
+
+| 臂 | GM bytes/call | ms | GB/s |
+|---|---:|---:|---:|
+| mode 0 P 走 GM（控制） | 151.0 MB | 0.490 | 308 |
+| mode 1 完全不读不写 P（上限，结果按构造是错的） | 100.7 MB | 0.383 | 263 |
+| mode 2 P 走 L0C→L1→L0B | **100.7 MB** | **0.394** | 255 |
+
+**上限 0.107 ms，候选拿到 0.096（90%）**，只比"白送"贵 0.012；且 mode 2 与 mode 0 **位一致**
+（A16 0/50331648 个不同，GM 里的 P tile 原封不动——store 真的没了）。
+
+关键在布局：Nd2Nz 的 band-major 源是 `[k-block][n-block]`（这就是 shipped 的
+`LoadDataWithTranspose(0, KF*KF, 1, 0, 0)` 能吃四个连续 512 B 分形的理由），而 `CFG_NZ` 的 fixpipe
+写出来的是 `[n-block][k-block]`。所以 mode 2 把四个 16×16 分形**按 0、2、1、3 的顺序**塞进 L0B 的
+四个槽位，**位一致性是这套映射唯一的验收依据**（错映射不是慢，是错）。
+
+**生产**（`loadMode` 扩成 0/1/2：0 = shipped 队列形态，1 = 合并装载 + P 走 GM，2 = 1 + P 上片；
+`kda_solve_assemble` 用同一份 per-chunk 链函数、只在装载与 P 的去处分支）：
+
+| 口径 | mode 0 shipped | mode 1 合并 | mode 2 P 上片 |
+|---|---:|---:|---:|
+| 输出 | — | 位一致 | **位一致** |
+| ASM（24 launch 重放） | 0.866 | 0.665 | **0.513** |
+| AIC（ASM+cube） | 2.552 | 2.242 | **2.141** |
+| sliced（生产 schedule 重放 = stage） | 2.505 | 2.323 | **2.322** |
+| e2e（中位 of 3） | 10.593 | 10.418 | **10.408** |
+| AIV（wide） | 2.137 | 2.139 | 2.134 |
+
+- ASM 自己从 0.866 掉到 0.513（−0.353），但 stage 只动 −0.183：**AIC 半边的尾巴被 AIV 的重叠吃掉**，
+  这和 §11.34/§11.38 是同一条规律。
+- **两半已经配平**：AIC 2.141 对 AIV 2.134，差 0.007 ms。也就是说这条线的账已经结清——此后单独优化
+  任何一侧都不会再动 stage，除非**成对**动（要么同时削，要么削完一侧再把另一侧那 0.18 的松弛量拿出来用）。
+- mode 1 → mode 2 的 stage 收益只有 0.001 ms（2.323 → 2.322），isolated 是 −0.152；这已经是"用满"的
+  信号：AIC 那半边不再是瓶颈。
+- 附带事实：mode 2 下 `pmid`（`[c_solve, M, M]`，50.3 MB/call）既不被写也不被读，回收它是后续的
+  清理项（本轮没做，避免动 workspace 池的语义）。
+
+**默认**：`KDA_ASM_LOADS` = 2，`KDA_CUBE_A16_RESIDENT` = 1。这一轮两个改动合起来把 solve stage 从
+2.538（本轮起点，§11.37 后的生产值）压到 **2.322 ms（−8.5%）**，e2e 从 10.62 压到 **10.408 ms**，
+全部口径位一致。
+
+本轮新增：`kernels/v1/k1_solve_assemble_l1p_probe.cpp`、`tools/probe_solve_assemble_l1p.py`、
+`tools/probe_solve_cube_a16_resident.py`、`tests/test_solve_cube_a16_resident.py`，并扩展
+`tests/test_solve_assemble_loads.py`（默认 2、三条臂位一致）。生产改动：`k1_solve_assemble.cpp`、
+`k1_solve_wu_cube.cpp`、`python/kda_ascendc_v1/api.py`。
+
+**门禁**（默认 `KDA_ASM_LOADS=2` + `KDA_CUBE_A16_RESIDENT=1`）：`bash tools/run_chunk_matrix.sh`
+在 C=16/32/64 三个 leg 全部 PASS；`tests/test_solve_assemble_loads.py`（三条臂位一致、默认 2、每 slice
+都带、每次调用重读）与新增 `tests/test_solve_cube_a16_resident.py`（两臂位一致、默认 1、每 slice 都带）
+在 C=64 下 6 passed。C=16/32 那两 leg 对 cube 的 a16Mode 也生效（单级 solve 同样走这个 kernel），
+assemble 仍然只在 C=64 上线。

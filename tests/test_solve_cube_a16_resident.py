@@ -1,22 +1,13 @@
-"""The assemble's load-path knob: wired, per slice, and read per call.
+"""The Cube solve's A16-residency knob: wired, per slice, and read per call.
 
-``docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md`` section 11.37 replaced the
-coupling block's six-per-chunk ND2NZ pattern with a batched one (one call per
-block for the A operand, a chunk's two B bands merged, and pass 1's whole B
-operand in one call), keeping the shipped form behind a runtime argument so
-``tools/probe_solve_assemble_loads.py`` could price both in production.  The
-answer was bit-identical outputs and -0.178 ms on the stage; this file pins the
-wiring that makes the arm real:
-
-* ``api.asm_load_mode()`` reads ``KDA_ASM_LOADS`` per call (not frozen at
-  import), so one process can round-robin the two arms, and production is the
-  batched path (1) rather than whatever happens to be in the environment;
-* ``kda_solve_assemble`` carries the mode in its *last* argument slot - a mode
-  in the wrong slot is read as the chunk count, and that failure is silent (a
-  different A_inv, no exception);
-* every slice of the two-level path carries it, not just the first.
-
-Timings belong to the probe; this is the wiring.
+``docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md`` section 11.38 keeps the block's
+A16 tile in L1 for both passes of ``kda_solve_wu_cube_kernel`` instead of
+re-reading it (the second read is an L2 hit, section 11.35).  The kernel takes
+the mode as a runtime argument (api.cube_a16_resident(), KDA_CUBE_A16_RESIDENT)
+so ``tools/probe_solve_cube_a16_resident.py`` could price both arms in one
+process.  What has to stay true is the wiring: a mode in the wrong slot is read
+as the chunk count, and that failure is silent - the solve computes a different
+A_inv rather than raising.  The timings belong to the probe.
 """
 from __future__ import annotations
 
@@ -39,21 +30,19 @@ import kda_ascendc_v1.api as api  # noqa: E402
 D = 128
 B, T, H = 1, 512, 16
 KW = dict(lower_bound=-1.0, output_final_state=True)
-KERNEL = "kda_solve_assemble"
+KERNEL = "kda_solve_wu_cube_kernel"
 
 
-def _skip_unless_two_level():
+def _skip_unless_supported():
     if api.CHUNK not in api.SUPPORTED_CHUNKS:
         pytest.skip("KDA_CHUNK=%d is an unsupported build" % api.CHUNK)
-    if api.SOLVE_WIDE_SUBB <= 1:
-        pytest.skip("KDA_CHUNK=%d does not run the two-level solve" % api.CHUNK)
 
 
 @pytest.fixture(scope="module")
 def inputs():
-    _skip_unless_two_level()
+    _skip_unless_supported()
     device = torch.device("npu:0")
-    torch.manual_seed(1131)
+    torch.manual_seed(1133)
     q = (torch.randn(B, T, H, D, device=device) * 0.2).to(torch.bfloat16)
     k = (torch.randn(B, T, H, D, device=device) * 0.2).to(torch.bfloat16)
     v = (torch.randn(B, T, H, D, device=device) * 0.1).to(torch.bfloat16)
@@ -90,7 +79,7 @@ class _LaunchSpy:
         return False
 
     def trailers(self, kernel=KERNEL):
-        """Every launch's trailing (C, loadMode) int pair."""
+        """Every launch's trailing (C, a16Mode) int pair."""
         out = []
         for name, args in self.calls:
             if name == kernel:
@@ -100,51 +89,45 @@ class _LaunchSpy:
         return out
 
 
-def test_production_is_the_batched_path(inputs):
-    """KDA_ASM_LOADS unset -> mode 2, on every slice, in the last slot."""
-    os.environ.pop("KDA_ASM_LOADS", None)
-    assert api.asm_load_mode() == 2
+def test_production_keeps_a16_resident(inputs):
+    """KDA_CUBE_A16_RESIDENT unset -> mode 1, on every slice, in the last slot."""
+    os.environ.pop("KDA_CUBE_A16_RESIDENT", None)
+    assert api.cube_a16_resident() == 1
     with _LaunchSpy() as spy:
         _call(inputs)
     trailers = spy.trailers()
     for n, mode in trailers:
-        assert mode == 2, "production is not the batched, P-on-chip path"
+        assert mode == 1, "production is not the resident form"
     c_solve = -(-(B * H * (T // api.CHUNK)) // api.SOLVE_WIDE_NCH) * api.SOLVE_WIDE_NCH
     assert sum(n for n, _ in trailers) == c_solve, trailers
     torch.npu.synchronize()
 
 
 def test_the_mode_is_read_per_call_not_frozen(inputs):
-    """A probe flips this between two arms of one process: it has to move.
-
-    Both arms have to reach *every* slice: a mode that only made the first
-    launch would time a half-converted stage.
-    """
-    for mode in (0, 2, 1, 0):
-        os.environ["KDA_ASM_LOADS"] = str(mode)
+    """A probe flips this between two arms of one process: it has to move."""
+    for mode in (0, 1, 0):
+        os.environ["KDA_CUBE_A16_RESIDENT"] = str(mode)
         try:
-            assert api.asm_load_mode() == mode
+            assert api.cube_a16_resident() == mode
             with _LaunchSpy() as spy:
                 _call(inputs)
         finally:
-            os.environ.pop("KDA_ASM_LOADS", None)
+            os.environ.pop("KDA_CUBE_A16_RESIDENT", None)
         trailers = spy.trailers()
         assert [t[1] for t in trailers] == [mode] * len(trailers), trailers
-        assert len(trailers) >= 2, "the shape did not exercise more than one slice"
     torch.npu.synchronize()
 
 
-def test_the_arms_agree_bit_for_bit(inputs):
+def test_the_two_arms_agree_bit_for_bit(inputs):
     """The knob's whole justification: same operands, same outputs."""
     outs = []
-    for mode in (0, 1, 2):
-        os.environ["KDA_ASM_LOADS"] = str(mode)
+    for mode in (0, 1):
+        os.environ["KDA_CUBE_A16_RESIDENT"] = str(mode)
         try:
             out, state = _call(inputs)
         finally:
-            os.environ.pop("KDA_ASM_LOADS", None)
+            os.environ.pop("KDA_CUBE_A16_RESIDENT", None)
         torch.npu.synchronize()
         outs.append((out.clone(), state.clone()))
-    for i, mode in enumerate((1, 2), start=1):
-        assert torch.equal(outs[0][0], outs[i][0]), "mode %d differs" % mode
-        assert torch.equal(outs[0][1], outs[i][1]), "mode %d's state differs" % mode
+    assert torch.equal(outs[0][0], outs[1][0]), "the two arms disagree"
+    assert torch.equal(outs[0][1], outs[1][1]), "the final states disagree"
