@@ -87,9 +87,17 @@ constexpr int32_t CH = NC * MM;   // floats in one block's A_inv
 constexpr int32_t CM = 64 * 255;  // largest count-mode calCount
 constexpr int32_t RW21 = NCH * M;  // floats in one row of the L21 tile
 
+// ``a16Mode`` is the A16-store ablation (2026-09-23, plan 11.34): the kernel's
+// own share of the solve stage is 55% row recursion and ~45% DMA (L gathers,
+// the bf16 round trip, and the A16/Xb/Lneg exports), so the first thing to
+// price is what dropping the parent-tile writes buys.  0 = production (both
+// stores), 1 = no strict-upper blank, 2 = no parent tile at all.  Modes 1/2
+// leave the Cube solve with a partially written operand *on purpose* - they
+// exist to measure the store, not to be correct - and the single-level build
+// (SB == 1), where that tile is the kernel's only output, ignores the mode.
 extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA32, GM_ADDR pA16, GM_ADDR pXb,
-    GM_ADDR pLneg, int32_t C, int32_t debugStores) {
+    GM_ADDR pLneg, int32_t C, int32_t a16Mode, int32_t debugStores) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const int32_t c0 = GetBlockIdx() * NCH;
     if (c0 >= C) return;
@@ -127,6 +135,14 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
 #if KDA_SOLVE_WIDE_SUBB > 1
     LocalTensor<float> zf = bZf.Get<float>();
     LocalTensor<bfloat16_t> zrow = bZb.Get<bfloat16_t>();
+    // The two modes of the ablation (see the signature).  Declared here, not
+    // at the stores: the blank's *source* is built above the recursion, and an
+    // unguarded Duplicate/Cast there would pay for a store that never happens.
+    const bool writeBlank = (a16Mode == 0);
+    const bool writeDiagA16 = (a16Mode <= 1);
+#else
+    const bool writeBlank = false;
+    const bool writeDiagA16 = true;   // SB == 1: the parent tile is the output
 #endif
     GlobalTensor<float> L, Eye, A32;
     GlobalTensor<bfloat16_t> A16;
@@ -171,9 +187,11 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     Cast(l21b, l21f, RoundMode::CAST_RINT, M * RW21);
 #endif
 #if KDA_SOLVE_WIDE_SUBB > 1
-    Duplicate(zf, 0.0f, MM);
-    PipeBarrier<PIPE_V>();
-    Cast(zrow, zf, RoundMode::CAST_RINT, MM);
+    if (writeBlank) {
+        Duplicate(zf, 0.0f, MM);
+        PipeBarrier<PIPE_V>();
+        Cast(zrow, zf, RoundMode::CAST_RINT, MM);
+    }
 #endif
     PipeBarrier<PIPE_V>();
 
@@ -211,15 +229,18 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     // fp32 twin the debug views hand out - leaving it uninitialised made the
     // two disagree on a block that is zero in A_inv.
     // The A16 store next to each one is the one that has to stay.
-    for (int32_t s = 0; s + 1 < SB; ++s) {
-        for (int32_t s2 = s + 1; s2 < SB; ++s2) {
-            for (int32_t ch = 0; ch < NCH; ++ch) {
-                const uint64_t d = static_cast<uint64_t>(c0 + ch) * PC * PC
-                                   + (s * M) * PC + s2 * M;
-                if (keepA32) {
-                    DataCopy(A32[d], zf, DataCopyParams(M, M / 8, 0, (PC - M) / 8));
+    if (writeBlank) {
+        for (int32_t s = 0; s + 1 < SB; ++s) {
+            for (int32_t s2 = s + 1; s2 < SB; ++s2) {
+                for (int32_t ch = 0; ch < NCH; ++ch) {
+                    const uint64_t d = static_cast<uint64_t>(c0 + ch) * PC * PC
+                                       + (s * M) * PC + s2 * M;
+                    if (keepA32) {
+                        DataCopy(A32[d], zf, DataCopyParams(M, M / 8, 0, (PC - M) / 8));
+                    }
+                    DataCopy(A16[d], zrow,
+                             DataCopyParams(M, M / 16, 0, (PC - M) / 16));
                 }
-                DataCopy(A16[d], zrow, DataCopyParams(M, M / 16, 0, (PC - M) / 16));
             }
         }
     }
@@ -235,8 +256,10 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
                 DataCopy(A32[d], af[t * M],
                          DataCopyParams(M, M / 8, (NC - 1) * (M / 8), (PC - M) / 8));
             }
-            DataCopy(A16[d], ab[t * M],
-                     DataCopyParams(M, M / 16, (NC - 1) * (M / 16), (PC - M) / 16));
+            if (writeDiagA16) {
+                DataCopy(A16[d], ab[t * M],
+                         DataCopyParams(M, M / 16, (NC - 1) * (M / 16), (PC - M) / 16));
+            }
 #if KDA_SOLVE_WIDE_SUBB > 1
             // The same tile again, contiguous, for the coupling kernel: it
             // reads X11 / X22 as plain [M, M] operands.

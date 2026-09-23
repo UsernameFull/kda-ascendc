@@ -69,6 +69,15 @@ block kept whatever the allocation held, which is zero for the fresh 100 MB
 buffer of the real shape but 1e36-`inf` for recycled memory at small shapes, so
 the Cube solve read garbage there (W/U came out `inf`, the e2e output wrong).
 
+`kda_solve_wu_wide` takes one runtime int32 next to the chunk count (`a16Mode`,
+between `C` and the debug flag) so plan section 11.34's store ablation could be
+run without a recompile: 0 is production (both stores above), 1 drops the
+blank, 2 drops the parent tile entirely.  1 and 2 leave the Cube solve a
+partially written operand *by construction* - they are measurement arms, not
+settings - and they do not move the stage (docs section 11.34); production goes
+through `api.a16_mode()`, which reads `KDA_SOLVE_A16_MODE` per call and defaults
+to 0.
+
 `kda_solve_assemble` (AIC) forms the coupling block in two passes: pass 0
 `P = Lneg @ X11` fixpiped row-major into its own `[c_solve, M, M]` bf16 tile,
 pass 1 `X21 = X22 @ P` fixpiped straight into the parent tile's lower-left

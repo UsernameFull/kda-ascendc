@@ -204,6 +204,20 @@ def _solve_streams(device: torch.device):
     return pair
 
 
+def a16_mode() -> int:
+    """A16-store ablation mode for the wide solve (KDA_SOLVE_A16_MODE).
+
+    0 is production: the wide kernel writes both the diagonal sub-blocks of the
+    parent A_inv tile and its strict-upper blank.  1 drops the blank, 2 drops
+    the whole parent tile - the Cube solve then reads a partially written
+    operand, which is the point of the ablation (tools/probe_solve_a16_ablation.py
+    prices the store) and never a production setting.  Read per call rather than
+    frozen at import so a probe can flip it between two arms of one process; the
+    kernel is unchanged either way, this is a runtime argument.
+    """
+    return int(os.environ.get("KDA_SOLVE_A16_MODE", "0"))
+
+
 def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
                             a32, a16, xb, lneg, pmid, rk, rv, W, U, stream,
                             debug_stores) -> None:
@@ -244,7 +258,7 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
     for glo, ghi in pairs:
         lo, n = glo * unit, (ghi - glo) * unit
         wargs = _pack_ptrs([L[lo:], eye, a32[lo:], a16[lo:], xb[lo:],
-                            lneg[lo:]]) + [_i(n), _i(1 if debug_stores else 0)]
+                            lneg[lo:]]) + [_i(n), _i(a16_mode()), _i(1 if debug_stores else 0)]
         aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:], pmid[lo:]]) + [_i(n)]
         cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + [_i(n)]
         ncube = min(n, c - lo)
@@ -701,7 +715,7 @@ def _kda_fwd_impl(
         # the kernel takes them in every build, and a short argument list would
         # leave it reading C out of the args array's tail.
         solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16, None, None])
-        solve_args += [_i(c), _i(1 if keep_debug else 0)]
+        solve_args += [_i(c), _i(a16_mode()), _i(1 if keep_debug else 0)]
         _launch("kda_solve_wu_wide", c_solve // SOLVE_WIDE_NCHUNK, solve_args, stream)
         # The Cube needs the bf16 A_inv the substitution just wrote, so the two
         # launches stay ordered on the stream.

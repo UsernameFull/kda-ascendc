@@ -2194,3 +2194,96 @@ UB 32 KB），融合形态递归在 `[M, 256]` 的 RHS 上（256 lane × 4 个�
 生产路径未改；本轮新增的都是探针与账本工具（`tools/probe_rhs_substitution.py`、
 `tools/probe_chunk128_k1.py`、`tools/gen_ub_l1_budget.py` 的 `pre_gram_ub()`、
 `kernels/v1/k1_solve_rhs_probe.cpp`）。
+
+## 11.34. solve 的 0.95 ms 判决：A16 store 消融——那 0.95 ms 是被 AIC 遮住的松弛量，不是 stage 时间（2026-09-23 深夜）
+
+§11.33 的副产品把下一步钉成"若要再动 solve，先削 AIV 半边那 0.95 ms（递归地板 1.169 之外的部分）"，
+本轮就按它执行：A16 store/blank 消融 → 再看 Xb/Lneg 能不能直供 assemble → 布局不动。
+**结论是这条分支关闭**，而且理由是反的：删掉 parent tile 的写回不但不赚，端到端还稳定慢 ~0.2 ms——
+因为 solve 的 stage 早就被 AIC 半边定住（2.535 ms ≈ ASM 0.928 + CUBE 1.586），AIV 的 2.144 ms 是**被
+遮住的松弛量**，不是 stage 时间。
+
+### 1. 消融怎么做：一个运行期 int32，不是重编译
+
+`kernels/v1/k1_solve_wu_wide.cpp` 的签名在 C 与 debugStores 之间多了一个 `a16Mode`：
+
+| 模式 | 写什么 | 用途 |
+|---:|---|---|
+| 0 | 生产：parent tile 的两个对角子块 + 严格上三角的 blank（Cube 当 0 读） | 默认，生产路径 |
+| 1 | 只写对角子块，不写 blank | 消融 |
+| 2 | parent tile 一个字节都不写 | 消融 |
+
+`api.a16_mode()` 每次调用读一次 `KDA_SOLVE_A16_MODE`（不在 import 时冻结，探针才能在一个进程里翻臂），
+缺省 0 就是生产；`tests/test_solve_a16_ablation.py` 钉住接线（生产恒为 0、所有 slice 带同一个模式、
+debug flag 仍在最后一个 int）。**模式 1/2 是故意错的**：`kda_solve_wu_cube_kernel` 会读到部分写入的
+A_inv，探针的 `--cold` 量的就是这件事——冷 A16 下 mode 2 与 mode 0 有 100663008/100663296 个元素不同
+（max|d| 9.399e-03）；热跑时三臂逐位相同，只是缓存分配器把上一轮那 98 MB 原样还了回来。
+
+### 2. 三臂（[1,8192,96,128]、C=64、同进程、`tools/probe_solve_a16_ablation.py`）
+
+| 口径 | mode 0 生产 | mode 1 去 blank | mode 2 去整个 parent tile |
+|---|---:|---:|---:|
+| e2e（do_bench 中位 of 3） | 10.623 ms | 10.664（**+0.041**） | 10.847（**+0.224**） |
+| 生产 schedule 重放（24 slice + per-slice event） | 2.535 | 2.533（−0.002） | 2.620（**+0.085**） |
+| AIV（wide kernel） | 2.144 | 2.053（−0.091） | 1.862（−0.282） |
+| ASM（assemble） | 0.928 | 0.928 | 0.929 |
+| CUBE（solve） | 1.586 | 1.587 | 1.588 |
+| AIC（ASM+CUBE 同一条 stream） | 2.614 | 2.616 | 2.615 |
+
+e2e 的符号在三个独立进程里一致（正序 +0.023/+0.216、倒序 −0.004/+0.197、正序 +0.041/+0.224）：
+blank 那一份无事，parent tile 那一份稳定慢 ~0.2 ms。
+
+删掉的字节：blank 2 KB/chunk + 对角 4 KB/chunk = 6 KB/chunk ×12288 = **73.7 MB/call**；AIV 因此少
+0.282 ms ⇒ **3.8 ns/B**，与 §11.30 用另一条路径量到的 4.2 ns/B 同量级：**store 没有变慢，它只是不落在
+关键路径上。**
+
+### 3. 机制：stage = max(AIV, AIC)，而 AIC > AIV
+
+- 按生产 schedule 重放（每 slice：sa 上 wide → event → sb 上 assemble+cube）得 **2.535 ms**，
+  与 api 注释里记的 24-slice 值 2.525 对上；
+- 单独重放 AIC 半边（ASM 0.928 + CUBE 1.586 = 2.514）得 2.614 ms（差值是 launch 之间的空隙）；
+- 也就是 per-slice 的双流重叠已经把 AIV 整个藏住，只多 0.02 ms：**stage 就是 AIC 的串行工作量**。
+
+为什么删了反而更慢：AIV 提前做完，它的 L gather 和剩下的 store 就与 AIC 那一刀挤进同一段时间
+（§11.27 已量到这台机器是吞吐饱和的），两组访存在内存系统上互相拖。证据是三个模式**单独**跑 AIC 时
+一模一样（2.614/2.616/2.615），差异只能来自干涉；`overlapped`（无 event 的并发重放）与 `sliced`
+（生产 schedule）两个口径同向变差。
+
+### 4. 判决：分支关闭；步骤 2（Xb/Lneg 直供 assemble）也不上场
+
+- Xb 只有 4 KB/chunk（50.3 MB/call），比 mode 2 删掉的那 6 KB 还小，而 mode 2 已经证明删更大的
+  那份不赚；
+- Xb 与 A16 的对角子块**同源逐位相同**（同一个 `ab[t*M]`，只有目的 pitch 不同），所以"能不能直读"
+  是布局问题不是数值问题；
+- 但让 assemble 从 A16 读对角块，是把一次连续的 2 KB `Nd2Nz` 换成 32 行 × 64 B 的跨步读——**往
+  瓶颈那一侧加活**，方向反了；
+- 设计书的准入"完整 solve stage 接近 2.53 ms 才继续"现在读作：stage 已经是 2.535，而唯一能在 AIV
+  上省的时间被遮住 ⇒ **停**。布局（[row][chunk][lane]、Brcb + repeat-stride）本轮一字未动。
+
+### 5. 本轮留下的新账：solve 第一次被拆成 AIV / ASM / CUBE
+
+| 半边 | ms | 说明 |
+|---|---:|---|
+| AIV wide | 2.144 | 递归地板 1.169（§11.33），其余 ~0.98 是 gather/cast/store——**被遮住** |
+| AIC assemble | 0.928 | 只做 X21 = X22·Lneg21·X11，两趟；GM 账面 12 KB/chunk = 147.5 MB ⇒ 159 GB/s，**不在带宽上**，是 wave/依赖受限 |
+| AIC cube solve | 1.586 | 80 KB/chunk = 983 MB：A16 16 KB（**两个 pass 各读一遍**）+ RHS 32 + W/U 32 ⇒ 620 GB/s |
+
+**实测的否定**：想靠"把 assemble 的块做肥"降它的 wave 数也走不通——`KDA_ASM_NCHUNK = 6` 与 `8` 在
+第一次 api 调用就把核挂住（AICore 100% 空转：两个设备各一次并发复现，外加一次单进程复现），与
+kernel 注释里"L1 队列必须恰好 NC 深"是同一类约束。杀掉进程后设备恢复 0%。所以 assemble 的 NC 被
+钉在 4。
+
+**剩下的两个入口（都在 AIC，不在 AIV）**：
+
+1. **cube 每个 pass 重读 A16**：`qa` 只有 NC=2 个 L1 slot，两个 pass 各从 GM 读 8 KB/chunk，合计
+   98.3 MB（它自己 983 MB 的 10%）。把 `qa` 加深到 2·NC（L1 多 16 KB）就能让两个 pass 共用一次加载
+   ⇒ 省 98 MB，按它自己的 620 GB/s 投影 **−0.16 ms**。**投影，未实测**，而且只有"cube 是带宽受限"
+   成立时才对——1.586 ms 对 983 MB 是 620 GB/s，接近这台机器的上限量级，但还没有带宽探针把
+   "带宽"与"波次"分开。
+2. **assemble 整块 0.928 ms**：字节账只有 147.5 MB（159 GB/s），削流量不会等比例回本；要动就得动
+   结构——把 X21 的构造并进 cube kernel（上界 −0.93 ms，但那是 §11.9/§11.24 立起来那套东西的
+   改写，需要自己的探针和 gate）。
+
+生产路径未改（`KDA_SOLVE_A16_MODE` 缺省 0；本轮 C=16/32/64 的 chunk 矩阵全 PASS，bench gate 在本机
+仍只差 §11.26 记录的跨设备绝对时间）。本轮新增：`tools/probe_solve_a16_ablation.py`、
+`tests/test_solve_a16_ablation.py`、wide kernel 的 `a16Mode` 参数与 `api.a16_mode()`。

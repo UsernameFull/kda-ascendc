@@ -213,8 +213,34 @@ sweep**；重开条件只有一个——诊断显示快照 workspace/流量本�
 ### 4.6 还没有实测的
 
 路线 5（segment scan）仍是专用分支（小 B/H、超长 T），入场条件见 §11.32；C128 与融合
-solve 的"组合"随各自路线一起冻结。真要再动 solve，第一步是先削 §4.4 里那 0.95 ms 的
-非递归开销，而不是重排递归。
+solve 的"组合"随各自路线一起冻结。§4.4 的副产品曾把"先削 AIV 那 0.95 ms 非递归开销"
+写成下一步——**那条已经在 §4.7 被实测否掉**（AIV 不是关键路径）。
+
+### 4.7 solve 的 0.95 ms（本轮新增第四条）：不采用——它是被 AIC 遮住的松弛量
+
+`tools/probe_solve_a16_ablation.py`（wide kernel 的 `a16Mode` 运行期参数，0 生产 / 1 去
+blank / 2 去整个 parent tile，探针同进程翻臂）在 [1,8192,96,128]/C=64 上量到：
+
+| 口径 | mode 0 生产 | mode 1 去 blank | mode 2 去 parent tile |
+|---|---:|---:|---:|
+| e2e（do_bench 中位 of 3） | 10.623 ms | +0.041 ms | **+0.224 ms** |
+| 生产 schedule 重放（24 slice + event） | 2.535 ms | 2.533 | **2.620 ms** |
+| AIV（wide） | 2.144 ms | 2.053 | **1.862** |
+| ASM / CUBE / AIC | 0.928 / 1.586 / 2.614 | 不变 | 不变 |
+
+删掉 73.7 MB/call 让 AIV 少 0.282 ms（3.8 ns/B，与 §11.30 的 4.2 ns/B 同量级），**stage
+不动反涨**：stage = max(AIV, AIC) 且 AIC（assemble 0.928 + cube 1.586 = 2.514）本来就
+比 AIV 高 0.47 ms，per-slice 双流重叠已经把 AIV 全藏住（sliced 2.535 ≈ AIC 的 2.514，
+只多 0.02 ms）。把 AIV 做快只是把松弛量做大，还让它的 gather/store 与 AIC 挤在同一段
+（§11.27：这台机器吞吐饱和）。⇒ **AIV 侧分支关闭**，步骤 2（Xb/Lneg 直供 assemble）也不
+上场：Xb 只有 4 KB/chunk 且与 A16 对角块同源逐位相同，而 A16 直读会把 assemble 的
+`Nd2Nz` 变成跨步读——往瓶颈那一侧加活。
+
+solve 剩下的入口都在 AIC，且都是**投影未见实测**：cube 每个 pass 重读 A16（98.3 MB ≈
+−0.16 ms，须先做带宽探针）、assemble 的结构性改写（0.928 ms，字节账只有 159 GB/s，不是
+带宽受限）。把 assemble 的块做肥这条被实测封死：`KDA_ASM_NCHUNK = 6/8` 直接把核挂住
+（AICore 100% 空转，两次并发 + 一次单进程复现）。完整口径见
+`docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.34。
 
 ### Level 2 / Level 3 的准入条件
 
