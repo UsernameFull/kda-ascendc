@@ -137,6 +137,43 @@ Level 4  仅在 Level 2/3 有稳定收益后，评估 device-side persistent sch
   不允许引入新布局（例如 K2 的 `d1/d2/d3` 与 `vnew_t` 的 task-major 顺序不要动，
   §11.24 的 C=32 bug 就是跨带 walk 与布局假设不一致造成的）。
 
+## 4. 判决实验（2026-09-23）
+
+设计阶段之后，三条路线里已经跑完两条的判决，实测量与完整口径在
+`docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.30 / §11.31。
+
+### 4.1 state/output 分离（路线 1）：不采用
+
+`kernels/v1/k2_state_loop.cpp`（串行状态链，按 chunk 发布入口状态 `H[c]`）+
+`kernels/v1/k2_out_parallel.cpp`（全并行 `O[c] = Q[c]H[c] + A[c]Z[c]`），
+`k2_mode="split_state_out"`，只用 experimental 入口；K1 一字未动。
+
+| 口径（C=64，`[1,8192,96,128]`，同进程交错 A/B，3 轮 `do_bench` 中位） | fused | split |
+|---|---:|---:|
+| 端到端 | 10.599 ms | **12.301 ms（+1.70 ms，+16.1%）** |
+| K2 内部（profile，含 sync） | 4.078 ms | 3.446 + 2.373 ms |
+| K2 的 GM 字节（几何） | 5140.1 MB | 5542.8 MB（+402.7 MB，全是快照读侧） |
+
+两臂**逐位一致**（out 与 final_state），所以这是纯成本判决：状态链只减重 15%，而并行输出核
+单独要 2.373 ms（38.6 GFLOP + ~1.85 GB GM 往返 ⇒ ~16 TFLOPS 有效）。**输出留在状态链里**；
+唯一的翻盘形态是 Level 4 的设备侧重叠，不是换 tile。
+
+### 4.2 稠密仿射递推（路线 2）：数值可行但形态受限，代价不回收
+
+`tools/probe_affine_precision.py` 用同一组 fp32 中间量对比四种 rounding discipline
+（C=64、T=8192、H=8，long/mid/init 三种 regime）。结论：
+
+- 把 `diag(d)` 折进 bf16 的 `E`：状态误差比现实现高 30～70% ⇒ **不合格**；
+- `decay` 留在 AIV 的 fp32 状态、只把 `E_off = -Kg^T W` 舍成 bf16：状态误差比现实现**低**
+  25～30%（少交 d1 与 Z 两次舍入）⇒ 合格，但跨核交接一点没少；
+- 代价侧：+59 GFLOP 按 §11.30 实测价位值 1.5～3.7 ms，而 K2 全部只有 4.08 ms。
+
+### 4.3 还没有实测的
+
+路线 3（融合式分块 solve）、路线 4（C128/tile 解耦）、路线 5（segment scan）尚未进入实现，
+入场条件与定价写在 §11.32。路线 3 的第一步不是写 kernel，而是一份"leaf inverse 批量 +
+块更新走 Cube + 中间 RHS 不落 GM"的设计与 slot/credit 预算。
+
 ### Level 2 / Level 3 的准入条件
 
 在动手前必须先提交：

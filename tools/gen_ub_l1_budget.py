@@ -82,6 +82,11 @@ def budget(chunk: int, b: int, t: int, h: int, maxh: int) -> dict:
         # its three staging buffers are build-dependent and are added below.
         "xb": None, "lneg": None, "pmid": None,
         "s32": (tasks * BV * D, "fp32"), "s16": (tasks * BV * D, "bf16"),
+        # The route-1 split's chunk-entry-state snapshot (k2_state_loop writes
+        # it, k2_out_parallel reads it).  It replaces the fused loop's single
+        # S16 slot, which is why the split's extra GM traffic is the *read*
+        # side only: [tasks, nt, BV, D] bf16 = 402.65 MB at the target shape.
+        "hsnap": (tasks * nt * BV * D, "bf16"),
         "d1": (tasks * nt * chunk * BV, "bf16"),
         "d2": (tasks * nt * chunk * BV, "bf16"),
         "d3": (tasks * nt * chunk * BV, "bf16"),
@@ -93,7 +98,7 @@ def budget(chunk: int, b: int, t: int, h: int, maxh: int) -> dict:
     # `vnew` and `vnew_t` exist only for return_intermediates (production passes
     # a null pointer and skips the row-major store), so they are reported but
     # not counted in the production total.
-    conditional = {"vnew"}
+    conditional = {"vnew", "hsnap"}
     elt = {"bf16": 2, "fp32": 4}
     if chunk >= 64:
         ws["xb"] = (c * SOLVE_SUBB * sub * sub, "bf16")
@@ -109,7 +114,7 @@ def budget(chunk: int, b: int, t: int, h: int, maxh: int) -> dict:
     # `vnew` and `vnew_t` exist only for return_intermediates (production passes
     # a null pointer and skips the row-major store), so they are reported but
     # not counted in the production total.
-    conditional = {"vnew"}
+    conditional = {"vnew", "hsnap"}
     elt = {"bf16": 2, "fp32": 4}
     if chunk >= 64:
         ws["xb"] = (c * SOLVE_SUBB * sub * sub, "bf16")
@@ -131,6 +136,51 @@ def budget(chunk: int, b: int, t: int, h: int, maxh: int) -> dict:
                         l1_total=l1, l1_cap=512 * 1024,
                         l0c_cap=128 * 1024, l0c_used=co1),
                 workspace=ws, workspace_total=sum(v[0] for v in ws.values()))
+
+
+def split_budget(chunk: int, maxh: int) -> dict:
+    """UB / L1 / L0 of the two route-1 kernels (k2_state_loop + k2_out_parallel).
+
+    Same arithmetic as ``budget`` - the numbers are the kernels' own
+    ``InitBuffer`` calls, restated in the tool because the tools cannot parse
+    the source - so the split's admission check is executable like the fused
+    loop's.  ``k2_state_loop`` is the fused loop's staging minus the output
+    side (no ``ob``/``of``/d2f/d3f: its uA is vf only), and ``k2_out_parallel``
+    has no resident state at all, which is why the output half costs 56 KB of UB
+    against the fused loop's 184.5 KB.
+    """
+    FR, BV, NV, D = 16, 64, 2, 128
+    M = chunk
+    NB = M // FR
+    NG = 2 * BV // M
+    TILE = M * BV
+    S_TILE = BV * D
+    HALF_BYTES = max(TILE * 2, S_TILE)          # uB/uD of the state loop
+    state_ub = (maxh * S_TILE * 4               # us: resident fp32 state
+                + TILE * 4                      # uA vf
+                + HALF_BYTES                    # uB ub | s16
+                + TILE * 2                      # uC d1
+                + HALF_BYTES                    # uD vb | d4
+                + TILE * 4                      # uE sc/vt | d1f
+                + D * 4)                        # udec
+    state_l1 = (M * D * 2                       # qw
+                + NV * BV * D * 2               # qs
+                + NG * M * M * 2                # qv
+                + D * M * 2)                    # qk
+    state_l0a = max(M * D, NG * M * M) * 2
+    state_l0b = NV * BV * D * 2
+    state_l0c = (NG * M * D + NV * M * BV) * 4
+    out_ub = 2 * TILE * 4 + 3 * TILE * 2        # of, scratch | d2, d3, ob
+    out_l1 = (M * D * 2 + NV * BV * D * 2 + M * M * 2 + NV * BV * M * 2)
+    out_l0a = (M * D + M * M) * 2
+    out_l0b = (NV * BV * D + NV * BV * M) * 2
+    out_l0c = 2 * NV * M * BV * 4
+    return {
+        "state": dict(ub=state_ub, l1=state_l1, l0a=state_l0a, l0b=state_l0b, l0c=state_l0c),
+        "out": dict(ub=out_ub, l1=out_l1, l0a=out_l0a, l0b=out_l0b, l0c=out_l0c),
+        "caps": dict(ub=192 * 1024, l1=512 * 1024, l0a=64 * 1024,
+                     l0b=64 * 1024, l0c=128 * 1024),
+    }
 
 
 def main():
@@ -167,6 +217,26 @@ def main():
     print("   %-12s %10.2f MB  (production)" % ("TOTAL", rep["workspace_total"] / 1e6))
     print("   peak live     %10.2f MB  (guard: the pool has to hold this)"
           % (max(v[0] for v in rep["workspace"].values()) / 1e6))
+
+    # The route-1 split (k2_state_loop + k2_out_parallel).  It is a candidate,
+    # not the shipped path, but it lives in the tree and its admission numbers
+    # have to be executable like everything else - the measurement that
+    # rejected it (docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md section 11.30) is
+    # about time, not about a budget overrun.
+    sb = split_budget(chunk, maxh)
+    print()
+    print("route-1 split (k2_state_loop + k2_out_parallel), same caps:")
+    print("   %-22s %8s %8s %8s" % ("", "UB", "L1", "L0C"))
+    for name in ("state", "out"):
+        row = sb[name]
+        print("   %-22s %7.1fK %7.1fK %7.1fK   L0A %.1fK  L0B %.1fK"
+              % (name, row["ub"] / 1024, row["l1"] / 1024, row["l0c"] / 1024,
+                 row["l0a"] / 1024, row["l0b"] / 1024))
+    for name in ("state", "out"):
+        row = sb[name]
+        over = [k for k in ("ub", "l1", "l0a", "l0b", "l0c")
+                if row[k] > sb["caps"][k]]
+        print("   %-22s %s" % (name, "OVER: " + ", ".join(over) if over else "fits"))
 
 
 if __name__ == "__main__":

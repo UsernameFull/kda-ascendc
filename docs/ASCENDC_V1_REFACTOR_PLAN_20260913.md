@@ -1915,3 +1915,166 @@ C=16 腿抓到的。这和 §11.24 的 C=32 bug 是同一类：一个只在别�
 下一档的账要诚实：Level 2/3 加起来约 0.2 ms，而它们要动的是跨 launch 的交接协议与同步审计，
 成本远高于本轮这个 3 文件的守卫。**先把 Level 1 剩下的一条（`Aqk32` raw 复读，同一套账本
 已经标好位置）量掉**，再决定要不要为 0.2 ms 重排 pre_gram->solve 的交接。
+
+## 11.30. 全流水生命周期重构（三）：state/output 分离的判决实验——分割合法、逐位一致，但总价 +1.70 ms（+16.1%）（2026-09-23）
+
+用户在设计书（`docs/PREFILL_LIFECYCLE_REFACTOR_20260922.md`）之外给的三条路线里，第一条是
+"把 output 从串行状态链里拆出去"，并指定了判决口径：**保留现有 K1、只换 K2，比较现有 K2
+vs state-only + parallel-output，并且必须计入两个 kernel、快照、布局转换和输出的总成本**。
+"单独 state kernel 更快不算成功。"这一节就是那次判决。
+
+### 1. 落地
+
+- `kernels/v1/k2_state_loop.cpp`：`k2_persistent_loop` 去掉全部 output 侧——不读 `Qg`、不做
+  `Qg@S^T`、不读 `Aqk`、不做 `d3 = Aqk@v_new`，stage 4 只剩状态递推。bf16 状态发布从"一个
+  被反复覆盖的 S16 槽"改成**按 chunk 索引的 `Hsnap[task, chunk]`**：同样的字节、不同的地址，
+  所以**序列链为快照付出的写侧成本是零**；设计书里那 384 MiB 的快照价只落在读侧。
+- `kernels/v1/k2_out_parallel.cpp`：全并行输出核。同一套 block/flag 骨架去掉 `FL_V`（AIV 不再
+  生产 Cube 的operand），每 tile 两个 Mmad（`Qg@H^T`、`Aqk@Z`），并且**保留原 kernel 的每一个
+  舍入位置**：Cube 把 d2/d3 舍成 bf16，AIV 用 fp32 累加 `out = d2*scale + d3` 后只舍一次。
+- `python/kda_ascendc_v1/api.py`：`k2_mode="split_state_out"`（`SPLIT_STATE_OUT`），只走
+  experimental 入口，公共 API 仍然拒绝；两个 launch 都在调用者 stream 上（见第 4 节）。
+- 准入数（`tools/gen_ub_l1_budget.py` 现在把两个 kernel 都算出来）：
+
+| kernel | UB | L1 | L0C | L0A / L0B | 结论 |
+|---|---:|---:|---:|---:|---|
+| `kda_k2_state_loop` | 184.5 KB | 80.0 KB | 96.0 KB | 16 / 32 KB | 全部在 cap 内 |
+| `kda_k2_out_parallel` | 56.0 KB | 72.0 KB | 64.0 KB | 24 / 48 KB | 全部在 cap 内 |
+
+- `tools/probe_state_out_split.py`：同进程交错 A/B（同一份编译产物、每轮两臂交替、`do_bench`
+  中位、600 ms rep），外加一份**由几何推出的 GM 账**（两个 kernel 各自读写了什么）。
+
+### 2. 判决（C=64，`[1,8192,96,128]`，三轮交错）
+
+| 轮次 | fused | split | 备注 |
+|---|---:|---:|---|
+| 1 | 10.599 (p20 10.579 / p80 10.646) | 12.299 (p20 12.283 / p80 12.316) | |
+| 2 | 10.600 (p20 10.574 / p80 10.623) | 12.306 (p20 12.283 / p80 12.344) | |
+| 3 | 10.586 (p20 10.579 / p80 10.624) | 12.301 (p20 12.279 / p80 12.321) | |
+| **中位** | **10.599** | **12.301** | **+1.701 ms（+16.1%）** |
+
+- **两臂逐位一致**（`torch.equal`：out 与 final_state 都过）。这一步让"分割"的合法性从代数
+  变成实现事实：两个新 kernel 复现了 shipped kernel 的每一个 bit，包括 d2/d3 的 bf16 舍入与
+  `out = d2*scale + d3` 的 fp32 累加顺序。
+- 同一次运行的 profile（每个 mark 都带 sync，绝对值偏高，只用来看内部比例）：
+  `k2_ms` fused 4.078 vs split 5.928；拆开是 **state 3.446 + out 2.373**。
+- GM 账（几何，无实测）：fused 5140.1 MB → split 5542.8 MB，**+402.7 MB**（正好是快照的读侧：
+  `[tasks, nt, BV, D]` bf16 = 402.65 MB；写侧与 fused 的 S16 同量，不重复计账）。
+- 小形状（`[1,512,4,128]`）同向：fused 1.068 vs split 1.105（+3.5%，受 launch/固定开销支配）。
+
+### 3. 为什么输
+
+1. **状态链只减重 15%**：删掉的是一整个 `Qg@S`（2 Mmad/head-chunk）、`Aqk@v_new`
+   （2 Mmad/head-chunk）、`Aqk` 的 100 MB 读、`Qg` 的 201 MB 读、D2/D3 的 786 MB 往返和
+   192 MB 的 out 写出——合起来只值 4.078 → 3.446 ms。也就是说 K2 的时间不在这些 Mmad 与
+   这些 store 上，而在分离根本不碰的地方：stage 2 的 16 次转置与 Vt 打包、D4 的 fp32
+   805 MB 写 + 805 MB 读、以及 per-chunk 的描述符数量（kernel 头注释早已记过：这个 loop 是
+   descriptor/work-bound，不是 flag-bound）。
+2. **并行输出核不便宜**：2.373 ms 里是 38.6 GFLOP 加约 1.85 GB 的 GM 往返，等于 ~16 TFLOPS
+   有效吞吐。它是"更连续、更规则"的 Cube 计算没错，但本机没有便宜到能让这条路线翻盘。
+3. **快照的读侧是实价**：fused 的单槽 S16 只有 3 MB、常驻 L2、几乎免费；按 chunk 物化后，
+   输出核要把 384 MiB 从 HBM 再读一遍（+0.33 ms HBM 价、+0.08 ms L2 价），而它换来的
+   只是"输出可以晚算"这一条自由度。
+
+### 4. 边界与残留
+
+- 唯一可能翻盘的形态是**输出核与状态核在设备侧重叠**（按 chunk 的 ready 计数、跨 launch
+  的 hand-off，也就是 Level 4 persistent scheduler）。本次两段在同一 stream 上串行，这是
+  设计书明确后置的形态，不在这条候选的范围内——但它是这条路线唯一的翻盘点，而不是
+  "换更小的 tile"。
+- 候选留在树里，并由 `tests/test_state_out_split.py` 钉住三件事：与 fused **逐位一致**、
+  确实是两次 launch（`kda_k2_state_loop` + `kda_k2_out_parallel`，且没有 `persistent_loop`）、
+  公共入口继续拒绝它。C=16/32/64 三条腿都跑（和 §11.29 同一个理由：只在别的 build 里存在的
+  路径必须靠矩阵覆盖）。
+- 这条判决同时给后面所有"用更多 GEMM 换更短依赖链"的路线**定了一个价**：本机的稠密并行
+  Cube kernel 实测大约值 16 TFLOPS 有效（含 GM 往返），不是峰值。§11.31 用它算路线 2 的账。
+
+## 11.31. 稠密仿射递推（路线 2）的精度门：`diag(d)` 不能进 bf16 转移矩阵（2026-09-23）
+
+路线 2 把递推改写成
+
+```text
+E = diag(d) - Kg^T W     F = Kg^T U     P = Q - A W     R = A U
+Snext = E S + F          O = P S + R
+```
+
+它与 shipped 的 `Z = U - W S`、`Snext = diag(d) S + Kg^T Z` 代数等价，但**不是 bf16 等价**：
+shipped 用 fp32 的 decay 乘 fp32 的状态，仿射路径的整个转移（包括 decay 本身）必须变成 Cube 的
+bf16 operand。设计书要求"先过长链精度再测完整成本"，这一节就是那个门。
+
+### 1. 工具与口径（`tools/probe_affine_precision.py`）
+
+一次 fp32 chunk 链做参考，然后让四种 rounding discipline 消费**同一组 fp32 中间量**：
+
+| 名称 | 含义 |
+|---|---|
+| `fp32` | 无中间舍入（参考本身） |
+| `shipped` | 现实现：bf16 W/U/Aqk/Qg/kg、bf16 S16 快照、bf16 d1 与 Z、**精确 fp32 decay**、fp32 累加状态 |
+| `affine` | E/P 舍成 bf16（Cube operand），F/R 保持 fp32 |
+| `affine_dec` | 同上，但 decay 留在矩阵外：`Snext = diag(d) S + bf(E_off) S + F` |
+| `affine_fp32` | E 不舍入（上界，用来区分"是 bf16 的错"还是"是形态的错"） |
+
+gate regime：C=64、T=8192、H=8、B=1，三种输入（`long` 长记忆 / `mid` 中等衰减 / `init` 非零初值），
+工具会打印每个 regime 的实测 per-chunk decay `2^Σgate`。
+
+### 2. 结果（state / out 相对误差，vs fp32 参考）
+
+| regime | shipped | affine | affine_dec | affine_fp32 |
+|---|---|---|---|---|
+| long | 4.41e-3 / 6.14e-3 | **5.83e-3** / 6.32e-3 | **3.32e-3** / 5.98e-3 | 3.08e-3 / 5.26e-3 |
+| mid | 4.26e-3 / 8.13e-3 | **7.32e-3** / 6.23e-3 | **3.49e-3** / 5.36e-3 | 3.28e-3 / 5.24e-3 |
+| init | 4.79e-3 / 5.65e-3 | **6.40e-3** / 5.49e-3 | **3.69e-3** / 4.82e-3 | 3.20e-3 / 4.72e-3 |
+
+判决：
+
+1. **把 `diag(d)` 折进 bf16 的 E 不合格**：状态误差比 shipped 高 30～70%（`affine` 与 shipped
+   的差值本身就有 5.2～7.7e-3 相对量级，和中/长记忆 regime 下 shipped 的整份误差同阶）。
+   bf16 只有 8 位有效位，对角线在 1 附近的实现在每 chunk 引入 ~2^-9 的系统性偏差，长链上
+   直接变成状态漂移。
+2. **decay 留在矩阵外合格**：`affine_dec` 的状态误差 3.3～3.7e-3，**比 shipped 低 25～30%**，
+   输出误差也略低——因为仿射路径反而省掉了 shipped 交的两次舍入（d1 与 Z）。也就是说
+   路线 2 的数值可行性存在，但形态被钉死成"fp32 状态 + fp32 decay 留在 AIV，只有
+   `E_off = -Kg^T W` 进 Cube 的 bf16 operand"。
+3. 没有出现长链爆炸：128 个 chunk、弱衰减、非零初值都稳在同一量级。
+4. **口径教训**：仓库默认输入（`g = logsigmoid(randn)`、`A_log = randn(H)`）的 per-chunk
+   decay ≈ 0（状态在一个 chunk 内就忘光），在这种输入下任何 formulation 都看不出差别——
+   一个看不出差别的实验会伪装成"通过了"。工具因此显式构造 long-memory regime 并打印
+   `2^Σgate`。
+5. **方法教训**：这版模拟器的前两稿有 bug——状态 `(V,K)/(K,V)` 装反、`P` 漏了 scale——
+   两次都是靠"同时和 shipped 比一份副表"抓到的（只看 vs fp32 的话，错误会被读成
+   "仿射路径误差 100%，判决不通过"）。数值研究必须自带同形态的影子对照。
+
+### 3. 代价侧（判决的另一半）
+
+设计书口径：目标形状主要 GEMM 从 ~90 GFLOP 增到 ~155 GFLOP（+59 GFLOP，不含公共 K1），
+而且 E/F 的构建在**每个 chunk 的串行链上**。按 §11.30 实测的价位（38.6 GFLOP 的稠密并行
+kernel 单独跑 2.373 ms ⇒ ~16 TFLOPS 有效，其中约 1.5 ms 是 GM 往返），这 +59 GFLOP 值
+1.5～3.7 ms，而 K2 的全部只有 4.08 ms。
+
+结论：**路线 2 不进入实现**——它的数值形态被精度门限死（decay 必须在 AIV 的 fp32 里，
+所以跨核交接一点不少），它的代价按本机实测价位收不回来。除非出现新的硬件事实（例如
+`L0C→A1→L0B` 反馈能稳定省掉一趟 GM——仓库记录过该路径可用，但独立探针没有稳定加速），
+这条路线没有第二次机会。
+
+## 11.32. 三条路线的位置与下一步（2026-09-23）
+
+| 路线 | 状态 | 证据 |
+|---|---|---|
+| 1. state/output 分离 | **判决：不采用**（+1.70 ms / +16.1%，逐位一致） | §11.30，唯一翻盘点是 Level 4 的设备侧重叠 |
+| 2. 稠密仿射递推 | **判决：不采用**（精度门只在 decay 留 AIV 时通过；+59 GFLOP 按实测价位收不回） | §11.31 |
+| 3. 融合式分块 solve | **未测**，入场条件见下 | 设计书 §3 + 本节的定价 |
+| 4. C128 / tile 解耦 | **未测**，是几何候选而非承诺 | 设计书 §4 |
+| 5. segment scan | 后置（小 B/H、超长 T 的专用分支） | 设计书 §4 末 |
+
+路线 3 要动 K1，它的对手不是"空"，而是已上线的两级 solve：隔离口径下 AIV 半 2.40 ms、
+AIC 半 2.59 ms（设计书 §1）。blocked TRSM 变体能省的只有"应用"那半的一部分：按 C=64、
+leaf 16 的口径估，Cube 侧 MAC 从 `64x64x256`（=1.05 M/chunk）降到两次 leaf 应用加一次
+耦合更新（≈0.78 M/chunk），外加上省掉 a16 的 100 MB 写 + 100 MB 读，即 ~25% 的 Cube 工作
+与 ~0.3 ms 的带宽——而 leaf inverse 的批量计算、宽 RHS 的列切片、以及本来就在 AIV 上的
+per-chunk 串行一样都没少。设计书转述的旧 TRSM 原型是 11.45 ms（本轮仓库里没有对应源码，
+按设计判断引用），它否定的是"TRSM 形状不对"的实现，不是这个方向的全部；但在拿到
+"leaf inverse 批量 + 块更新走 Cube + 中间 RHS 不落 GM"的一版实现之前，**不建议动 K1**。
+
+下一步的顺序因此是：路线 3 先做**一份不落 GM 的 leaf-inverse + 块更新设计**（含 slot/credit
+与 UB 预算），再决定是否写 kernel；路线 4 先试不动协议几何的变体（C=96，或"逻辑 chunk 64 +
+值 tile 128"）；路线 5 保持在专用分支的位置。

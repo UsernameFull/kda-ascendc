@@ -122,12 +122,21 @@ NV = 2
 # benchmarking through kda_ascendc_v1.experimental, and the C=16 check is
 # enforced centrally in _kda_fwd_impl so no caller can bypass it.
 PERSISTENT_LOOP = "persistent_loop"
+# Route 1 of the 2026-09-22 redesign (docs/PREFILL_LIFECYCLE_REFACTOR_20260922.md
+# section 4.1): the serial state chain (kda_k2_state_loop) and the output
+# (kda_k2_out_parallel) as two kernels.  Only Z and the state gate the next
+# chunk, so the output of every chunk is computable in parallel from the
+# chunk-entry state the state kernel publishes; the pair is a candidate only
+# if its *total* beats the fused loop (tools/probe_state_out_split.py).  It is
+# not in C16_ONLY_K2_MODES: both kernels are KDA_CHUNK-generic, exactly like
+# the loop they were split out of.
+SPLIT_STATE_OUT = "split_state_out"
 C16_ONLY_K2_MODES = frozenset({
     "separated", "cube_separated", "cube_d3_separated", "cube_full_d4",
     "mix_aic_1_2", "mix_d12_vnew", "persistent", "persistent_scan",
     "persistent_scan_cube", "triton_aiv",
 })
-K2_MODES = frozenset(C16_ONLY_K2_MODES | {PERSISTENT_LOOP})
+K2_MODES = frozenset(C16_ONLY_K2_MODES | {PERSISTENT_LOOP, SPLIT_STATE_OUT})
 _COMPILED = False
 _PERSISTENT_COMPILED = False
 _PERSISTENT_SCAN_COMPILED = False
@@ -343,6 +352,8 @@ _SOURCES: list[tuple[str, str]] = [
     ("kernels/v1/k2_mix_d12_vnew.cpp", "kda_k2_mix_d12_vnew"),
     ("kernels/v1/k2_mix_all_cube.cpp", "kda_k2_mix_all_cube"),
     ("kernels/v1/k2_persistent_loop.cpp", "kda_k2_persistent_loop"),
+    ("kernels/v1/k2_state_loop.cpp", "kda_k2_state_loop"),
+    ("kernels/v1/k2_out_parallel.cpp", "kda_k2_out_parallel"),
     ("kernels/v1/k2_outstate_full.cpp", "kda_k2_outstate_full_kernel"),
     ("kernels/v1/k2_outstate.cpp", "kda_k2_outstate_kernel"),
 ]
@@ -746,7 +757,8 @@ def _kda_fwd_impl(
                  "W": W, "U": U, "persistent": True}
         return out_public, final_state, debug
 
-    if k2_mode == "persistent_loop":
+    if k2_mode in (PERSISTENT_LOOP, SPLIT_STATE_OUT):
+        split = k2_mode == SPLIT_STATE_OUT
         # One device-side chunk loop.  Each block owns up to MAXH=4 heads (both
         # AIV subcores run the same flag sequence and split the value dim), keeps
         # its fp32 state in UB across all chunks and never writes S32 until the
@@ -770,7 +782,15 @@ def _kda_fwd_impl(
                                            else (bh + maxh - 1) // maxh)
         nblk = max(nblk, (bh + maxh - 1) // maxh)
         s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
-        s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
+        # The fused loop publishes the bf16 state into one slot it overwrites
+        # every chunk; the split's state kernel publishes the same bytes into a
+        # per-chunk slot, which is what the output kernel reads as H[c].  The
+        # 384 MiB snapshot is the split's whole extra allocation and the only
+        # reason its write side is free (see k2_state_loop.cpp).
+        s16 = (None if split else
+               torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device))
+        hsnap = (torch.empty((tasks, nt, BV, D), dtype=torch.bfloat16, device=q.device)
+                 if split else None)
         # d1/d2/d3 cross to the vector side as bf16 (the loop's fixpipe rounds
         # them), so they are allocated bf16 here as well: the loop indexes the
         # buffers in bf16 elements and an fp32 allocation silently half-filled
@@ -801,10 +821,32 @@ def _kda_fwd_impl(
         # kda_kg_transpose built.  Dropping that launch saves its 0.16 ms of
         # device time (and the 67 MB round trip) per pass.
         mark("k2_start")
-        _launch("kda_k2_persistent_loop", nblk,
-                _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
-                            out_public, vnew, vnew_t, h0, s32, s16]) +
-                [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
+        if split:
+            # Two launches, both on the caller's stream: the output kernel
+            # needs every chunk's H[c], and a device-side "chunk c is ready"
+            # hand-off between two launches is the Level 4 scheduler, not
+            # this candidate.  The pair's total is the number that decides.
+            mark("k2_state_start")
+            _launch("kda_k2_state_loop", nblk,
+                    _pack_ptrs([U, W, kg, decay, d1, d4f, hsnap,
+                                vnew, vnew_t, h0, s32]) +
+                    [_i(bh), _i(nt), _i(NV), _i(nblk), _i(h)], stream)
+            # Not "..._ms": total_ms sums every *_ms key, and these two are
+            # inside the k2_ms span.
+            finish("k2_state", "k2_state_start")
+            mark("k2_out_start")
+            # `d2`/`d3` are the same per-(task, chunk) bf16 slots the fused
+            # loop's fixpipes wrote, so the arithmetic (and the rounding
+            # positions) of out = d2*scale + d3 are unchanged.
+            _launch("kda_k2_out_parallel", nblk,
+                    _pack_ptrs([qg, aqk16, kg, d2, d3, hsnap, out_public, vnew_t]) +
+                    [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
+            finish("k2_out", "k2_out_start")
+        else:
+            _launch("kda_k2_persistent_loop", nblk,
+                    _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
+                                out_public, vnew, vnew_t, h0, s32, s16]) +
+                    [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
         finish("k2_ms", "k2_start")
         final_state = None if not output_final_state else s32.view(bh, NV, BV, D).reshape(b, h, D, D)
         if profile:
@@ -816,7 +858,9 @@ def _kda_fwd_impl(
                  "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
                  "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
                  "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
-                 "d3": d3, "d4": d4f, "state_s32": s32, "persistent_loop": True}
+                 "d3": d3, "d4": d4f, "state_s32": s32,
+                 "persistent_loop": not split, "split_state_out": split,
+                 "S16snap": hsnap}
         return out_public, final_state, debug
 
     s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
