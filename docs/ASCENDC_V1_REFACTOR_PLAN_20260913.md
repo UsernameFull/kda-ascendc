@@ -1724,3 +1724,194 @@ C=64。四次独立运行的读数一致（±0.05 ms）。
 §11.25 的清单不变，仍然只有"少算工作"（算法/精度）这一条能到 5 ms 量级；本轮的增量是：
 **"排流水"这条在 11.17 之后被再次确认封死，而且这次是在更有利的测法下**（跨阶段、
 真 kernel、真 grid）。新增一条负结果，避免以后再花一轮去试 super-kernel。
+
+## 11.28. 全流水生命周期重构（一）：S1 冻结、三段账本落地，以及它抓到的三处 debug-only 写（2026-09-22）
+
+这一轮的提案是"把 `pre_gram -> solve -> K2` 按生命周期重写：减少中间张量落 GM、扩大阶段重叠"。
+提案的前提是 §11.27 已经量过的那张表：隔离总和 13.27 ms，**在当前形态下还没被吃掉的**
+重叠上界约 1.1 ms（PG‖K2 0.70 + PG‖solve:AIV 0.22 + PG‖solve:AIC 0.17）。所以这一轮不再
+论证"能不能重叠"，而是先把三段的生命周期与字节账做成**可复算的产物**，再用它给候选排序。
+设计书见 `docs/PREFILL_LIFECYCLE_REFACTOR_20260922.md`。
+
+### 1. S1（workspace 池化）：三条证据，判决冻结
+
+§11.26 把 0.873 ms 的暴露 host 份额指向"每次调用的 workspace 分配"，S1 就是把这 28 个
+张量、4.15 GB 的分配缓存到按 shape 键控的池里。三份证据把它否掉：
+
+| 证据 | 读数 | 结论 |
+|---|---|---|
+| `tools/probe_host_cost.py` | 分配臂单独 0.304 ms/调用（host MIN of 12） | 池化能省的**全部**就是这个数 |
+| `tools/probe_workspace_pool.py` | checkout/checkin 0.00x ms，池化后仍持有 4.15 GB | 手臂真实，但只值 0.30 ms |
+| `tools/probe_host_exposure.py` | e2e 中位 10.773 ms 在 host wall 5.84 → 9.34 → 10.90 ms 上**保持平**（< +0.05），到 13.63/18.32 ms 才跟涨（+3.1/+7.6） | host slack ≥ 5 ms，0.30 ms 埋在 slack 里 |
+
+第三条是决定性的：**host 侧能白扛一个设备时间的量级**，所以"省 0.30 ms host"不可能出现在
+端到端数上。同轮还量到池化原型的两种错法（都属于"更快但答案是错的"这一类）：
+
+- 按 `(shape, dtype)` 键控会把 `rk/rv/qg/kg/W/U` 这些同形 buffer 相互别名（实测
+  `max|do| 3.368e-01`、`max|ds| 2.799e-01`，而 e2e 看起来还"快了" 0.606 ms）；
+- 交给上层一个"够形状不够元素数"的 buffer，会撞上 api 自己的 `.view()`（`shape [8,2,64,128]
+  is invalid for input of size 262144`），或在更大的请求上越界读。
+
+负结果被两个文件钉住：`tests/test_workspace_pool.py`（容器契约：互不别名、忙则拒绝、
+换 shape 换条目、buffer 够大）与 `tests/test_workspace_pool_numerics.py`（暴露口径：
+加 host 延迟看 e2e 是否跟涨；host-bound 的小形状必须一对一跟涨）。**S1 冻结。**
+
+### 2. Level 0：三段生命周期 / slot / 流量账
+
+新增 `tools/gen_stage_lifecycle.py`，产出三份产物（`docs/artifacts/`）：
+
+| 产物 | 内容 |
+|---|---|
+| `stage_lifecycle.csv` | 44 行 8 字段账本：producer / consumer / scope / memory / lifetime / sync / layout / role，覆盖 host、pre_gram、solve(wide/assemble/cube)、K2 |
+| `stage_slot_map.csv` | 跨 stage 交接与双 window ring 的 local slot 分配（`pre_gram->solve` 2 槽、`solve->k2` 1 槽、`pre_gram->k2` 3 槽） |
+| `stage_traffic.txt` | 每次调用的 GM 读写账，按 stage 与 producer/consumer 拆分 |
+
+账本不是注释：**每一行都要通过引用校验**——行内引用的符号必须出现在它引用的 kernel（或
+`api.py`）里，交接点引用的代码片段必须逐字存在；字节列由 shape×dtype 推出并与
+`tools/gen_ub_l1_budget.py` 的 workspace 总量对账（4353.69 MB 一致，`tests/test_stage_lifecycle.py`
+把它固定下来）。
+
+`[1,8192,96,128]`、C=64 下的 GM 流量（每调用）：
+
+```text
+总量           写 5042.65 MB   读 4636.85 MB   合计 9679.50 MB
+host           808.50 / 808.50      （输入打包读入）
+pre_gram      2425.36 / 2220.88
+solve_wide     352.32 /  150.99
+solve_assemble  25.17 /   25.17
+solve_cube     402.65 /  402.65
+k2            1028.65 / 1028.65
+```
+
+读法：**pre_gram 一家的 GM 流量（4.6 GB）就占全流水的一半**，因为它的 Gram 产物要在
+AIC 与 AIV 之间走两趟 GM（AIC 落 raw fp32 → AIV 取回、mask/scale 后再落）。
+
+### 3. 账本抓到的候选：三处 debug-only 写
+
+把每行的 consumer 追一遍，发现生产路径上有三个缓冲区**没有 kernel 读**，只有
+`return_intermediates` 的 debug dict 读：
+
+| 写 | 字节/调用 | 谁写 | 为什么没人读 |
+|---|---:|---|---|
+| `Aqk32` masked 回写 | 201.33 MB | pre_gram AIV `post_gram`（select+scale 后 MTE3） | 生产只消费 `Aqk16`；`Aqk32` 只在 debug dict |
+| `A32` | 201.33 MB | solve wide AIV（fp32 A_inv） | 生产只消费 `A16`；`A32` 只在 debug dict |
+| `BetaOut` | 3.15 MB | pre_gram AIV | 同上 |
+
+另有 `Aqk32` **raw 的一次复读**（201.33 MB）：AIV 的 band 循环要把 raw Gram 取回来做
+mask/scale，这次读是结构上需要的（除非 mask/scale 搬到 Cube），先记着不当作候选。
+
+按仓库自己的两个实测速率折算：
+
+```text
+0.095 ms / 201 MB store（R3 的 K2 v_new 守卫）  → 三处 0.191 ms，含复读 0.286 ms
+0.2 ms / GB（§11.12 的 L2 流量价）              → 三处 0.081 ms，含复读 0.121 ms
+```
+
+两个数都远小于 §11.27 的 1.1 ms 上界，但**这是当前唯一"改动小、可位一致、有既有先例"的
+候选**（K2 的 row-major `v_new` 就是同一个 pattern，§11.25 已落地）。判决：**允许进入
+Level 1，但必须先做同进程交错 A/B**——两个速率差 2.4 倍，说明这 400 MB 里有多少是真暴露的
+写带宽、多少已经被 MTE3 排水吃掉，只有量了才知道。
+
+### 4. 设备健康：这次有 4 个 pin 的失败是环境，不是回归
+
+本轮开始时 `npu-smi` 上 device 0 是 `Alarm`（`extra-info/data-dump/0/` 有 03:11 的
+exception dump），在它上面跑 `tests/test_workspace_pool_numerics.py` 得到
+`Vector core execution timed out` / `aclrtMemcpyAsync workspace input failed: 507034`，
+4 个 pin 记在 `lastfailed` 里；换到健康的 device 1（`ASCEND_RT_VISIBLE_DEVICES=1`）同代码
+重跑，`..` 全过。**规则：跑任何 device 侧 pin 之前先看 `npu-smi` 的 Health 列；Alarm 设备
+上的失败不进结论。**
+
+### 5. 这一轮之后还剩什么
+
+| 方向 | 上界/代价 | 状态 |
+|---|---:|---|
+| S1 workspace 池化 | 0.30 ms，且埋在 ≥5 ms 的 host slack 里 | **冻结** |
+| debug-only 三处写（Aqk32/A32/BetaOut） | 0.08～0.19 ms（不含复读） | **候选**（Level 1，需交错 A/B） |
+| `Aqk32` raw 复读（mask/scale 搬 Cube） | +0.04～0.10 ms | 待定（要动 pre_gram 的 AIV band 循环） |
+| Level 2 `pre_gram->solve` window 流式 | 省 L/Rk/Rv 的一趟 GM = 0.6 GB ≈ 0.12 ms（L2 价） | 未开工（先交 slot/credit 协议） |
+| Level 3 `solve->K2` window 流式 | 省 W/U 的一趟 = 0.4 GB ≈ 0.08 ms | 未开工 |
+| super-kernel / persistent scheduler | §11.27 判决：整条路线冻结 | **冻结** |
+
+Level 2/3 的准入条件（slot 字节账、credit/free 协议、同步审计 diff、精度 gate、交错 A/B）
+写进了设计书第 3 节；按 L2 价，这两级加起来也只值 0.2 ms 量级，因此**顺序是把 Level 1 的
+三处写先量掉**，再决定要不要为 0.2 ms 重排跨 stage 交接。
+
+## 11.29. 全流水生命周期重构（二）：三处 debug-only store 落地（-0.164 ms），以及一次空指针的教训（2026-09-23）
+
+§11.28 的账本把它们排在最前面：一次调用里有三个缓冲区**没有设备侧读者**——`Aqk32` 的
+masked fp32 回写（pre_gram AIV）、`A32`（wide solve 的 fp32 A_inv）、`BetaOut`——它们只服务
+`return_intermediates` 的 debug 视图。当时按仓库两个实测速率折算成 0.081～0.191 ms，判决是
+"候选，先做同进程交错 A/B"。这一节是那次 A/B 与落地。
+
+### 1. 一次失败：不能用空指针关掉 `Aqk32` 的回写
+
+第一版实现沿用 K2 `v_new` 的写法——生产传空指针、kernel 判 `pAqk32 != nullptr`。结果是设备
+直接报错（`npuSynchronizeDevice ... SUSPECT REMOTE ERROR, error code 507057`）。原因很直接：
+`Aqk32` 那块 GM **同时是 pre_gram AIV 的输入**——`post_gram` 的 band 循环要把 Cube 落下的
+raw Gram 读回来做 mask/scale/round，只有"masked 回写"是没人读的。指针一为空，读的那条
+`DataCopy` 就去访问地址 0。
+
+改法：两个 kernel 各加一个 `int32_t debugStores` 尾参数，`api.py` 传
+`1 if keep_debug else 0`；`keep_debug = return_intermediates or KDA_DEBUG_STORES == "1"`，
+生产默认 0。**为什么是 flag 不是空指针**：一块 buffer 只要还有人读，它的生命周期就不能靠
+指针是否为空来表达。`A32`/`BetaOut` 本来可以安全地用空指针（kernel 里只有写），但三个 store
+用同一个机制更好审计。
+
+### 2. A/B（`tools/probe_dead_store.py`）
+
+同一进程、同一份编译产物，两臂只差 `KDA_DEBUG_STORES`（0/1），每轮跑两臂、取 `do_bench`
+中位（warmup 100 ms / rep 800 ms），三轮：
+
+| 轮次 | stock (10.7x) | guard | 备注 |
+|---|---:|---:|---|
+| 1 | 10.765 (p20 10.743 / p80 10.809) | 10.600 (p20 10.583 / p80 10.648) | |
+| 2 | 10.754 (p20 10.735 / p80 10.805) | 10.603 (p20 10.587 / p80 10.641) | |
+| 3 | 10.766 (p20 10.741 / p80 10.801) | 10.601 (p20 10.586 / p80 10.638) | |
+| **中位** | **10.765** | **10.601** | **−0.164 ms（−1.5%）** |
+
+两臂的臂内 p20/p80 只差 0.05 ms，三轮间差 0.012 ms（远小于 0.164 ms 的信号），并且
+**输出与 final_state 逐位一致**（`torch.equal`）——跳过一块没人读的 store 不改变任何算术。
+实测 −0.164 ms 落在两个估计值（0.081 / 0.191）之间：说明这 405.8 MB 里大约三分之二确实是
+暴露的写带宽，其余被 MTE3 排水吃掉了。
+
+### 3. 落地与门禁
+
+- `kernels/v1/k1_pre_gram_mix.cpp`、`kernels/v1/k1_solve_wu_wide.cpp`：新增 `debugStores`
+  尾参数，三处 store 受它控制（`Aqk32` 的读、`L` 的回写、`Aqk16` 的 Cast 全部不动）；
+- `python/kda_ascendc_v1/api.py`：`keep_debug` 决定该参数，默认 0；`KDA_DEBUG_STORES=1`
+  是回到旧行为的开关；`return_intermediates=True` 时三块照写（debug 视图不放未初始化内存）；
+- `tests/test_dead_store.py`：三件事——flag 真的传到了两个 kernel（host 侧抓 launch 参数）、
+  两臂逐位一致、`return_intermediates` 仍然填满三块 tile；
+- 写这个测试时抓到一个**与本次改动无关的既有缺口**：`A32` 的 debug 视图只被写了一半。
+  wide kernel 写对角线子块、并把严格上三角清零，但**左下角的耦合块 X21 是 assemble kernel
+  算进 `Pmid` 的，没有任何 kernel 把它写回 A32**——那块是未初始化的设备内存，同一次调用的
+  两次运行会给出不同的值（实测第一带 −2.68e-17 vs 0.0）。测试因此只比较"真被写过"的区域，
+  并把这条记录在这里：`return_intermediates` 的 `A32` 视图在下三角的耦合块上是垃圾值，
+  要修就得让 assemble 顺手写一份 fp32（+201 MB store，与本轮的目标相反），所以先记不修；
+- 账本随改动更新：生产 GM 写 **5042.65 → 4636.85 MB**，总流量 **9679.50 → 9273.70 MB**
+  （每调用、C=64），三行标为 `skipped`，`tests/test_stage_lifecycle.py` 断言它们不计入生产
+  流量——这正是 §11.28 给账本定的规矩："落了守卫就要同一次改动里教会账本"。
+
+**本轮的门禁**：`tools/run_chunk_matrix.sh`（C=16/32/64 三条腿）全绿；benchmark 的 golden
+没有重录——本机是 `Ascend910B3` 而 golden 记在 `Ascend910_9382`（§11.26 的口径规则：跨设备
+只比同一格式内的比值），跨设备的 gate 读数不属于本轮证据，A/B 才是。
+
+落地时的一个教训，值得单独写下来：`keepA32` 的声明最初被放在 `#if KDA_SOLVE_WIDE_SUBB > 1`
+里面，而它的第二个使用点在**单层路径**上——C=16/32 恰好只编译那条。于是 **C=64 的 A/B 全绿、
+C=16 的 RTC 编译直接失败**（`aclrtcCompileProg failed`），是 `tools/run_chunk_matrix.sh` 的
+C=16 腿抓到的。这和 §11.24 的 C=32 bug 是同一类：一个只在别的 build 里存在的代码路径，
+必须靠三个 build 的矩阵去覆盖，不能靠"生产形状量过了"来推断。
+
+### 4. 还剩什么
+
+| 方向 | 上界/代价 | 状态 |
+|---|---:|---|
+| 三处 debug-only store | 实测 −0.164 ms | **已落地** |
+| `Aqk32` raw 复读（201 MB，需要把 mask/scale 搬到 Cube） | +0.04～0.10 ms | 待定（要动 pre_gram 的 AIV band 循环） |
+| Level 2 `pre_gram->solve` window 流式（省 L/Rk/Rv 一趟 GM） | ≈0.12 ms（L2 价） | 需先交 slot/credit 协议 |
+| Level 3 `solve->K2` window 流式（省 W/U 一趟） | ≈0.08 ms | 同上 |
+| S1 workspace 池化 / super-kernel | §11.28 / §11.27 判决 | **冻结** |
+
+下一档的账要诚实：Level 2/3 加起来约 0.2 ms，而它们要动的是跨 launch 的交接协议与同步审计，
+成本远高于本轮这个 3 文件的守卫。**先把 Level 1 剩下的一条（`Aqk32` raw 复读，同一套账本
+已经标好位置）量掉**，再决定要不要为 0.2 ms 重排 pre_gram->solve 的交接。

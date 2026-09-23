@@ -1,0 +1,321 @@
+{
+  "barrier_total": 18,
+  "barriers_by_pipe": {
+    "ALL": 7,
+    "M": 1,
+    "MTE3": 2,
+    "V": 8
+  },
+  "flag_pairing": [
+    {
+      "balanced": true,
+      "balanced_inloop": true,
+      "flag": "FL_C1",
+      "id": 0,
+      "inloop_sets": 1,
+      "inloop_waits": 1,
+      "pipeline_primed": false,
+      "prologue_sets": 0,
+      "set_count": 1,
+      "set_pipes": {
+        "PIPE_FIX": 1
+      },
+      "set_sites": [
+        {
+          "engine": "AIC",
+          "line": 269,
+          "pipe": "PIPE_FIX",
+          "stage": "stage1"
+        }
+      ],
+      "wait_count": 1,
+      "wait_sites": [
+        {
+          "engine": "AIV",
+          "line": 555,
+          "stage": "stage3"
+        }
+      ]
+    },
+    {
+      "balanced": true,
+      "balanced_inloop": true,
+      "flag": "FL_V",
+      "id": 1,
+      "inloop_sets": 1,
+      "inloop_waits": 1,
+      "pipeline_primed": false,
+      "prologue_sets": 0,
+      "set_count": 1,
+      "set_pipes": {
+        "PIPE_MTE3": 1
+      },
+      "set_sites": [
+        {
+          "engine": "AIV",
+          "line": 614,
+          "pipe": "PIPE_MTE3",
+          "stage": "stage3"
+        }
+      ],
+      "wait_count": 1,
+      "wait_sites": [
+        {
+          "engine": "AIC",
+          "line": 298,
+          "stage": "stage3"
+        }
+      ]
+    },
+    {
+      "balanced": true,
+      "balanced_inloop": true,
+      "flag": "FL_C2",
+      "id": 2,
+      "inloop_sets": 1,
+      "inloop_waits": 1,
+      "pipeline_primed": false,
+      "prologue_sets": 0,
+      "set_count": 1,
+      "set_pipes": {
+        "PIPE_FIX": 1
+      },
+      "set_sites": [
+        {
+          "engine": "AIC",
+          "line": 410,
+          "pipe": "PIPE_FIX",
+          "stage": "stage3"
+        }
+      ],
+      "wait_count": 1,
+      "wait_sites": [
+        {
+          "engine": "AIV",
+          "line": 631,
+          "stage": "stage4"
+        }
+      ]
+    },
+    {
+      "balanced": true,
+      "balanced_inloop": true,
+      "flag": "FL_R",
+      "id": 3,
+      "inloop_sets": 1,
+      "inloop_waits": 1,
+      "pipeline_primed": true,
+      "prologue_sets": 1,
+      "set_count": 2,
+      "set_pipes": {
+        "PIPE_MTE3": 2
+      },
+      "set_sites": [
+        {
+          "engine": "AIV",
+          "line": 536,
+          "pipe": "PIPE_MTE3",
+          "stage": "stage3"
+        },
+        {
+          "engine": "AIV",
+          "line": 698,
+          "pipe": "PIPE_MTE3",
+          "stage": "stage4"
+        }
+      ],
+      "wait_count": 1,
+      "wait_sites": [
+        {
+          "engine": "AIC",
+          "line": 205,
+          "stage": "stage1"
+        }
+      ]
+    }
+  ],
+  "hard_event_counts": {
+    "SetFlag<FIX_M>": 2,
+    "SetFlag<MTE1_M>": 2,
+    "SetFlag<MTE2_MTE1>": 2,
+    "SetFlag<MTE2_V>": 5,
+    "SetFlag<MTE3_V>": 1,
+    "SetFlag<M_FIX>": 2,
+    "SetFlag<M_MTE1>": 2,
+    "SetFlag<V_MTE2>": 2,
+    "SetFlag<V_MTE3>": 4,
+    "WaitFlag<FIX_M>": 2,
+    "WaitFlag<MTE1_M>": 2,
+    "WaitFlag<MTE2_MTE1>": 2,
+    "WaitFlag<MTE2_V>": 5,
+    "WaitFlag<MTE3_V>": 1,
+    "WaitFlag<M_FIX>": 2,
+    "WaitFlag<M_MTE1>": 2,
+    "WaitFlag<V_MTE2>": 2,
+    "WaitFlag<V_MTE3>": 4
+  },
+  "kernel": "kernels/v1/k2_persistent_loop.cpp",
+  "loops": {
+    "n_chunk_loop": "NT (T / KDA_CHUNK)",
+    "n_head_loop": "nh <= MAXH",
+    "stage_order": {
+      "AIC": [
+        1,
+        3
+      ],
+      "AIV": [
+        2,
+        4
+      ]
+    }
+  },
+  "producer_consumer": [
+    {
+      "buffer": "U (input)",
+      "live": "whole call",
+      "read": "AIV stage 2 (DataCopy ub)",
+      "where": "GM",
+      "written": "host, once per call"
+    },
+    {
+      "buffer": "W, Qg (input)",
+      "live": "whole call",
+      "read": "AIC stage 1 (qw/qg -> L0A)",
+      "where": "GM",
+      "written": "K1 solve, once per call"
+    },
+    {
+      "buffer": "Aqk, Kg (input)",
+      "live": "whole call",
+      "read": "AIC stage 3 (qa/qk)",
+      "where": "GM",
+      "written": "K1 pre_gram, once per call"
+    },
+    {
+      "buffer": "Decay (input)",
+      "live": "whole call",
+      "read": "AIV stage 4 (DataCopy dec)",
+      "where": "GM",
+      "written": "K1 pre_gram"
+    },
+    {
+      "buffer": "D1, D2 (bf16)",
+      "live": "chunk-loop, one chunk",
+      "read": "AIV stage 2 (DataCopy d1)",
+      "where": "GM",
+      "written": "AIC stage 1 Fixpipe"
+    },
+    {
+      "buffer": "D3 (bf16)",
+      "live": "chunk-loop, one chunk",
+      "read": "AIV stage 4 (DataCopy d3)",
+      "where": "GM",
+      "written": "AIC stage 3 Fixpipe"
+    },
+    {
+      "buffer": "D4 (fp32)",
+      "live": "chunk-loop, one chunk",
+      "read": "AIV stage 4 (four quarter loads)",
+      "where": "GM",
+      "written": "AIC stage 3 Fixpipe"
+    },
+    {
+      "buffer": "VnewT (bf16)",
+      "live": "chunk-loop, one chunk",
+      "read": "AIC stage 3 (qv/vx -> L0A/L0B)",
+      "where": "GM",
+      "written": "AIV stage 2 (DataCopy Vt)"
+    },
+    {
+      "buffer": "S16 (bf16)",
+      "live": "across chunks (whole call)",
+      "read": "AIC stage 1 (qs -> L0B)",
+      "where": "GM",
+      "written": "AIV (start-up + stage 4 quarters)"
+    },
+    {
+      "buffer": "S32 (fp32)",
+      "live": "whole call",
+      "read": "host",
+      "where": "GM",
+      "written": "AIV, once at the end"
+    },
+    {
+      "buffer": "Out (bf16)",
+      "live": "whole call",
+      "read": "host",
+      "where": "GM",
+      "written": "AIV stage 4 (first quarter)"
+    },
+    {
+      "buffer": "H0 (fp32)",
+      "live": "prologue",
+      "read": "AIV start-up (DataCopy state)",
+      "where": "GM",
+      "written": "host, once per call"
+    },
+    {
+      "buffer": "cf (L0C)",
+      "live": "one head-step",
+      "read": "Fixpipe stages 1/3",
+      "where": "L0C",
+      "written": "Mmad stages 1/3"
+    },
+    {
+      "buffer": "l0a/l0b (L0A/L0B)",
+      "live": "one head-step",
+      "read": "Mmad stages 1/3",
+      "where": "L0A/L0B",
+      "written": "LoadData stages 1/3"
+    },
+    {
+      "buffer": "lw/lg/ls/la/lv/lx/lk (L1)",
+      "live": "one head-step",
+      "read": "LoadData stages 1/3",
+      "where": "L1",
+      "written": "DataCopy (Nd2Nz)"
+    },
+    {
+      "buffer": "ub/vf/sc/vt (UB)",
+      "live": "stage2 phase, one head-step",
+      "read": "AIV stage 2/3 hand-off",
+      "where": "UB",
+      "written": "AIV stage 2"
+    },
+    {
+      "buffer": "d1/d1f/d2/d3/d3f/ob (UB)",
+      "live": "aliased phase pair (stage2|stage4)",
+      "read": "AIV stage 2/4",
+      "where": "UB",
+      "written": "AIV stage 2/4"
+    },
+    {
+      "buffer": "vb/d4 (UB)",
+      "live": "stage4 phase, one head-step",
+      "read": "AIV stage 4 recurrence",
+      "where": "UB",
+      "written": "AIV stage 4 quarter loads"
+    },
+    {
+      "buffer": "st (fp32 state, UB)",
+      "live": "whole call, resident",
+      "read": "stage-4 recurrence + final publish",
+      "where": "UB",
+      "written": "prologue + stage 4"
+    },
+    {
+      "buffer": "dec (UB)",
+      "live": "one head-step",
+      "read": "AIV stage 4 Mul",
+      "where": "UB",
+      "written": "AIV stage 4 (DataCopy)"
+    },
+    {
+      "buffer": "s16 (UB)",
+      "live": "one quarter",
+      "read": "AIV MTE3 store to S16",
+      "where": "UB",
+      "written": "AIV Cast"
+    }
+  ]
+}

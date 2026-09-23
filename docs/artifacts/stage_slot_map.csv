@@ -1,0 +1,7 @@
+pair,local_slot,buffer,grain,bytes_per_slot,producer,consumer,ring
+pre_gram -> solve,0,L masked,chunk,201326592,pre_gram AIV post_gram,solve_wide AIV bLraw,double window (2 x n_local)
+pre_gram -> solve,1,"Rk, Rv",chunk,402653184,pre_gram AIV,solve_cube AIC L0B,double window (2 x n_local)
+solve -> k2,0,"W, U",chunk,402653184,solve_cube AIC,k2 AIC stage 1 (W),double window (2 x n_local)
+pre_gram -> k2,0,"Qg, Kg",chunk,402653184,pre_gram AIV,k2 AIC stages 1/3,double window (2 x n_local)
+pre_gram -> k2,1,Aqk16,chunk,100663296,pre_gram AIV,k2 AIC stage 3,double window (2 x n_local)
+pre_gram -> k2,2,Decay,chunk,6291456,pre_gram AIV,k2 AIV stage 4,double window (2 x n_local)

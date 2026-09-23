@@ -1,0 +1,43 @@
+geometry: C=32  shape=(1, 8192, 96, 128)  MAXH=4
+
+UB budget (per AIV subcore, cap 192 KB):
+   resident fp32 state  MAXH * S_TILE         128.0 KB
+   aliased staging                              36.5 KB
+   TOTAL                                       164.5 KB   headroom 27.5 KB
+
+L1 / L0 budget (per AIC):
+   7 B1 queues                                  74.0 KB
+   L1 cap                                      512.0 KB   headroom 438.0 KB
+   CO1 (L0C)                                    48.0 KB of 128 KB
+   L0A                                          16.0 KB of 64 KB
+   L0B                                          32.0 KB of 64 KB
+
+workspace (allocated per call):
+   gate             402.65 MB  fp32
+   gc               402.65 MB  fp32
+   qn               201.33 MB  bf16
+   kn               201.33 MB  bf16
+   rk               201.33 MB  bf16
+   rv               201.33 MB  bf16
+   qg               201.33 MB  bf16
+   kg               201.33 MB  bf16
+   W                201.33 MB  bf16
+   U                201.33 MB  bf16
+   d1               201.33 MB  bf16
+   d2               201.33 MB  bf16
+   d3               201.33 MB  bf16
+   out_public       201.33 MB  bf16
+   vnew_t           201.33 MB  bf16
+   vnew             201.33 MB  bf16  [intermediates only]
+   aqk32            100.66 MB  fp32
+   L                100.66 MB  fp32
+   a32              100.66 MB  fp32
+   aqk16             50.33 MB  bf16
+   a16               50.33 MB  bf16
+   decay             12.58 MB  fp32
+   s32                6.29 MB  fp32
+   d4f                6.29 MB  fp32
+   beta_out           3.15 MB  fp32
+   s16                3.15 MB  bf16
+   TOTAL           3856.66 MB  (production)
+   peak live         402.65 MB  (guard: the pool has to hold this)

@@ -196,7 +196,8 @@ def _solve_streams(device: torch.device):
 
 
 def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
-                            a32, a16, xb, lneg, pmid, rk, rv, W, U, stream) -> None:
+                            a32, a16, xb, lneg, pmid, rk, rv, W, U, stream,
+                            debug_stores) -> None:
     """R1 two-level solve: wide kernel (AIV), then assemble + Cube (AIC).
 
     The substitution runs on M = CHUNK/SB sub-blocks (k1_solve_wu_wide.cpp) and
@@ -234,7 +235,7 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
     for glo, ghi in pairs:
         lo, n = glo * unit, (ghi - glo) * unit
         wargs = _pack_ptrs([L[lo:], eye, a32[lo:], a16[lo:], xb[lo:],
-                            lneg[lo:]]) + [_i(n)]
+                            lneg[lo:]]) + [_i(n), _i(1 if debug_stores else 0)]
         aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:], pmid[lo:]]) + [_i(n)]
         cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + [_i(n)]
         ncube = min(n, c - lo)
@@ -592,6 +593,20 @@ def _kda_fwd_impl(
     # it only writes Qn/Kn/Gate/Gc when those pointers are non-null (the
     # ``return_intermediates`` debug path).
     keep = return_intermediates
+    # Three of the buffers a call allocates exist for the
+    # ``return_intermediates`` views and are read by nothing on the device:
+    # Aqk32's masked fp32 copy (the band loop reads the raw one; Aqk16 is
+    # rounded from registers), A32 (the wide solve's fp32 A_inv - the Cube
+    # solve reads A16) and BetaOut.  Writing them costs 405 MB per call at
+    # C=64 and 0.19 ms at R3's measured store rate, so the two kernels take a
+    # ``debugStores`` flag and production passes 0.  It is a flag and not a
+    # nulled pointer because the raw Aqk32 slot stays live either way: the
+    # pre_gram band loop reads it back before the masked copy exists.
+    # Measured interleaved at [1,8192,96,128]/C=64 (tools/probe_dead_store.py,
+    # 3 rounds x 800 ms): 10.765 -> 10.601 ms for the three stores together, so
+    # the flag defaults to off and KDA_DEBUG_STORES=1 is the way back to the
+    # old behaviour (docs 11.29).
+    keep_debug = keep or os.environ.get("KDA_DEBUG_STORES", "0") == "1"
     pre_head = [q, k, v, g, beta_pack, A_log, bias,
                 qn if keep else None, kn if keep else None,
                 gate if keep else None, gc if keep else None,
@@ -616,6 +631,8 @@ def _kda_fwd_impl(
                   or (1 if c < 256 else min(64, max(2, c // 192))))
     mark("pre_gram_start")
     if os.environ.get("KDA_PRE_GRAM", "mix") == "aiv":
+        # The vector-only experiment path has no debugStores flag: it keeps
+        # writing its Aqk32/BetaOut tiles, exactly as before this change.
         pre_args = _pack_ptrs(pre_head + pre_tail)
         pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
                      _i(qk_row_bytes), _i(g_row_bytes)]
@@ -638,7 +655,7 @@ def _kda_fwd_impl(
         pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
                               + pre_tail)
         pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
-                     _i(qk_row_bytes), _i(g_row_bytes)]
+                     _i(qk_row_bytes), _i(g_row_bytes), _i(1 if keep_debug else 0)]
         # One MIX block pairs an AIC with two AIV subcores, so it covers
         # 2 * pre_unroll chunks.
         _launch("kda_pre_gram_mix", (c + 2 * pre_unroll - 1) // (2 * pre_unroll),
@@ -664,14 +681,16 @@ def _kda_fwd_impl(
                                 SOLVE_OVERLAP, L,
                                 _tri_eye(q.device, CHUNK // SOLVE_WIDE_SUBB),
                                 a32, a16,
-                                xb, lneg, pmid, rk, rv, W, U, stream)
+                                xb, lneg, pmid, rk, rv, W, U, stream,
+                                1 if keep_debug else 0)
     else:
         # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector
         # instruction (see the kernel header); the padded chunks are solved too
         # but land outside the first c.  The two-level operands are null here:
         # the kernel takes them in every build, and a short argument list would
         # leave it reading C out of the args array's tail.
-        solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16, None, None]) + [_i(c)]
+        solve_args = _pack_ptrs([L, _tri_eye(q.device), a32, a16, None, None])
+        solve_args += [_i(c), _i(1 if keep_debug else 0)]
         _launch("kda_solve_wu_wide", c_solve // SOLVE_WIDE_NCHUNK, solve_args, stream)
         # The Cube needs the bf16 A_inv the substitution just wrote, so the two
         # launches stay ordered on the stream.

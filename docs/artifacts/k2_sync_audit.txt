@@ -1,0 +1,39 @@
+K2 sync audit: kernels/v1/k2_persistent_loop.cpp
+  flags: 4  (balanced: True)
+  flag     id sets(wait)  inloop      prologue  pairing
+  FL_C1     0    1/1       1/1    0         balanced
+        set  [AIC/stage1@269]
+        wait [AIV/stage3@555]
+  FL_V      1    1/1       1/1    0         balanced
+        set  [AIV/stage3@614]
+        wait [AIC/stage3@298]
+  FL_C2     2    1/1       1/1    0         balanced
+        set  [AIC/stage3@410]
+        wait [AIV/stage4@631]
+  FL_R      3    2/1       1/1    1         primed +1
+        set  [AIV/stage3@536,AIV/stage4@698]
+        wait [AIC/stage1@205]
+  PipeBarrier by pipe: ALL x7, M x1, MTE3 x2, V x8  (total 18)
+  HardEvent pairs (set+wait): SetFlag<FIX_M> x2, SetFlag<MTE1_M> x2, SetFlag<MTE2_MTE1> x2, SetFlag<MTE2_V> x5, SetFlag<MTE3_V> x1, SetFlag<M_FIX> x2, SetFlag<M_MTE1> x2, SetFlag<V_MTE2> x2, SetFlag<V_MTE3> x4, WaitFlag<FIX_M> x2, WaitFlag<MTE1_M> x2, WaitFlag<MTE2_MTE1> x2, WaitFlag<MTE2_V> x5, WaitFlag<MTE3_V> x1, WaitFlag<M_FIX> x2, WaitFlag<M_MTE1> x2, WaitFlag<V_MTE2> x2, WaitFlag<V_MTE3> x4
+  producer-consumer lifetime table (21 rows):
+    U (input)                    GM       w:host, once per call                        r:AIV stage 2 (DataCopy ub)                      live:whole call
+    W, Qg (input)                GM       w:K1 solve, once per call                    r:AIC stage 1 (qw/qg -> L0A)                     live:whole call
+    Aqk, Kg (input)              GM       w:K1 pre_gram, once per call                 r:AIC stage 3 (qa/qk)                            live:whole call
+    Decay (input)                GM       w:K1 pre_gram                                r:AIV stage 4 (DataCopy dec)                     live:whole call
+    D1, D2 (bf16)                GM       w:AIC stage 1 Fixpipe                        r:AIV stage 2 (DataCopy d1)                      live:chunk-loop, one chunk
+    D3 (bf16)                    GM       w:AIC stage 3 Fixpipe                        r:AIV stage 4 (DataCopy d3)                      live:chunk-loop, one chunk
+    D4 (fp32)                    GM       w:AIC stage 3 Fixpipe                        r:AIV stage 4 (four quarter loads)               live:chunk-loop, one chunk
+    VnewT (bf16)                 GM       w:AIV stage 2 (DataCopy Vt)                  r:AIC stage 3 (qv/vx -> L0A/L0B)                 live:chunk-loop, one chunk
+    S16 (bf16)                   GM       w:AIV (start-up + stage 4 quarters)          r:AIC stage 1 (qs -> L0B)                        live:across chunks (whole call)
+    S32 (fp32)                   GM       w:AIV, once at the end                       r:host                                           live:whole call
+    Out (bf16)                   GM       w:AIV stage 4 (first quarter)                r:host                                           live:whole call
+    H0 (fp32)                    GM       w:host, once per call                        r:AIV start-up (DataCopy state)                  live:prologue
+    cf (L0C)                     L0C      w:Mmad stages 1/3                            r:Fixpipe stages 1/3                             live:one head-step
+    l0a/l0b (L0A/L0B)            L0A/L0B  w:LoadData stages 1/3                        r:Mmad stages 1/3                                live:one head-step
+    lw/lg/ls/la/lv/lx/lk (L1)    L1       w:DataCopy (Nd2Nz)                           r:LoadData stages 1/3                            live:one head-step
+    ub/vf/sc/vt (UB)             UB       w:AIV stage 2                                r:AIV stage 2/3 hand-off                         live:stage2 phase, one head-step
+    d1/d1f/d2/d3/d3f/ob (UB)     UB       w:AIV stage 2/4                              r:AIV stage 2/4                                  live:aliased phase pair (stage2|stage4)
+    vb/d4 (UB)                   UB       w:AIV stage 4 quarter loads                  r:AIV stage 4 recurrence                         live:stage4 phase, one head-step
+    st (fp32 state, UB)          UB       w:prologue + stage 4                         r:stage-4 recurrence + final publish             live:whole call, resident
+    dec (UB)                     UB       w:AIV stage 4 (DataCopy)                     r:AIV stage 4 Mul                                live:one head-step
+    s16 (UB)                     UB       w:AIV Cast                                   r:AIV MTE3 store to S16                          live:one quarter

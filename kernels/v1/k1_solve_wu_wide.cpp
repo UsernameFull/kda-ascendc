@@ -89,7 +89,7 @@ constexpr int32_t RW21 = NCH * M;  // floats in one row of the L21 tile
 
 extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     GM_ADDR pL, GM_ADDR pEye, GM_ADDR pA32, GM_ADDR pA16, GM_ADDR pXb,
-    GM_ADDR pLneg, int32_t C) {
+    GM_ADDR pLneg, int32_t C, int32_t debugStores) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const int32_t c0 = GetBlockIdx() * NCH;
     if (c0 >= C) return;
@@ -200,16 +200,25 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
 
     SetFlag<HardEvent::V_MTE3>(e3);
     WaitFlag<HardEvent::V_MTE3>(e3);
+    // A32 has no device consumer at all (the Cube solve reads A16, W and U and
+    // the debug views are host-side), so production skips its stores - 201 MB
+    // per call at C=64 (docs 11.29).  The declaration has to sit outside the
+    // SUBB > 1 block below: the second store it guards is the single-level
+    // path's, which is exactly the C=16/32 builds.
+    const bool keepA32 = (debugStores != 0);
 #if KDA_SOLVE_WIDE_SUBB > 1
     // Both exports get the blank: the Cube solve reads A16, and A32 is the
     // fp32 twin the debug views hand out - leaving it uninitialised made the
     // two disagree on a block that is zero in A_inv.
+    // The A16 store next to each one is the one that has to stay.
     for (int32_t s = 0; s + 1 < SB; ++s) {
         for (int32_t s2 = s + 1; s2 < SB; ++s2) {
             for (int32_t ch = 0; ch < NCH; ++ch) {
                 const uint64_t d = static_cast<uint64_t>(c0 + ch) * PC * PC
                                    + (s * M) * PC + s2 * M;
-                DataCopy(A32[d], zf, DataCopyParams(M, M / 8, 0, (PC - M) / 8));
+                if (keepA32) {
+                    DataCopy(A32[d], zf, DataCopyParams(M, M / 8, 0, (PC - M) / 8));
+                }
                 DataCopy(A16[d], zrow, DataCopyParams(M, M / 16, 0, (PC - M) / 16));
             }
         }
@@ -222,8 +231,10 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
             const int32_t t = s * NCH + ch;
             const uint64_t d =
                 static_cast<uint64_t>(c0 + ch) * PC * PC + (s * M) * PC + s * M;
-            DataCopy(A32[d], af[t * M],
-                     DataCopyParams(M, M / 8, (NC - 1) * (M / 8), (PC - M) / 8));
+            if (keepA32) {
+                DataCopy(A32[d], af[t * M],
+                         DataCopyParams(M, M / 8, (NC - 1) * (M / 8), (PC - M) / 8));
+            }
             DataCopy(A16[d], ab[t * M],
                      DataCopyParams(M, M / 16, (NC - 1) * (M / 16), (PC - M) / 16));
 #if KDA_SOLVE_WIDE_SUBB > 1

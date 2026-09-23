@@ -1,0 +1,57 @@
+geometry: C=64 b=1 t=8192 h=96 d=128  nt=128 bh=96 c=12288 tasks=192 nblk=24 maxh=4
+
+lifecycle ledger rows: 44  (validated against 6 kernels + api.py)
+workspace reconciled with gen_ub_l1_budget.py: 4353.69 MB
+
+GM traffic per call (production path):
+   writes 4636.85 MB   reads 4636.85 MB   total 9273.70 MB
+
+   by stage:
+      host            w   808.50 MB  r   808.50 MB
+      pre_gram        w  2220.88 MB  r  2220.88 MB
+      solve_wide      w   150.99 MB  r   150.99 MB
+      solve_assemble  w    25.17 MB  r    25.17 MB
+      solve_cube      w   402.65 MB  r   402.65 MB
+      k2              w  1028.65 MB  r  1028.65 MB
+
+   top flows (w = writes, r = reads, MB per call):
+      Ga, Gk, Gb                   handoff  w   603.98  r   603.98
+      G                            input    w   402.65  r   402.65
+      Rk, Rv                       handoff  w   402.65  r   402.65
+      Qg, Kg                       handoff  w   402.65  r   402.65
+      W, U                         handoff  w   402.65  r   402.65
+      D1, D2 (bf16)                handoff  w   402.65  r   402.65
+      Q, K                         input    w   201.33  r   201.33
+      V                            input    w   201.33  r   201.33
+      Aqk32 raw                    handoff  w   201.33  r   201.33
+      L raw                        handoff  w   201.33  r   201.33
+      L masked                     handoff  w   201.33  r   201.33
+      VnewT (bf16)                 handoff  w   201.33  r   201.33
+      D3 (bf16)                    handoff  w   201.33  r   201.33
+      Out (bf16)                   output   w   201.33  r   201.33
+
+   stores kept for the return_intermediates views only, skipped in
+   production by the debugStores flag (docs 11.29; measured -0.164 ms
+   interleaved at [1,8192,96,128]/C=64, tools/probe_dead_store.py):
+      Aqk32 masked/scaled          w   201.33 MB   nothing in production (skipped unless debugStores)
+      BetaOut                      w     3.15 MB   nothing in production (skipped unless debugStores)
+      A32                          w   201.33 MB   nothing in production (skipped unless debugStores)
+      total 405.80 MB of production writes removed; the AIV's 201.33 MB
+      re-read of Aqk32 raw stays - the mask/scale needs the value
+
+   the two estimates that sent this to the A/B, against the result:
+      0.095 ms / 201 MB store (R3, K2 v_new guard)   estimated 0.191 ms
+      0.2 ms / GB (section 11.12, L2 traffic)        estimated 0.081 ms
+      interleaved A/B (docs 11.29)                   measured  -0.164 ms
+
+slot map (level 2/3 handoff, double window):
+      pre_gram -> solve  local 0  L masked     double window (2 x n_local)
+      pre_gram -> solve  local 1  Rk, Rv       double window (2 x n_local)
+      solve -> k2        local 0  W, U         double window (2 x n_local)
+      pre_gram -> k2     local 0  Qg, Kg       double window (2 x n_local)
+      pre_gram -> k2     local 1  Aqk16        double window (2 x n_local)
+      pre_gram -> k2     local 2  Decay        double window (2 x n_local)
+
+builds validated: C=16 ok, C=32 ok, C=64 ok
+
+validation: clean

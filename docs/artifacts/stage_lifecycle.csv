@@ -1,0 +1,45 @@
+chunk,name,stage,where,dtype,bytes,producer,consumer,scope,lifetime,sync,layout,role,source,symbols
+64,"Q, K",host,GM,bf16,201326592,"host, once per call","pre_gram AIV (DataCopyPad, public order)","(b,t,h) whole call",whole call,stream order,"public [b,t,h,d], 4B-stride rows",input,api,q k
+64,V,host,GM,bf16,201326592,"host, once per call",pre_gram AIV (rv landing -> Rv),"(b,t,h) whole call",whole call,stream order,"public [b,t,h,d]",input,api,v
+64,G,host,GM,fp32,402653184,"host, once per call",pre_gram AIV (DataCopyPad byte-stride),"(b,t,h) whole call",whole call,stream order,"public [b,t,h,d]",input,api,g
+64,Beta (packed),host,GM,fp32,3145728,host permute().contiguous(),pre_gram AIV,whole call,whole call,stream order,"[c,CHUNK] chunk-major",input,api,beta_pack
+64,"A_log, bias",host,GM,fp32,49152,"host, once per call",pre_gram AIV,per head,whole call,stream order,"[h], [h,d]",input,api,A_log bias
+64,qnb/knb/rvb (landing),pre_gram,UB,bf16,8192,pre_gram AIV MTE2,pre_gram AIV V (Cast to fp32),one 16-row band,one band,"TQue (VECIN, depth 2)",bf16 rows,scratch,pre_gram,qnb knb rvb
+64,qf/kf/qf32 (norm tiles),pre_gram,UB,fp32,8192,pre_gram AIV Cast,l2 norm + Qg/Kg/Rk/Rv stores,one band,one band,PipeBarrier<PIPE_V>,fp32 rows,scratch,pre_gram,bQf bKf
+64,gate/decay tiles,pre_gram,UB,fp32,8192,"pre_gram AIV (cumsum, exp)",Decay/Rk/Rv/Qg/Kg stores,one band,one band,MTE3->V self-paired at the pass boundary,fp32 rows,scratch,pre_gram,bGef bT2
+64,"Ga, Gk, Gb",pre_gram,GM,bf16,603979776,pre_gram AIV MTE3 (bf16 gated operands),pre_gram AIC MTE2 -> L1 -> L0A/L0B,one chunk (two per step),one step (AIV step -> AIC step),CrossCoreSetFlag/WaitFlag<2> FL_READY / FL_DONE per step,"[c,CHUNK,D] row-major -> Nd2Nz on load",handoff,pre_gram,Ga Gk Gb
+64,Gx (cross-band k),pre_gram,GM,bf16,100663296,pre_gram AIV,pre_gram AIC (band 1's k reference),one chunk,one step,same FL_READY channel,"[c,CHUNK/2,D]",handoff,pre_gram,Gx
+64,ta/tk/tb/tx (Gram operands),pre_gram,L1/L0A/L0B,bf16,32768,pre_gram AIC DataCopy (Nd2Nz),pre_gram AIC LoadData -> Mmad,one step,one step,"TQue depth 4/2 (MTE2_MTE1, MTE1_M, M_FIX, FIX_M)",fractal NZ,resident,pre_gram,qa qb qx
+64,"cf (raw Gram, L0C)",pre_gram,L0C,fp32,4096,pre_gram AIC Mmad,pre_gram AIC Fixpipe,one band of one chunk,one band,M_FIX / FIX_M,fractal,scratch,pre_gram,qc
+64,Aqk32 raw,pre_gram,GM,fp32,201326592,pre_gram AIC Fixpipe (raw fp32 Gram),"pre_gram AIV post_gram (band loop, MTE2)",one chunk,one step,CrossCoreWaitFlag(FL_DONE),"[c,CHUNK,CHUNK] row-major, 16-row bands",handoff,pre_gram,Aqk32
+64,L raw,pre_gram,GM,fp32,201326592,pre_gram AIC Fixpipe (raw fp32 Gram),pre_gram AIV post_gram,one chunk,one step,CrossCoreWaitFlag(FL_DONE),"[c_solve,CHUNK,CHUNK] row-major",handoff,pre_gram,L
+64,Aqk32 masked/scaled,pre_gram,GM,fp32,201326592,pre_gram AIV MTE3 (select + scale),nothing in production (skipped unless debugStores),one chunk,one step,V_MTE3 -> TQue VECOUT,"[c,CHUNK,CHUNK] row-major",debug,pre_gram,Aqk32
+64,L masked,pre_gram,GM,fp32,201326592,pre_gram AIV MTE3 (select),solve wide AIV (bLraw),one chunk,whole call (read once),launch order on the caller's stream,"[c_solve,CHUNK,CHUNK] row-major",handoff,pre_gram,L
+64,Aqk16,pre_gram,GM,bf16,100663296,pre_gram AIV Cast -> MTE3,k2 AIC stage 3 (qa),one chunk,whole call (read once),launch order,"[c,CHUNK,CHUNK] row-major",handoff,pre_gram,Aqk16
+64,"Rk, Rv",pre_gram,GM,bf16,402653184,"pre_gram AIV MTE3 (l2-normalised k, v)",solve cube AIC (L0B) as the solve's right-hand sides,one chunk,whole call (read once),launch order,"[c,CHUNK,D] row-major -> Nd2Nz",handoff,pre_gram,Rk Rv
+64,"Qg, Kg",pre_gram,GM,bf16,402653184,"pre_gram AIV MTE3 (gated q, k)",k2 AIC stage 1 (qw/qg) and stage 3 (qk),one chunk,whole call (read once),launch order,"[c,CHUNK,D] row-major -> Nd2Nz",handoff,pre_gram,Qg Kg
+64,Decay,pre_gram,GM,fp32,6291456,pre_gram AIV MTE3 (chunk-centred gate),"k2 AIV stage 4 (dequeue, one row per chunk)",one chunk row,whole call (read once),launch order,"[c,D] fp32",handoff,pre_gram,Decay
+64,BetaOut,pre_gram,GM,fp32,3145728,pre_gram AIV MTE3,nothing in production (skipped unless debugStores),one chunk,one store,MTE3_V self-paired,"[c,CHUNK] fp32",debug,pre_gram,BetaOut
+64,"Qn, Kn",pre_gram,GM,bf16,402653184,not written in production (pointers passed as null),nothing,whole call,never written,n/a,"[c,CHUNK,D]",debug,pre_gram,Qn Kn
+64,bLraw (gathered L),solve_wide,UB,fp32,16384,"solve wide AIV MTE2 (gather, DataCopyParams(NC,2,30,0))",solve wide V (MulAddDst row recursion),one block of NC chunks,one block,"MTE2_V, V_MTE3","[row][chunk][lane] in UB, chunk-major source",scratch,solve_wide,bLraw
+64,bCexp (Brcb expansion),solve_wide,UB,fp32,4096,solve wide AIV Brcb,MulAddDst src1,one block,one block,PipeBarrier<PIPE_V>,per-row coefficient x 8 blocks,scratch,solve_wide,bCexp
+64,A32,solve_wide,GM,fp32,201326592,solve wide AIV MTE3 (fp32 A_inv),nothing in production (skipped unless debugStores),one block,one block,V_MTE3,"[c_solve,CHUNK,CHUNK]",debug,solve_wide,A32
+64,A16,solve_wide,GM,bf16,100663296,solve wide AIV MTE3 (bf16 A_inv),solve assemble AIC + solve cube AIC (L0A),one block,two launches (wide -> assemble/cube),launch order on the caller's stream,"[c_solve,CHUNK,CHUNK] row-major",handoff,solve_wide,A16
+64,"Xb, Lneg",solve_wide,GM,bf16,50331648,"wide (Xb, Lneg) / assemble (Pmid)","assemble (Xb, Lneg) / cube (Pmid)",one block,two launches,launch order,"[c_solve,SB,sub,sub] and [c_solve,sub,sub]",handoff,solve_wide,Xb Lneg
+64,Pmid,solve_assemble,GM,bf16,25165824,solve assemble AIC Fixpipe (X21 = -X22 L21 X11),solve cube AIC,one block,one launch,launch order,"[c_solve,sub,sub] bf16",handoff,solve_assemble,P
+64,qa/qb (assemble L1),solve_assemble,L1,bf16,8192,solve assemble AIC DataCopy,solve assemble AIC LoadData -> Mmad,one block,one launch,"MTE2_MTE1, MTE1_M, M_FIX, FIX_M",fractal,resident,solve_assemble,qa qb
+64,"W, U",solve_cube,GM,bf16,402653184,"solve cube AIC (W = A_inv @ Rk, U = A_inv @ Rv)",k2 AIC stage 1 (qw) and AIV stage 2 (DataCopy ub),one chunk,whole call (read once),launch order on the caller's stream,"[c,CHUNK,D] bf16",handoff,solve_cube,W U
+64,H0,k2,GM,fp32,6291456,"host, once per call (optional)",k2 AIV start-up,"per (b,h)",prologue,stream order,"[bh,D,D]",input,k2,pH0
+64,st (resident state),k2,UB,fp32,131072,k2 AIV prologue (H0) + stage 4 recurrence,k2 AIV stage 4 + final S32 publish,"whole call, resident",whole call,none (single subcore owns it),"fp32 [MAXH][BV,D]",resident,k2,us MAXH S_TILE
+64,d1/d1f/d2/d3/d3f/ob (UB),k2,UB,bf16,24576,k2 AIV MTE2 (d1/d2/d3 loads),k2 AIV stage 2/4 arithmetic,one head-step,stage 2 | stage 4 (aliased phase pair),"MTE2_V / V_MTE3, phase aliasing in the TBuf plan","bf16 [CHUNK,BV] tiles",scratch,k2,uC
+64,vb/d4 (UB),k2,UB,fp32,32768,k2 AIV stage 4 quarter loads,k2 AIV stage 4 recurrence,one head-step,stage 4,PipeBarrier / V_MTE3,"fp32 [D,BV]",scratch,k2,uA uE
+64,lw/lg/ls/la/lv/lx/lk (L1),k2,L1,bf16,114688,"k2 AIC DataCopy (Nd2Nz, one per operand)",k2 AIC LoadData -> Mmad (stages 1/3),one head-step,one head-step,TQue + MTE2_MTE1 / MTE1_M,fractal NZ,resident,k2,qw qg qs qa qv qx qk
+64,cf (L0C),k2,L0C,fp32,32768,k2 AIC Mmad stages 1/3,"k2 AIC Fixpipe (-> d1/d2, d3/d4)",one head-step,one head-step,M_FIX / FIX_M + enUnitFlag,fractal fp32,scratch,k2,qc
+64,"D1, D2 (bf16)",k2,GM,bf16,402653184,k2 AIC stage 1 Fixpipe,k2 AIV stage 2 (DataCopy ub),one head-step,one chunk (stage1 -> stage2),CrossCore FL_C1 (AIC stage 1 -> AIV stage 2),"[tasks,NT,CHUNK,BV] bf16",handoff,k2,pD1 pD2
+64,VnewT (bf16),k2,GM,bf16,201326592,k2 AIV stage 2 (DataCopy Vt),k2 AIC stage 3 (qv/vx),one head-step,one chunk (stage2 -> stage3),CrossCore FL_V (AIV stage 2 -> AIC stage 3),"[tasks,NT,BV,CHUNK] (transposed store)",handoff,k2,pVnewT
+64,D3 (bf16),k2,GM,bf16,201326592,k2 AIC stage 3 Fixpipe,k2 AIV stage 4 (DataCopy d3),one head-step,one chunk (stage3 -> stage4),CrossCore FL_C2 (AIC stage 3 -> AIV stage 4),"[tasks,NT,CHUNK,BV] bf16",handoff,k2,pD3
+64,D4 (fp32),k2,GM,fp32,6291456,k2 AIC stage 3 Fixpipe,k2 AIV stage 4 (four quarter loads),one head-step,one chunk (stage3 -> stage4),CrossCore FL_C2,"[bh,D,D] fp32, quarter tiles",handoff,k2,pD4
+64,S16 (bf16),k2,GM,bf16,3145728,k2 AIV (start-up + stage 4 quarters),k2 AIC stage 1 (qs),whole call,across chunks (state handoff),"CrossCore FL_R (AIV -> AIC, prologue-primed)","[tasks,BV,D] bf16",handoff,k2,pS16
+64,S32 (fp32),k2,GM,fp32,6291456,"k2 AIV, once at the end",host (final_state),whole call,final publish,stream order,"[tasks,BV,D] -> viewed [bh,NV,BV,D]",output,k2,pS32
+64,Out (bf16),k2,GM,bf16,201326592,"k2 AIV stage 4 (strided store, public layout)",host,whole call,one store per head-step,stream order,"public [b,t,h,d] direct (no host permute)",output,k2,pOut
+64,Vnew (row-major),k2,GM,bf16,201326592,"not written in production (null pointer, R3 guard)",nothing,whole call,never written,n/a,"[tasks,NT,CHUNK,BV]",debug,k2,pVnew

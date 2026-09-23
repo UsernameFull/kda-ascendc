@@ -241,7 +241,8 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
                                         const GlobalTensor<bfloat16_t> Aqk16,
                                         const GlobalTensor<float> MaskS,
                                         const GlobalTensor<float> MaskL,
-                                        int32_t c, float scale, bool buildMasks) {
+                                        int32_t c, float scale, bool buildMasks,
+                                        bool keepAqk32) {
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
     CrossCoreWaitFlag(FL_DONE);
     // P2-1: the two triangular masks are the same [M, M] tile for every chunk
@@ -316,7 +317,13 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
     LocalTensor<float> gA2 = qout.DeQue<float>();
     LocalTensor<float> ga32s = gA2, gl32s = gA2[NB];
     LocalTensor<bfloat16_t> g16s = qo16.DeQue<bfloat16_t>();
-    DataCopy(Aqk32[o], ga32s, DataCopyParams(16, M / 8, 0, 0));
+    // The masked fp32 copy has no device consumer: the only reader of Aqk32 is
+    // the band loop above (the raw Gram the Cube wrote), and Aqk16 - the tile
+    // the next launch actually consumes - is rounded from this register value,
+    // not from the store.  It exists for the ``return_intermediates`` views, so
+    // ``debugStores == 0`` skips the 201 MB (C=64) store (docs 11.29).  The raw
+    // Aqk32 pointer has to stay valid either way - this function reads it.
+    if (keepAqk32) DataCopy(Aqk32[o], ga32s, DataCopyParams(16, M / 8, 0, 0));
     DataCopy(L[o], gl32s, DataCopyParams(16, M / 8, 0, 0));
     DataCopy(Aqk16[o], g16s, DataCopyParams(16, M / 16, 0, 0));
     qout.FreeTensor(gA2);
@@ -591,7 +598,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb, GM_ADDR pGx,
     GM_ADDR pAqk32, GM_ADDR pAqk16, GM_ADDR pL, GM_ADDR pMaskS, GM_ADDR pMaskL,
     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
-    int32_t xRowBytes, int32_t gRowBytes) {
+    int32_t xRowBytes, int32_t gRowBytes, int32_t debugStores) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIC {
         run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * (T / M), unroll);
@@ -847,7 +854,10 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // block), and the passes after the first already have the store behind
     // them.
     SetFlag<HardEvent::MTE3_V>(e3d);
-    DataCopy(BetaOut[cm], beta, DataCopyParams(1, M / 8, 0, 0));
+    // Same as the masked Aqk32 store: BetaOut feeds the debug views only, so
+    // production switches it off with the same flag.  The flag pair below is
+    // unconditional - it orders the tile's reuse, not this store.
+    if (debugStores != 0) DataCopy(BetaOut[cm], beta, DataCopyParams(1, M / 8, 0, 0));
     LocalTensor<bfloat16_t> pga = bPga0.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> pgk = bPgk0.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> pgb = bPgb0.Get<bfloat16_t>();
@@ -1084,7 +1094,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // ---- previous chunk's Gram: mask, scale, round, store -----------------
     if (cprev >= 0) {
         post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
-                  MaskS, MaskL, cprev, scale, !masksBuilt);
+                  MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
         masksBuilt = true;
     }
     // ---- publish + hand off ---------------------------------------------
@@ -1109,7 +1119,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // Drain the pipeline: the last chunk's Gram has no later chunk to hide
     // behind (~1/unroll of the stage, and the Cube is idle by then).
     post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
-              MaskS, MaskL, cprev, scale, !masksBuilt);
+              MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
     masksBuilt = true;
     PipeBarrier<PIPE_ALL>();
     }
