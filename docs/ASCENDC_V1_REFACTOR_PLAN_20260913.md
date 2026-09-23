@@ -2385,3 +2385,70 @@ LoadData + 1 次 LoadDataWithTranspose、Mmad、Fixpipe、L0/L0C 槽位与 InitB
 生产路径未改。下一步是同一探针上的第二个判决实验——**同样的字节、更少的调用**（先量 1/2/4/8/16/32 KB
 的调用尺寸 vs 速率曲线定住固定开销，再把 shipped 的 6 次/chunk 换成按块合并的 2~3 次/chunk），
 只有当 mode 1 明显向 839 GB/s 靠拢时才动生产 kernel。
+
+## 11.37. assemble 的小传输被合并掉了：同样 100.7 MB，从 6 次/chunk 压到 2.5 次，生产里位一致、stage −0.178 ms（2026-09-23 深夜）
+
+§11.36 把 assemble 的账算到"小传输自己占 0.339 ms（52%）"上，并指出 `Nd2NzParams` 的 `ndNum` /
+`srcNdMatrixStride` / `dstNzMatrixStride` 允许一次调用搬多张 ND 矩阵，而 Lneg / Xb / P 的源布局恰好
+都是等跨距的。本轮先做探针，再把赢的那一支落进生产。
+
+**探针**（`kernels/v1/k1_solve_assemble_coalesce_probe.cpp` + `tools/probe_solve_assemble_coalesce.py`，
+12288 chunk / grid 3072 / 同进程交错 MIN of 5，每臂字节数固定 100.7 MB，只变调用形态）：
+
+| 臂 | 调用/chunk | 总调用 | ms | GB/s |
+|---|---:|---:|---:|---:|
+| mode 0 shipped 形态 | 6.0 | 73728 | 0.313 | 321 |
+| mode 1 两条 B band 合并（ndNum=KF） | 4.0 | 49152 | 0.252 | 399 |
+| mode 2 A 操作数按块合并（ndNum=nch） | 2.5 | 30720 | 0.217 | 465 |
+| mode 3 两者都合并（需重排布局的 packed 源） | 1.0 | 12288 | 0.220 | 459 |
+| mode 4 整个 block-pass 一次调用（packed 上限） | 0.5 | 6144 | 0.157 | 641 |
+
+判读：**固定开销是真的**（6→2.5 次/chunk 省 0.096 ms，6→4 省 0.061），但 2.5 次之后就没便宜可捡
+（mode 2 0.217 ≈ mode 3 0.220），所以 mode 3 需要的重排布局**不值得做**；mode 4 那 0.06 要用 16 KB
+大块才拿得到，代价是全部操作数重排，也不做。4.25 ns/次、1.37 KB/次 ⇒ 100.7 MB 里 ~0.31 ms 是
+传输形态本身。
+
+**结构比调用数更贵**：把 L0 链和 store 加回来，四臂（同字节、同算术、P/A16 位一致）：
+
+| 结构 | shipped 调用 | 合并后的调用 |
+|---|---:|---:|
+| 显式 B1 buffer（TBuf，一遍一个 flag） | 0.901 ms | **0.531 ms** |
+| shipped 的 per-chunk 队列（EnQue/DeQue） | 0.706 ms | 0.606 ms |
+
+也就是：小调用多的时候队列的 per-chunk 流水值 0.196 ms（0.706 vs 0.901），**但换成大调用之后显式
+buffer 反而更快**（0.531 vs 0.606，队列的 per-chunk 同步成了纯开销）。位一致性先于计时：mode 6/8
+对 mode 5/7、以及 queue 对 TBuf 的 P 与 A16 全部 IDENTICAL。
+
+**生产**（`kda_solve_assemble` 新增运行期参数 `loadMode`，`api.asm_load_mode()` 读 `KDA_ASM_LOADS`，
+每次调用读一次，同一进程可翻臂；0 = shipped，1 = 合并；`tools/probe_solve_assemble_loads.py`）：
+
+| 口径 | mode 0 shipped | mode 1 合并 | Δ |
+|---|---:|---:|---:|
+| 输出（10.07e7 元素） | — | 0 个不同，max\|d\| 0.000e+00，final state identical | 位一致 |
+| e2e（do_bench 中位 of 3） | 10.627 ms（10.620/10.627/10.637） | **10.449**（10.448/10.449/10.450） | **−0.178** |
+| ASM（24 launch 重放，MIN of 5） | 0.846 | **0.657** | −0.189（−22%） |
+| CUBE（同） | 1.587 | 1.586 | 0 |
+| AIC（ASM+CUBE 同流） | 2.619 | **2.310** | −0.309 |
+| overlapped（双流无线程事件） | 2.715 | 2.485 | −0.230 |
+| **sliced（生产 schedule 重放）** | **2.541** | **2.363** | **−0.178** |
+| AIV（wide） | 2.135 | 2.134 | 0（未动） |
+
+- sliced 的 2.541 复现了 §11.34 的 2.535 基线，所以这一列的 −0.178 与 e2e 的 −0.178 是同一笔账：
+  **stage 就是 AIC 半边，AIC 少了 0.309，stage 少 0.178**（重叠把那 0.13 的差吃掉）。
+- 生产 ASM 0.657 ≈ 转写臂 0.531 + 24 个 launch 的 0.107（§11.35 量的 4.4 µs/launch）＋CrossCoreFlag
+  等待，三个数对得上。
+- 剩下的账：AIC 2.310 仍高于 AIV 2.134，**stage 还在 AIC 侧**；要翻到 AIV 侧还差 ~0.18 ms，那正好是
+  §11.36 的 P 往还（0.137）＋ §11.35 的 cube A16 重读（0.070）同一个量级。
+- **队列深度那个理由消失了**：KDA_ASM_NCHUNK 之所以被钉在 4，是 shipped 路径"一个 pass 的装载先发完、
+  队列必须 NC 深"（6/8 实测挂核）。显式 buffer 没有这个约束，所以 NC=6/8 现在值得重测——这是后续，
+  不是本轮结论。
+
+生产改动：`kernels/v1/k1_solve_assemble.cpp`（两套 L1 形态 + 共用的 per-chunk 链函数，`loadMode` 选路）、
+`python/kda_ascendc_v1/api.py`（`asm_load_mode()`，默认 1，随 launch 传参）。公式、dtype、单 head 内
+chunk 顺序、同步（CrossCoreFlag / PipeBarrier / 每次 pass 的 MTE2→MTE1）都没动，输出位一致。
+
+**门禁**（默认已切到 `KDA_ASM_LOADS=1`）：`bash tools/run_chunk_matrix.sh` 在 C=16/32/64 三个 leg
+全部 PASS（`test_chunk_shape_matrix.py` + `test_stability_gate.py` + `test_c64_gate_overflow.py`）；
+新增 `tests/test_solve_assemble_loads.py` 钉住这根旋钮的接线（默认 1、每个 slice 都带、每次调用重读、
+两臂输出位一致），C=64 下 3 passed。注意 assemble 只在 C=64 上线（`SOLVE_WIDE_SUBB = 2` 的入场条件），
+C=16/32 只会编译它、不会启动它，所以三档矩阵里只有 C=64 那一 leg 真正覆盖新代码路径。

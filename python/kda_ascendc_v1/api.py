@@ -218,6 +218,20 @@ def a16_mode() -> int:
     return int(os.environ.get("KDA_SOLVE_A16_MODE", "0"))
 
 
+def asm_load_mode() -> int:
+    """L1 load shape for the coupling block (kda_solve_assemble).
+
+    0 is the shipped form: one B1 queue per operand, six ND2NZ calls per chunk.
+    1 batches the same bytes - one call per block for the A operand, a chunk's
+    two B bands merged, and pass 1's whole B operand in one call.  Both land
+    byte-identical operands in L1 (tools/probe_solve_assemble_coalesce.py
+    checks P and A16 are equal before it times either), so this is a scheduling
+    knob, not a numeric one.  Read per call rather than frozen at import so a
+    probe can flip it between two arms of one process.
+    """
+    return int(os.environ.get("KDA_ASM_LOADS", "1"))
+
+
 def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
                             a32, a16, xb, lneg, pmid, rk, rv, W, U, stream,
                             debug_stores) -> None:
@@ -259,7 +273,8 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
         lo, n = glo * unit, (ghi - glo) * unit
         wargs = _pack_ptrs([L[lo:], eye, a32[lo:], a16[lo:], xb[lo:],
                             lneg[lo:]]) + [_i(n), _i(a16_mode()), _i(1 if debug_stores else 0)]
-        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:], pmid[lo:]]) + [_i(n)]
+        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:], pmid[lo:]]) + \
+            [_i(n), _i(asm_load_mode())]
         cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + [_i(n)]
         ncube = min(n, c - lo)
         if ovl:
