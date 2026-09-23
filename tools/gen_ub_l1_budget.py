@@ -254,7 +254,7 @@ def main():
                                              for n, b in pg["ub_biggest"]))
     print("   C=128 L1 terms:  " + ", ".join("%s %.1f KB" % (n, b / 1024)
                                              for n, b in pg["l1_biggest"]))
-    for c in (64, 128):
+    for c in (16, 32, 64, 96, 128):
         pg = pre_gram_ub(c)
         print("   C=%-4d L0: A2 %.1f / 64 KB, B2 %.1f / 64 KB, CO1 %.1f / 128 KB"
               % (c, pg["l0a"] / 1024, pg["l0b"] / 1024, pg["l0c"] / 1024))
