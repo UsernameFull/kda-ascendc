@@ -2265,8 +2265,8 @@ blank 那一份无事，parent tile 那一份稳定慢 ~0.2 ms。
 | 半边 | ms | 说明 |
 |---|---:|---|
 | AIV wide | 2.144 | 递归地板 1.169（§11.33），其余 ~0.98 是 gather/cast/store——**被遮住** |
-| AIC assemble | 0.928 | 只做 X21 = X22·Lneg21·X11，两趟；GM 账面 12 KB/chunk = 147.5 MB ⇒ 159 GB/s，**不在带宽上**，是 wave/依赖受限 |
-| AIC cube solve | 1.586 | 80 KB/chunk = 983 MB：A16 16 KB（**两个 pass 各读一遍**）+ RHS 32 + W/U 32 ⇒ 620 GB/s |
+| AIC assemble | 0.928 | 只做 X21 = X22·Lneg21·X11，两趟；GM 账面 12 KB/chunk = 151.0 MB ⇒ 163 GB/s，**不在带宽上**，是 wave/依赖受限（§11.35） |
+| AIC cube solve | 1.586 | 80 KB/chunk = 1006.6 MB：A16 16 KB（**两个 pass 各读一遍**，其中一遍 100.7 MB）+ RHS 32 + W/U 32 ⇒ 635 GB/s（冷路径边际 839 GB/s，§11.35） |
 
 **实测的否定**：想靠"把 assemble 的块做肥"降它的 wave 数也走不通——`KDA_ASM_NCHUNK = 6` 与 `8` 在
 第一次 api 调用就把核挂住（AICore 100% 空转：两个设备各一次并发复现，外加一次单进程复现），与
@@ -2276,14 +2276,53 @@ kernel 注释里"L1 队列必须恰好 NC 深"是同一类约束。杀掉进程�
 **剩下的两个入口（都在 AIC，不在 AIV）**：
 
 1. **cube 每个 pass 重读 A16**：`qa` 只有 NC=2 个 L1 slot，两个 pass 各从 GM 读 8 KB/chunk，合计
-   98.3 MB（它自己 983 MB 的 10%）。把 `qa` 加深到 2·NC（L1 多 16 KB）就能让两个 pass 共用一次加载
-   ⇒ 省 98 MB，按它自己的 620 GB/s 投影 **−0.16 ms**。**投影，未实测**，而且只有"cube 是带宽受限"
-   成立时才对——1.586 ms 对 983 MB 是 620 GB/s，接近这台机器的上限量级，但还没有带宽探针把
-   "带宽"与"波次"分开。
-2. **assemble 整块 0.928 ms**：字节账只有 147.5 MB（159 GB/s），削流量不会等比例回本；要动就得动
+   100.7 MB（它自己 1006.6 MB 的 10%）。让两个 pass 共用一次加载（L1 多 16 KB）⇒ §11.35 已把候选
+   做出来量：**−0.070 ms**，不是投影的 −0.16 ms——第二次读是 L2 命中，只有它值得省。
+2. **assemble 整块 0.928 ms**：字节账只有 151.0 MB（163 GB/s），削流量不会等比例回本；要动就得动
    结构——把 X21 的构造并进 cube kernel（上界 −0.93 ms，但那是 §11.9/§11.24 立起来那套东西的
    改写，需要自己的探针和 gate）。
 
 生产路径未改（`KDA_SOLVE_A16_MODE` 缺省 0；本轮 C=16/32/64 的 chunk 矩阵全 PASS，bench gate 在本机
 仍只差 §11.26 记录的跨设备绝对时间）。本轮新增：`tools/probe_solve_a16_ablation.py`、
 `tests/test_solve_a16_ablation.py`、wide kernel 的 `a16Mode` 参数与 `api.a16_mode()`。
+
+## 11.35. 探针：Cube solve 的两遍 A16 重读只值 0.070 ms（不是投影的 0.16），而 assemble 那 0.75 ms 才是 AIC 里没被解释的部分（2026-09-23 深夜）
+
+§11.34 在 AIC 半边留下两个候选，第一个是 `kda_solve_wu_cube_kernel` 每个 pass 都从 GM 重读一遍
+A16（8 KB/chunk/pass，共 100.7 MB，占它自己 1006.6 MB 的 10%）。它值不值那 0.16 ms 的投影，取决于
+"这个 kernel 是不是带宽受限"——本轮不去推断，直接把候选做出来量。
+
+`kernels/v1/k1_solve_wu_cube_a16_probe.cpp` 是 shipped kernel 的逐字转写（同样的 RHS 装载、两次
+LoadData 交叉、Mmad、Fixpipe、L0/L0C 槽位与 InitBuffer 算术），三臂只差 A16 的装载路径；
+`tools/probe_solve_cube_a16.py` 在同进程里交错跑三个臂，并重放生产的 cube launch。
+
+| 臂 | A16 装载 | GM bytes/call | ms（MIN of 5，交错） | 边际 |
+|---|---|---:|---:|---|
+| mode 0 控制（shipped 结构） | 每 pass 各一次 | 1006.6 MB | 1.465 | — |
+| mode 1 候选（A16 常驻 L1） | 每块一次 | 906.0 MB | **1.395** | −0.070 ms（后一遍 100.7 MB） |
+| mode 2 地板（完全不读 A16） | 0 | 805.3 MB | 1.275 | −0.120 ms（冷的那一遍 100.7 MB） |
+| 生产 cube（同进程重放 24 个 slice） | 每 pass 各一次 | 1006.6 MB | 1.571 | +0.107 vs 控制 |
+
+判读：
+
+- **候选值 0.070 ms**（1.465 → 1.395，交错 MIN of 5），不是投影里的 0.16 ms。机制在边际率上：
+  第二遍读是 **L2 命中**（+100.7 MB 花 0.070 ms ⇒ 1439 GB/s 边际），第一遍是冷 HBM 读
+  （+100.7 MB 花 0.120 ms ⇒ 839 GB/s 边际）。**只有 L2 那一遍值得省**，而候选省的正是它。
+- **cube 自己已经贴着 HBM 速率**：冷路径边际 839 GB/s、绝对 687 GB/s；它还剩下 ~0.3 ms 的非 DMA
+  时间（906 MB 按 839 GB/s 应是 1.08 ms，实测 1.395），那是另一类问题，不是这次要动的。
+- 顺带量到 **slice 的价格**：同一份 1006.6 MB，生产的 24 个 launch 比单次 6144-block 启动贵
+  **0.107 ms**（≈4.4 µs/launch）——这是 SOLVE_OVERLAP=24 那个旋钮的另一半账（§11.25 的 sweep 只
+  看了重叠收益）。
+- **更重要的对照**：assemble 是 151.0 MB 跑 0.928 ms ⇒ **163 GB/s**，按 cube 的冷路径边际率它只要
+  0.18 ms；也就是说 AIC 半边里 **~0.75 ms 是 assemble 的结构开销**（两趟 + P 往还 + 每块 4 chunk），
+  是这次 A16 那 0.070 ms 的十倍。§11.34 试过的"把块做肥"（KDA_ASM_NCHUNK = 6/8）会挂核，所以下一刀
+  要么先给 assemble 做同款 DMA 结构探针（把它定住在小传输 / 两趟屏障 / wave 数上的哪一格），要么直接
+  做把它并进 cube kernel 的重写。
+
+**单位更正**：§11.34 与设计书 §4.7 的第一版把 KiB 计数当成了 MB——正确值是 cube 1006.6 MB / 635 GB/s、
+assemble 151.0 MB / 163 GB/s、A16 重读 100.7 MB、assemble 每个 chunk 12 KB。比例、投影与判决不变
+（0.16 ms 的投影本来就用同一套比例算出，实测值是 0.070 ms）。
+
+本轮新增：`kernels/v1/k1_solve_wu_cube_a16_probe.cpp`、`tools/probe_solve_cube_a16.py`。
+生产路径未改——**resident 形态还没有进生产 kernel**，它值 0.070 ms（cube 的 4.8%、solve stage 的
+2.8%、e2e 的 0.7%），要落地得先跑 C=16/32/64 的矩阵与 bench gate。

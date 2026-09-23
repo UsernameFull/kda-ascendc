@@ -236,11 +236,15 @@ blank / 2 去整个 parent tile，探针同进程翻臂）在 [1,8192,96,128]/C=
 上场：Xb 只有 4 KB/chunk 且与 A16 对角块同源逐位相同，而 A16 直读会把 assemble 的
 `Nd2Nz` 变成跨步读——往瓶颈那一侧加活。
 
-solve 剩下的入口都在 AIC，且都是**投影未见实测**：cube 每个 pass 重读 A16（98.3 MB ≈
-−0.16 ms，须先做带宽探针）、assemble 的结构性改写（0.928 ms，字节账只有 159 GB/s，不是
-带宽受限）。把 assemble 的块做肥这条被实测封死：`KDA_ASM_NCHUNK = 6/8` 直接把核挂住
-（AICore 100% 空转，两次并发 + 一次单进程复现）。完整口径见
-`docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.34。
+solve 剩下的入口都在 AIC，第一条已经探过了（§11.35）：把 cube 的 A16 重读候选直接做出来
+量（`kernels/v1/k1_solve_wu_cube_a16_probe.cpp`，三臂交错 MIN of 5）得 1.465（shipped
+结构）/ 1.395（A16 常驻 L1）/ 1.275（完全不读 A16）ms，即**候选只值 0.070 ms**，不是投影
+的 0.16——第二遍读是 L2 命中，只有它值得省（冷的那一遍是 HBM 价，边际 839 GB/s）。
+真正的账在 assemble：151.0 MB 跑 0.928 ms = 163 GB/s，按 cube 的冷路径边际率只要 0.18 ms
+⇒ **~0.75 ms 是它的结构开销**（两趟 + P 往还 + 每块 4 chunk），十倍于 A16 那 0.07。把
+assemble 的块做肥这条被实测封死：`KDA_ASM_NCHUNK = 6/8` 直接把核挂住（AICore 100% 空转，
+两次并发 + 一次单进程复现）。完整口径见 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md`
+§11.34/§11.35。
 
 ### Level 2 / Level 3 的准入条件
 
