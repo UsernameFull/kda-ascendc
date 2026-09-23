@@ -84,10 +84,23 @@ pass 1 `X21 = X22 @ P` fixpiped straight into the parent tile's lower-left
 block.  The `L0C -> GM -> L1` round trip of `P` is unavoidable (L0C has no path
 back into L0A/L0B); splitting the passes keeps it off the per-chunk critical
 path.  Both operands go in through `Nd2Nz` (whole tile for A, per-band for B,
-which `LoadDataWithTranspose` wants band-major).  The kernel's L1 queue has to
-be `NC` deep - the loads of a whole pass are issued before its arithmetic
-starts, and a 2-deep queue **deadlocks** on the third `AllocTensor` (measured:
-`KDA_ASM_NCHUNK = 2` runs, 4 and 8 hang the block).
+which `LoadDataWithTranspose` wants band-major), and the load *pattern* is a
+runtime argument (`api.asm_load_mode()`, `KDA_ASM_LOADS`, read per call):
+
+* `1` (production, docs section 11.37) - one explicit B1 buffer per operand and
+  the same bytes in fewer calls: the A operand's `NC` tiles in one `Nd2Nz`
+  (`ndNum = nch`; `Lneg` is chunk-contiguous and `Xb`'s pass-1 block is `2*MM`
+  apart), a chunk's two B bands merged (`ndNum = KF`), and pass 1's whole B
+  operand in one call (`ndNum = KF*nch` - `P` is chunk-contiguous).  1 + NC
+  calls for pass 0 and 2 for pass 1, against 3 per chunk.  Outputs are
+  bit-identical to mode 0 and it is 0.189 ms off the kernel (0.846 -> 0.657 ms
+  at `[1,8192,96,128]`, 0.178 off the stage).
+* `0` - the shipped per-chunk queue form.  Its L1 queue has to be `NC` deep:
+  the loads of a whole pass are issued before its arithmetic starts, and a
+  2-deep queue **deadlocks** on the third `AllocTensor` (measured:
+  `KDA_ASM_NCHUNK = 2` runs, 4 and 8 hang the block).  That depth constraint is
+  the queue's; mode 1 has an explicit buffer and no such depth, so re-testing
+  `KDA_ASM_NCHUNK = 6/8` is open again.
 
 Numerically the two-level path is a *bf16 chain*: `Xb` and `Lneg` are bf16, `P`
 is bf16, and the parent tile is bf16.  Against the fp64 inverse of the same
