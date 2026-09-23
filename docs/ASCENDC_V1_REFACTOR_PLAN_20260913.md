@@ -2326,3 +2326,62 @@ assemble 151.0 MB / 163 GB/s、A16 重读 100.7 MB、assemble 每个 chunk 12 KB
 本轮新增：`kernels/v1/k1_solve_wu_cube_a16_probe.cpp`、`tools/probe_solve_cube_a16.py`。
 生产路径未改——**resident 形态还没有进生产 kernel**，它值 0.070 ms（cube 的 4.8%、solve stage 的
 2.8%、e2e 的 0.7%），要落地得先跑 C=16/32/64 的矩阵与 bench gate。
+
+## 11.36. 探针：assemble 的 0.75 ms 里，小传输自己就占 0.339（52%），两趟结构不花钱、P 往还只值 0.137（2026-09-23 深夜）
+
+§11.35 把 assemble 定为 AIC 半边最大的未解释项：151.0 MB 跑 0.928 ms（profiler，带竞争）⇒ 163 GB/s，
+按 cube 的冷路径边际率（839 GB/s）它只要 0.18 ms。这一轮不推断结构，把候选逐个做出来量：
+`kernels/v1/k1_solve_assemble_probe.cpp` 是 shipped kernel 的逐字转写（同样的 6 次 ND2NZ、5 次
+LoadData + 1 次 LoadDataWithTranspose、Mmad、Fixpipe、L0/L0C 槽位与 InitBuffer 算术、两趟结构），
+五臂每次去掉一个候选；`tools/probe_solve_assemble.py` 在同进程里交错跑五臂（MIN of 5），并把生产的
+24 个 assemble launch 重放一遍作对照。mode 1/2 把垃圾喂给 Mmad/Fixpipe，输出无意义，是测量臂。
+
+| 臂 | 内容 | GM bytes/call | ms（MIN of 5，交错） | GB/s |
+|---|---|---:|---:|---:|
+| mode 0 | shipped 结构（控制） | 151.0 MB | 0.648 | 233 |
+| mode 1 | 只留 GM 流量（无 LoadData/Mmad/Fixpipe） | 100.7 MB | **0.339** | 297 |
+| mode 2 | 流量 + Fixpipe store | 151.0 MB | 0.510 | 296 |
+| mode 3 | 控制 − P 往还 | 100.7 MB | 0.511 | 197 |
+| mode 4 | 只跑 pass 0 | 75.5 MB | 0.327 | 231 |
+| 生产 assemble（同进程重放 24 launch） | shipped | 151.0 MB | **0.785** | 192 |
+
+判决算术（本轮脚本自己的输出）：
+
+| 项 | 式子 | 值 |
+|---|---|---:|
+| (a) GM 发出形态的地板 | mode 1 | **0.339 ms（控制的 52%）** |
+| (b) store 侧（两趟各一次 Fixpipe） | mode 2 − mode 1 | +0.171 ms |
+| (c) L0 链（LoadData×5 + Mmad + 两次 flag） | mode 0 − mode 2 | +0.138 ms |
+| (d) P 往还（含它那 50.3 MB） | mode 0 − mode 3 | +0.137 ms |
+| (e) 两趟屏障的每块固定成本 | 2 × mode 4 = 0.655 vs 0.648 | **+0.007 ms（没有）** |
+| (f) launch 形态（24 slice） | 生产 − 控制 | +0.137 ms |
+
+判读：
+
+- **瓶颈是小传输本身，不是账面上的字节数**：mode 1 只有 100.7 MB 却要 0.339 ms ⇒ **297 GB/s**，
+  是 cube 冷路径边际率（839 GB/s）的 1/3。每 chunk 只有 6 次装载（ave 1.37 KB/次，2 KB + 1 KB + 1 KB
+  每 pass），每 chunk 6 次、12288 chunk 共 73728 次调用 ⇒ 4.6 ns/次；若按 839 GB/s 折价，其中
+  **0.219 ms 是"传输太小"的价格**（合 3.0 ns/次固定开销）。这正是这次要打的项。
+- **两趟结构不花钱**：(e) 说 half-work 臂的两倍与控制臂只差 0.007 ms，也就是两趟之间那道
+  `PipeBarrier<PIPE_ALL>` 没有固定成本被摊在块尾。所以"把 assemble 并进 cube"能拿回的只有 (d)
+  那 0.137 ms（它顺带省掉 P 的 50.3 MB 往返），**不是** 0.75。
+- **可加性自检通过**：(b) + (c) = 0.309 ms = mode 0 − mode 1（0.648 − 0.339），三个候选互不遮蔽，
+  控制臂的 0.648 = 0.339（流量）+ 0.171（store）+ 0.138（L0 链）。
+- **生产的 0.785 ms 比控制臂贵 0.137**（24 个 launch，≈4.4 µs/launch，与 §11.35 在 cube 上量到的
+  slice 价格同值）；§11.34 的 0.928 是 profiler 在整链路竞争下记的，单独重放是 0.785。
+- **仍然不在带宽上**：生产绝对率 192 GB/s，把 (a) 的 0.339 打到 cube 价（839 GB/s ⇒ 0.120 ms）
+  也就 −0.22 ms；stage 2.535 的 8.7%。而且真到了那一步，AIC（0.55 + cube 1.586）会掉到 AIV 的
+  2.144 附近，**stage 变成 AIV 绑**（§11.34 已证明 AIV 那一侧的松弛量没法再用），所以这条线的
+  上限就是 ~0.4 ms，不是无穷。
+- **合并 DMA 有可测的合法路径**：`Nd2NzParams(ndNum, nValue, dValue, srcNdMatrixStride, srcDValue,
+  dstNzC0Stride, dstNzNStride, dstNzMatrixStride)` 允许一次调用搬多张 ND 矩阵，而现在的源布局
+  恰好是等跨距的——Lneg 相邻 chunk 相隔 2 KB、Xb 的两个 [M,M] 相隔 4 KB、P 相隔 2 KB，都连续，
+  所以"每 pass 每块（NC=4 chunk）的 la 合成一次调用、lb 的 2×NC 个 band 合成一次调用"在布局上
+  成立（需要 L1 目标侧的 NZ 跨距按矩阵给）。**当前 kernel 一次都没用 ndNum。**
+- 已封死的邻居：把块做肥（`KDA_ASM_NCHUNK = 6/8`）挂核（§11.34，本轮沿用 NC=4）；AIV 侧分支
+  已由 §11.34/§4.7 关闭。
+
+本轮新增：`kernels/v1/k1_solve_assemble_probe.cpp`、`tools/probe_solve_assemble.py`。
+生产路径未改。下一步是同一探针上的第二个判决实验——**同样的字节、更少的调用**（先量 1/2/4/8/16/32 KB
+的调用尺寸 vs 速率曲线定住固定开销，再把 shipped 的 6 次/chunk 换成按块合并的 2~3 次/chunk），
+只有当 mode 1 明显向 839 GB/s 靠拢时才动生产 kernel。

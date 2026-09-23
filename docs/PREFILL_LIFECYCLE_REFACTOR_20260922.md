@@ -246,6 +246,33 @@ assemble 的块做肥这条被实测封死：`KDA_ASM_NCHUNK = 6/8` 直接把核
 两次并发 + 一次单进程复现）。完整口径见 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md`
 §11.34/§11.35。
 
+### 4.8 assemble 的两趟与 P 往还（本轮新增第五条）：结构不花钱，账在"小传输"上
+
+§4.7 说 assemble 的 151.0 MB 跑 0.928 ms（163 GB/s）里 ~0.75 ms 是结构。本轮把它拆开量：
+`kernels/v1/k1_solve_assemble_probe.cpp`（shipped 的逐字转写，五臂各去一个候选）+
+`tools/probe_solve_assemble.py`（同进程交错 MIN of 5 + 生产 24-launch 重放）。
+
+| 臂 | GM bytes/call | ms | 判决 |
+|---|---:|---:|---|
+| mode 0 控制（shipped 结构） | 151.0 MB | 0.648 | — |
+| mode 1 只留 GM 流量 | 100.7 MB | **0.339** | **地板 = 控制臂的 52%，297 GB/s** |
+| mode 2 流量 + store | 151.0 MB | 0.510 | store 侧 = +0.171 |
+| mode 3 控制 − P 往还 | 100.7 MB | 0.511 | P 往还 = +0.137 |
+| mode 4 只跑 pass 0 | 75.5 MB | 0.327 | 2×0.327 = 0.655 vs 0.648 ⇒ 两趟**没有**固定成本 |
+| 生产 24 launch 重放 | 151.0 MB | 0.785 | launch 形态 +0.137（≈4.4 µs/launch） |
+
+- **（b）+（c）= 0.309 = mode 0 − mode 1**：控制臂 = 0.339（流量）+ 0.171（Fixpipe store）
+  + 0.138（L0 链），三项可加、互不遮蔽。**把 assemble 并进 cube 只值 0.137 ms**（(d)），不是 0.75。
+- 每 chunk 6 次装载、avg 1.37 KB/次、73728 次调用 ⇒ 4.6 ns/次；按 cube 冷路径边际 839 GB/s 折价，
+  **0.219 ms 是"传输太小"的价格**（≈3.0 ns/次固定开销）。`Nd2NzParams` 的 `ndNum` /
+  `srcNdMatrixStride` / `dstNzMatrixStride` 本来就允许一次搬多张，而 Lneg / Xb / P 的源布局都是
+  等跨距连续的——**生产 kernel 一次都没用 ndNum**。
+- 上限：把这 0.339 打到 cube 价 ⇒ −0.22 ms（stage 2.535 的 8.7%），且那时 AIC（≈0.55 + cube
+  1.586）会掉到 AIV 的 2.144 附近，**stage 转由 AIV 绑定**（§4.7 已证明那侧没有可挖的松弛量），
+  所以这条线的天花板是 ~0.4 ms。⇒ 下一刀只做"同样字节、更少调用"，先量调用尺寸 vs 速率曲线；
+  mode 1 不向 839 GB/s 靠拢就不动生产 kernel。完整口径见
+  `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.36。
+
 ### Level 2 / Level 3 的准入条件
 
 在动手前必须先提交：
