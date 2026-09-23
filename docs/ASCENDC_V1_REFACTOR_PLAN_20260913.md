@@ -2078,3 +2078,119 @@ per-chunk 串行一样都没少。设计书转述的旧 TRSM 原型是 11.45 ms�
 下一步的顺序因此是：路线 3 先做**一份不落 GM 的 leaf-inverse + 块更新设计**（含 slot/credit
 与 UB 预算），再决定是否写 kernel；路线 4 先试不动协议几何的变体（C=96，或"逻辑 chunk 64 +
 值 tile 128"）；路线 5 保持在专用分支的位置。
+
+## 11.33. 三条路线同轮执行（2026-09-23 晚）：C128 装不下且不回本、宽 RHS solve 的 AIV 地板已超整段预算、checkpoint/replay 被本轮实测的 GM 价位判死
+
+本轮顺序按设计书 §4：分层 C128 → 融合式宽 RHS solve →（组合）→ checkpoint/replay。
+三条都跑到了判决，**没有一条进入生产**，`python/kda_ascendc_v1/api.py` 的生产路径一字未动。
+
+### 1. 分层 C128：可行性算术 + "上一次同实验"的实测
+
+**(a) 设备事实。** `KDA_CHUNK=128` 全链路 RTC 编译通过（`_defines`：CHUNK 128 /
+SOLVE_WIDE_NCHUNK 8 / SUBB 2 / ASM_NCHUNK 4 / WU_NCHUNK 2 / MAXH 2），但第一个 launch 就把
+设备打挂（`tools/probe_chunk128_k1.py`，日志 `/tmp/c128_run.log`）：
+
+```text
+FAULT kda_pre_gram_mix  blocks=2
+       -> 507015 aicore exception, core id 33
+          "The GM address accessed by scalar exceeds 48 bits"
+```
+
+`/tmp/bisect_c128.py` 在每次 launch 后加一次 `torch.npu.synchronize()`，把它定位到
+`kda_pre_gram_mix` **自己**（不是 solve、不是 K2）；同一个 binary 在 C=64 一切正常。所以
+"当前实现装不下 C128" 是 kernel 的 UB/L0 算术问题，不是数学问题——与设计书的判断一致。
+
+**(b) 算术（可复算）。** `tools/gen_ub_l1_budget.py` 新增 `pre_gram_ub()`：直接从
+`kernels/v1/k1_pre_gram_mix.cpp` 的 `InitBuffer` 表达式求值（AIV 半边一份账、Cube 半边
+A1/B1/CO1 一份账，两者在同一个文件但不在同一块存储里）：
+
+| CHUNK | AIV half (UB) | Cube half (L1 queues) | L0: A2 / B2 / CO1 |
+|---:|---:|---:|---|
+| 16 | 119.7 / 192 KB（−72.3） | 42.0 / 512 KB | 16 / 32 / 8 KB |
+| 32 | 141.5 / 192 KB（−50.5） | 88.0 / 512 KB | 32 / 40 / 16 KB |
+| 64 | **185.3 / 192 KB（−6.7）** | 176.0 / 512 KB | 64 / 48 / 32 KB |
+| 96 | 229.7 / 192 KB（**+37.7**） | 280.0 / 512 KB | 96 / 64 / 72 KB |
+| 128 | **274.6 / 192 KB（+82.6）** | 400.0 / 512 KB | **128 / 80 / 128 KB** |
+
+C=64 的 185.3 KB / 余 6.7 KB 与 kernel 注释里实测的 "under 8 KB of UB headroom" 对上
+（模型不计 TPipe 的对齐/padding），说明它没有系统性偏差。C=128 同时超三项硬件预算：UB
++82.6 KB、L0A 128/64 KB、L0B 80/64 KB（L0C 正好占满 128/128）。超预算的四块就是分层方案
+要动的地方：`bT0`（整 chunk gate cumsum，64 KB）与 `qgin/qgmk/qgout`（16 行 × M 列的 band
+staging，各 32 KB）。
+
+**(c) 判决规则触发（"如果 C128 的 K1 已经没有收益，就不应该继续改 K2"）。** "chunk 数减半、
+M 翻倍"这个实验在上一步已经量过两次：
+
+| 口径（`[1,8192,96,128]`，C=32 → C=64） | K1 | K2 | 证据 |
+|---|---:|---:|---|
+| 文档同版本交错 A/B（§11.28） | pre 3.189 → 3.445，solve 2.294 → 2.548 = **+0.51 ms** | 3.405 → 2.462 = **−0.94 ms** | 同进程交错 |
+| 本轮同机同日 K1-only（do_bench 中位 of 3） | 6.326 → 6.642 ms = **+0.316 ms** | — | `tools/probe_chunk128_k1.py` |
+
+（本轮三条腿：C=16 6.589 / C=32 6.326 / C=64 6.642 ms，每 1000 token 0.804 / 0.772 / 0.811 ms。）
+也就是说，**上一步里 K1 已经开始倒亏**：增长的机制是算术的（pre_gram 的 Gram/post_gram
+元素数、solve 的行递归 lane 数都随 M 上升），而 C=64 时每 chunk 的固定成本已经摊薄。因此
+C=64 → C=128 不可能让 K1 变好，只剩 K2 还能赚——上限就是上一步实测的 −0.94 ms，而 K2 的
+每步成本本身也随 M 上升。**冻结 C128，不为它动 K2。**
+
+**(d) 将来重开的入口条件**（写清免得重新论证）：把 `post_gram` 的 band staging 从
+`[16, M]` 切成两半 `[16, 64]`（或降成单槽 ring，省 ~72 KB）；把 `bT0` 的整 chunk gate
+cumsum 改成带 carry 的 32 行 band（省 48 KB；**加法顺序变了，要重跑数值 gate，不是逐位
+一致**）；把 L0A/L0B 的操作数切片各减半。三条都做完只是"装得下"，回本仍要按 (c) 的账算。
+
+### 2. 融合式宽 RHS solve：AIV 半边的**地板**已经超过整段预算
+
+`tools/probe_rhs_substitution.py` + `kernels/v1/k1_solve_rhs_probe.cpp`（计时探针，非生产
+kernel；只写 32 B 防 DCE，没有 gather / cast / store）。同进程、12288 个 chunk-instance
+（生产 chunk 数）、grid 1536、MIN of 5：
+
+| 臂 | 指令/chunk | repeats | ms | ns/chunk |
+|---|---:|---:|---:|---:|
+| null | 0 | — | 0.081 | 6.6 |
+| shipped shape（M=32、32 lane、8 实例） | 124 | 8 | **1.169** | 95.2 |
+| fused 2×32（256 lane RHS、4 实例） | 496 | 8 | **5.854** | 476.4 |
+| fused 4×16（256 lane RHS、8 实例） | 240 | 8 | **2.941** | 239.4 |
+
+同一进程重放生产的 solve launch：**AIV 2.123 / AIC（assemble+cube）2.587 / 重叠 2.644 ms**。
+
+判决：停止规则是"完整融合 solve ≥ ~2.5 ms 即停"。两个融合形态的 AIV 地板——**不含** RHS
+gather、**不含** W/U store、2×32 还**不含**耦合那步 Cube——已经是 2.941（1.11×）与 5.854
+（2.21×）ms。⇒ **路线停止，不写 Cube 半边。**
+
+机制（为什么不是实现问题）：行递归的指令数由分块决定（每个对角块 `Σ_i i`），而**每条指令
+的宽度**由另一个操作数决定。现实现递归在 M×M 的 inverse 上（32 lane × 8 个 chunk 实例，
+UB 32 KB），融合形态递归在 `[M, 256]` 的 RHS 上（256 lane × 4 个实例，同样 128 KB UB），
+于是每 chunk 的指令数 ×4；4×16 把指令数砍半（240）但仍然在整段预算之上。这正是 §11.9
+"solve 的 2.53 ms 是真算力" 的另一面：**inverse 是小操作数、宽 repeat；RHS 是大操作数、
+窄 repeat**，而 UB 只够一种。
+
+副产品（对后续有用）：现实现 AIV 半边的 2.123 ms 里，递归地板只有 1.169 ms（55%），剩下
+~0.95 ms 是 L gather、bf16 往返 cast 与 A16/Xb/Lneg store。要再动 solve，**先动这 0.95 ms**
+（例如 A16 store 只写 Cube 真正读的对角块），而不是重排递归。
+
+### 3. checkpoint / replay：用本轮实测的 GM 价位直接判死（**定价否证**，不是实测）
+
+§11.30 的分割实验给出了"额外 GM 流量"的实测价格：+402.7 MB（bf16 快照读侧）= +1.70 ms
+⇒ **4.2 ns/byte**（≈236 GB/s 有效）。interval = 4 的账：
+
+| 项 | 量 | 价 |
+|---|---:|---:|
+| 省：快照流量 402.7 → ~100 MB | −300 MB | −1.27 ms |
+| 加：output 重放要再读 W/U/Qg/Kg/Aqk | +908 MB | +3.8 ms |
+| 加：重算 Z、A@Z、Q@H | ~39 GFLOP | +2.4 ms（按 §11.30 的 ~16 TFLOPS 有效价） |
+
+⇒ 净 **+5 ms 量级**，且 final state 仍然只能串行。**不做 interval sweep**。重开条件只有
+一个：诊断显示"快照 workspace 或它自己的流量"是瓶颈——而本轮的测量正好是反证：把快照流量
+开到最大的 split 变体（§11.30）已经更慢。
+
+### 4. 三条路线之后的账面
+
+| 路线 | 本轮状态 | 下一步 |
+|---|---|---|
+| 分层 C128 | **不采用**：装不下（UB +82.6 KB、L0A/L0B 各超），且上一步同实验里 K1 已倒亏 +0.51 ms | 入口条件见 1.(d)；重开前先按 1.(c) 的账回本 |
+| 融合式宽 RHS solve | **不采用**：AIV 地板 2.94 / 5.85 ms ≥ 整段 2.64 ms | 若要再动 solve，先削 AIV 的 0.95 ms 非递归开销（2 的副产品） |
+| checkpoint / replay | **不采用（定价）**：净 +5 ms 量级 | 只在诊断显示 workspace/流量是瓶颈时重开 |
+| 组合（C128 + 新 solve） | 随前两条一起冻结 | — |
+
+生产路径未改；本轮新增的都是探针与账本工具（`tools/probe_rhs_substitution.py`、
+`tools/probe_chunk128_k1.py`、`tools/gen_ub_l1_budget.py` 的 `pre_gram_ub()`、
+`kernels/v1/k1_solve_rhs_probe.cpp`）。

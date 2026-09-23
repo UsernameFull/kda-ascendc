@@ -168,11 +168,53 @@ Level 4  仅在 Level 2/3 有稳定收益后，评估 device-side persistent sch
   25～30%（少交 d1 与 Z 两次舍入）⇒ 合格，但跨核交接一点没少；
 - 代价侧：+59 GFLOP 按 §11.30 实测价位值 1.5～3.7 ms，而 K2 全部只有 4.08 ms。
 
-### 4.3 还没有实测的
+### 4.3 分层 C128（本轮新增第一条）：装不下，而且上一步的 K1 已经在倒亏
 
-路线 3（融合式分块 solve）、路线 4（C128/tile 解耦）、路线 5（segment scan）尚未进入实现，
-入场条件与定价写在 §11.32。路线 3 的第一步不是写 kernel，而是一份"leaf inverse 批量 +
-块更新走 Cube + 中间 RHS 不落 GM"的设计与 slot/credit 预算。
+两部分都在 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.33 有完整口径，这里只留判决：
+
+- **装不下（实测）**：`KDA_CHUNK=128` 全链路 RTC 编译通过，但第一个 launch
+  `kda_pre_gram_mix` 直接打挂设备（507015 aicore exception）。per-launch bisect 确认是
+  该 kernel 自己。`tools/gen_ub_l1_budget.py` 新增的 `pre_gram_ub()`（从 kernel 源码的
+  `InitBuffer` 表达式求值）给出原因：AIV 半边 274.6 / 192 KB（**+82.6**）、L0A 128/64、
+  L0B 80/64、L0C 128/128；C=64 的 185.3 / 192 KB 与 kernel 注释里的 "under 8 KB
+  headroom" 对上。要装下必须把 `post_gram` 的 band staging 切半、把整 chunk 的 gate
+  cumsum 改成带 carry 的 band（加法顺序变，需重跑数值 gate）、并把 L0 操作数切片减半。
+- **不回本（实测）**：'chunk 数减半、M 翻倍'这个实验在上一步已经量过：C=32 → C=64 的
+  K1 **+0.51 ms**（§11.28 同版本交错 A/B；本轮同机同日 K1-only 复测 +0.316 ms），K2
+  −0.94 ms。K1 的增长机制是算术的（Gram/post_gram 的元素数与 solve 的递归 lane 数都随 M
+  上升），所以 C64 → C128 不会让 K1 变好。**按判决规则：K1 没有收益 ⇒ 不动 K2，冻结 C128。**
+
+### 4.4 融合式宽 RHS solve（本轮新增第二条）：AIV 地板已经超过整段预算
+
+`tools/probe_rhs_substitution.py` + `kernels/v1/k1_solve_rhs_probe.cpp`（计时探针），同进程
+12288 个 chunk-instance、MIN of 5，只写 32 B 防 DCE：
+
+| 臂 | 指令/chunk | ms |
+|---|---:|---:|
+| shipped recursion floor | 124 | 1.169 |
+| fused 2×32（256 lane RHS） | 496 | **5.854** |
+| fused 4×16（256 lane RHS） | 240 | **2.941** |
+
+同进程重放生产 solve：AIV 2.123 / AIC 2.587 / 重叠 **2.644 ms**。两个融合形态的 AIV 地板
+（不含 RHS gather、不含 W/U store、2×32 还不含耦合 Cube 步）已经是整段的 1.11× / 2.21×。
+⇒ **停止，不写 Cube 半边。** 机制：递归的指令数由分块定，指令宽度由另一个操作数定；inverse
+是 32 lane × 8 实例，RHS 是 256 lane × 4 实例（同样 128 KB UB），所以每 chunk 指令数 ×4。
+副产品：现实现 AIV 的 2.123 ms 里递归只占 1.169 ms，剩下 ~0.95 ms 是 gather/cast/store——
+以后要动 solve 应该先动这 0.95 ms。
+
+### 4.5 checkpoint / replay（本轮新增第三条）：被实测的 GM 价位判死
+
+用 §4.1 的 split 实验实测出的价格（+402.7 MB = +1.70 ms ⇒ **4.2 ns/byte**）：interval 4 省
+回 ~1.27 ms 的快照流量，但要再读 W/U/Qg/Kg/Aqk（~908 MB ⇒ +3.8 ms）并重算 Z、A@Z、Q@H
+（~39 GFLOP ⇒ +2.4 ms），净 **+5 ms 量级**，且 final state 仍只能串行。⇒ **不做 interval
+sweep**；重开条件只有一个——诊断显示快照 workspace/流量本身是瓶颈，而本轮测量正好相反
+（把快照流量开到最大的 split 变体已经更慢）。
+
+### 4.6 还没有实测的
+
+路线 5（segment scan）仍是专用分支（小 B/H、超长 T），入场条件见 §11.32；C128 与融合
+solve 的"组合"随各自路线一起冻结。真要再动 solve，第一步是先削 §4.4 里那 0.95 ms 的
+非递归开销，而不是重排递归。
 
 ### Level 2 / Level 3 的准入条件
 

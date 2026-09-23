@@ -183,8 +183,82 @@ def split_budget(chunk: int, maxh: int) -> dict:
     }
 
 
+def pre_gram_ub(chunk: int) -> dict:
+    """What the fused stage-1 kernel charges, at a given KDA_CHUNK.
+
+    Route 3 of the 2026-09-23 order is "layered C128": keep the chunk-generic
+    kernels, move the logical chunk to 128, lay the work out so no whole
+    [128, 128] intermediate is resident.  The first half of that is a
+    *feasibility* question - does the existing kernel even fit at M = 128 - and
+    it is arithmetic, not a measurement: the kernel's InitBuffer list is an
+    expression list in M, D, N = M*D, NG = 16*D and BS = min(32, M), so the
+    total can be evaluated instead of argued about.
+
+    Read out of the source rather than re-typed: the two terms that break first
+    (bT0 = N * 4, the whole-chunk gate cumsum, and the four qg* queues =
+    2 * 16 * M * 4 per slot, the band staging) are exactly the ones a
+    hand-kept copy drifts on.  The two budget regions are kept apart because
+    they are: the AIV half (kda_pre_gram_mix's own TPipe, the 192 KB UB part)
+    and the paired Cube's A1/B1/CO1 queues (run_gram_aic's TPipe, L1), which
+    are allocated in the same file but not in the same memory.
+    """
+    import re
+    src = (ROOT / "kernels/v1/k1_pre_gram_mix.cpp").read_text(encoding="utf-8-sig")
+    aiv = src[src.index("kda_pre_gram_mix("):]
+    aic = src[src.index("run_gram_aic("):src.index("kda_pre_gram_mix(")]
+    env = {"M": chunk, "D": D, "N": chunk * D, "MM": chunk * chunk,
+           "NG": 16 * D, "MT": 16 if chunk > 16 else chunk,
+           "BS": 32 if chunk > 32 else chunk, "KF": max(1, chunk // 16)}
+
+    def parse(text):
+        rows = []
+        for m in re.finditer(r"pipe\.InitBuffer\((\w+),\s*(\d+),\s*([^;]+)\);", text):
+            rows.append((m.group(1), int(m.group(2)) * eval(m.group(3), {}, env)))
+        for m in re.finditer(r"pipe\.InitBuffer\((\w+),(?!\s*\d+\s*,)\s*([^;]+)\);", text):
+            rows.append((m.group(1), eval(m.group(2), {}, env)))
+        return rows
+
+    aiv_rows, aic_rows = parse(aiv), parse(aic)
+    # The two L0 operand slabs and the L0C slot are declared as raw
+    # LocalTensor<uint8_t> views rather than through InitBuffer, and at M = 128
+    # they are the *other* wall (L0A 128 KB and L0B 80 KB against 64 KB each,
+    # L0C exactly 128 KB) - see api.py's refusal note for the same arithmetic.
+    xband = chunk > 32
+    bs = 32 if xband else chunk
+    l0a = 4 * chunk * D * 2
+    l0b = 2 * chunk * D * 2 + (2 * bs * D * 2 if xband else 0)
+    l0c = 2 * chunk * chunk * 4
+    return {"chunk": chunk, "l0a": l0a, "l0b": l0b, "l0c": l0c,
+            "ub": sum(b for _, b in aiv_rows), "ub_cap": 192 * 1024,
+            "l1": sum(b for _, b in aic_rows), "l1_cap": 512 * 1024,
+            "ub_biggest": sorted(aiv_rows, key=lambda r: -r[1])[:6],
+            "l1_biggest": sorted(aic_rows, key=lambda r: -r[1])[:4]}
+
+
 def main():
     chunk = int(os.environ.get("KDA_CHUNK", "64"))
+    print("fused stage-1 (k1_pre_gram_mix.cpp) across the chunk sizes,"
+          " InitBuffer evaluated from source:")
+    print("   %-6s %22s %22s" % ("", "AIV half (UB)", "Cube half (L1 queues)"))
+    for c in (16, 32, 64, 96, 128):
+        pg = pre_gram_ub(c)
+        def fmt(used, cap):
+            over = used - cap
+            return ("%7.1f / %3d KB  %s" % (used / 1024, cap // 1024,
+                    ("%+.1f OVER" % (over / 1024)) if over > 0 else
+                    ("-%.1f free" % (-over / 1024))))
+        print("   C=%-4d %22s %22s" % (c, fmt(pg["ub"], pg["ub_cap"]),
+                                       fmt(pg["l1"], pg["l1_cap"])))
+    pg = pre_gram_ub(128)
+    print("   C=128 AIV terms: " + ", ".join("%s %.1f KB" % (n, b / 1024)
+                                             for n, b in pg["ub_biggest"]))
+    print("   C=128 L1 terms:  " + ", ".join("%s %.1f KB" % (n, b / 1024)
+                                             for n, b in pg["l1_biggest"]))
+    for c in (64, 128):
+        pg = pre_gram_ub(c)
+        print("   C=%-4d L0: A2 %.1f / 64 KB, B2 %.1f / 64 KB, CO1 %.1f / 128 KB"
+              % (c, pg["l0a"] / 1024, pg["l0b"] / 1024, pg["l0c"] / 1024))
+    print()
     # MAXH is derived the same way api.py derives it, so this tool does not
     # have to import the api (which pulls in the RTC launcher extension): a
     # budget generator that needs a compiled extension to run is one more thing
