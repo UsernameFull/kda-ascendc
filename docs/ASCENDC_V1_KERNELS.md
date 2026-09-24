@@ -112,8 +112,13 @@ runtime argument (`api.asm_load_mode()`, `KDA_ASM_LOADS`, read per call):
   the loads of a whole pass are issued before its arithmetic starts, and a
   2-deep queue **deadlocks** on the third `AllocTensor` (measured:
   `KDA_ASM_NCHUNK = 2` runs, 4 and 8 hang the block).  That depth constraint is
-  the queue's; mode 1 has an explicit buffer and no such depth, so re-testing
-  `KDA_ASM_NCHUNK = 6/8` is open again.
+  the queue's; mode 1 has an explicit buffer and no such depth, so
+  `KDA_ASM_NCHUNK = 6/8` was re-tested on modes 1/2
+  (`tools/probe_solve_assemble_nc.py`, docs section 11.41): the hang does not
+  come back (mode 0 still does hang at 6/8, reproduced as the negative
+  control), the arms run to NC = 16 and are bit-identical to NC = 4, but e2e is
+  flat inside the noise floor (10.389 / 10.390 / 10.392 ms for NC = 4/6/8,
+  median of 3), so the batched form is not wave-limited and **NC stays 4**.
 
 `kda_solve_wu_cube_kernel` reads the same A16 tiles in both of its passes, and
 a second argument (`api.cube_a16_resident()`, `KDA_CUBE_A16_RESIDENT`, read per

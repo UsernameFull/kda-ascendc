@@ -64,8 +64,15 @@
 // is why mode 1 pairs the batching with the explicit buffer.
 //
 // The queue's NC-deep shape is what pinned KDA_ASM_NCHUNK at 4 (6 and 8
-// deadlock, measured); the explicit buffer has no such depth constraint, so
-// re-testing a fatter block is a follow-up, not a claim.
+// deadlock, measured, and re-reproduced at mode 0 as the negative control);
+// the explicit buffer has no such depth constraint, so the fatter block was
+// re-tested (tools/probe_solve_assemble_nc.py): modes 1/2 run NC = 6/8/12/16
+// to completion and are bit-identical to NC = 4, but e2e is flat inside the
+// noise floor (10.389 / 10.390 / 10.392 ms for NC = 4/6/8, median of 3 in one
+// process), so the batched form is not wave-limited at 4 and NC stays 4.
+// That probe also measured the isolated replay to be address-sensitive (the
+// same kernel and NC: 0.15 vs 0.46 ms for different operand allocations), so
+// a block-size verdict has to come from e2e/stage, not from a replay.
 #include "kernel_operator.h"
 using namespace AscendC;
 

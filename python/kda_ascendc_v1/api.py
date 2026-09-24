@@ -58,9 +58,13 @@ SOLVE_WIDE_SUBB = (int(os.environ.get("KDA_SOLVE_WIDE_SUBB", "0"))
 # Chunks one wide block solves (the wide kernel's tile runs over sub-blocks x
 # chunks, see its header): SB sub-blocks of every chunk share one tile.
 SOLVE_WIDE_NCH = SOLVE_WIDE_NCHUNK // SOLVE_WIDE_SUBB
-# Chunks one assemble block forms the coupling block of.  Every pass of the
-# kernel issues the L1 loads of the whole block before its arithmetic, so the
-# queue has to be that deep (a shorter queue deadlocks on AllocTensor).
+# Chunks one assemble block forms the coupling block of.  The shipped queue
+# form (KDA_ASM_LOADS=0) issues the L1 loads of a whole pass before its
+# arithmetic, so its queue has to be exactly this deep; the explicit-buffer
+# forms (1, 2 - production) have no such constraint, and 6/8/12/16 were
+# re-tested on them (tools/probe_solve_assemble_nc.py): they run and are
+# bit-identical, but e2e is flat inside the noise floor (NC = 4/6/8 ->
+# 10.389/10.390/10.392 ms), so 4 stays - the knob is free, not profitable.
 ASM_NCHUNK = int(os.environ.get("KDA_ASM_NCHUNK", "0")) or 4
 # The wide part is AIV-only and the assemble/Cube part AIC-only, so the two
 # can run at the same time: the chunk range is cut into this many slices, the

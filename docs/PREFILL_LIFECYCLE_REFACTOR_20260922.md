@@ -242,8 +242,9 @@ solve 剩下的入口都在 AIC，第一条已经探过了（§11.35）：把 cu
 的 0.16——第二遍读是 L2 命中，只有它值得省（冷的那一遍是 HBM 价，边际 839 GB/s）。
 真正的账在 assemble：151.0 MB 跑 0.928 ms = 163 GB/s，按 cube 的冷路径边际率只要 0.18 ms
 ⇒ **~0.75 ms 是它的结构开销**（两趟 + P 往还 + 每块 4 chunk），十倍于 A16 那 0.07。把
-assemble 的块做肥这条被实测封死：`KDA_ASM_NCHUNK = 6/8` 直接把核挂住（AICore 100% 空转，
-两次并发 + 一次单进程复现）。完整口径见 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md`
+assemble 的块做肥这条当时被实测封死：`KDA_ASM_NCHUNK = 6/8` 直接把核挂住（AICore 100% 空转，
+两次并发 + 一次单进程复现）——**该结论的适用范围已澄清**（§11.41）：挂的是 shipped 队列形态，
+显式 buffer 下 6/8 能跑，但也没有收益，NC 仍钉在 4。完整口径见 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md`
 §11.34/§11.35。
 
 ### 4.8 assemble 的两趟与 P 往还（本轮新增第五条）：结构不花钱，账在"小传输"上
@@ -306,8 +307,10 @@ per-chunk 链函数，公式/dtype/同步结构未动）：
 
 AIC 2.310 仍高于 AIV 2.134，**stage 还在 AIC 侧**：要翻到 AIV 侧还差 ~0.18 ms，正好是 §4.8 记下的
 P 往还 0.137 与 §4.7/§11.35 的 cube A16 重读 0.070 的量级——那两条是这条线之后剩下的入口。
-副产物：KDA_ASM_NCHUNK=4 的钉死理由是 shipped 路径的队列深度，**显式 buffer 没有这个约束**，
-NC=6/8 值得重测（后续，不是结论）。完整口径见 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.37。
+副产物：KDA_ASM_NCHUNK=4 的钉死理由是 shipped 路径的队列深度，**显式 buffer 没有这个约束**——
+6/8 已复测（docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md §11.41）：挂核不回来了（mode 0 仍挂，作为负
+对照），但 e2e 平到噪声底（NC=4/6/8 → 10.389/10.390/10.392 ms），**NC 仍是 4**——旋钮是自由的，
+不是赚钱的。完整口径见 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.37。
 
 ### 4.10 AIC 两条收尾（本轮新增第七、八条）：A16 常驻与 P 上片都落地，两半配平
 
