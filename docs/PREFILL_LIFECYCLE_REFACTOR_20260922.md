@@ -341,9 +341,23 @@ NC=6/8 值得重测（后续，不是结论）。完整口径见 `docs/ASCENDC_V
 - **两半配平**：AIC 2.141 对 AIV 2.134，差 0.007 ms。这条线的账到此结清：再单独削任何一侧都不会
   动 stage，除非成对削（或把另一侧那 ~0.18 ms 的松弛量拿出来用）。这也是 §4.9 "上限 ~0.4 ms" 的
   落地版本——实际拿到 0.18（stage 2.505 → 2.322，−7.3%）。
-- 清理项（未做）：mode 2 下 `pmid` 的 50.3 MB/call 已经是死内存；回收它要动 workspace 池语义。
+- 清理项（§4.11 已做）：mode 2 下 `pmid` 已经是死内存——分配量 25.17 MB/call，往还 50.3 MB/call。
 
 完整口径见 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.38/§11.39。
+
+### 4.11 死内存清理（本轮新增第九条）：mode 2 的 P tile 不再分配
+
+§4.10 记的清理项已落地。mode 2 下 assemble 的 P 既不在 GM 写也不在 GM 读，所以调用点直接不分配这块
+`[c_solve, sub, sub]` bf16——**[1,8192,96,128] 下 25.17 MB/call（24 MiB）**。口径提醒：§4.10 里那句
+"50.3 MB" 说的是它的 GM 往还（pass 0 写 + pass 1 读），不是分配量。`_pack_ptrs` 把 `None` 打成空指针，
+kernel 在 mode 2 的结构里不碰它（`P` 这个 `GlobalTensor` 只出现在 `!onchip` 的两支），模式每次调用重读，
+所以 mode 0/1 仍然拿到真指针。
+
+判决：**位一致**（0/100663296 个元素不同，max|d| 0，状态相同），e2e 10.408 → 10.402、stage 2.322 →
+2.320、AIC 2.141 → 2.134（都在噪声内），AIC 2.134 对 AIV 2.132 依旧配平。三档 chunk 矩阵 PASS，
+`tests/test_solve_assemble_loads.py` 多一个指针为 0 / 非 0 的用例。
+
+完整口径见 `docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md` §11.40。
 
 ### Level 2 / Level 3 的准入条件
 

@@ -81,10 +81,14 @@ to 0.
 `kda_solve_assemble` (AIC) forms the coupling block in two passes: pass 0
 `P = Lneg @ X11` fixpiped row-major into its own `[c_solve, M, M]` bf16 tile,
 pass 1 `X21 = X22 @ P` fixpiped straight into the parent tile's lower-left
-block.  The `L0C -> GM -> L1` round trip of `P` is unavoidable (L0C has no path
-back into L0A/L0B); splitting the passes keeps it off the per-chunk critical
-path.  Both operands go in through `Nd2Nz` (whole tile for A, per-band for B,
-which `LoadDataWithTranspose` wants band-major), and the load *pattern* is a
+block.  The `L0C -> GM -> L1` round trip of `P` is unavoidable for *this* load
+path (L0C has no path back into L0A/L0B); splitting the passes keeps it off the
+per-chunk critical path.  Mode 2 below replaces that GM tile with an L1 one -
+the same bytes, one address space closer - and the caller then does not
+allocate the `[c_solve, M, M]` bf16 tile at all (25.17 MB per call at the
+target shape; the kernel takes a null and never dereferences it, docs section
+11.40).  Both operands go in through `Nd2Nz` (whole tile for A, per-band for
+B, which `LoadDataWithTranspose` wants band-major), and the load *pattern* is a
 runtime argument (`api.asm_load_mode()`, `KDA_ASM_LOADS`, read per call):
 
 * `1` (docs section 11.37) - one explicit B1 buffer per operand and the same
@@ -96,7 +100,8 @@ runtime argument (`api.asm_load_mode()`, `KDA_ASM_LOADS`, read per call):
 * `2` (production; docs section 11.39) - mode 1 plus `P` on chip: pass 0's
   fixpipe writes `P` into an L1 tile in `CFG_NZ` instead of its own GM tile and
   pass 1 builds L0B from that region, so the GM tile is neither written nor
-  read (151.0 -> 100.7 MB per call).  The NZ fractals come out `[n-block]
+  read (151.0 -> 100.7 MB per call - that 50.3 MB is the round trip, not the
+  tile, which is 25.17 MB).  The NZ fractals come out `[n-block]
   [k-block]` where the `Nd2Nz` band-major source was `[k-block][n-block]`, so
   the four 16x16 fractals enter L0B in the order 0, 2, 1, 3; the probe checks
   A16 is bit-identical, which is what verifies that mapping.  Measured at

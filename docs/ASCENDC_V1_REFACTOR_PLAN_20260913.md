@@ -2519,8 +2519,8 @@ AIC 的尾巴和 AIV 的重叠吃掉了一部分差值。**默认已切到 1**�
   任何一侧都不会再动 stage，除非**成对**动（要么同时削，要么削完一侧再把另一侧那 0.18 的松弛量拿出来用）。
 - mode 1 → mode 2 的 stage 收益只有 0.001 ms（2.323 → 2.322），isolated 是 −0.152；这已经是"用满"的
   信号：AIC 那半边不再是瓶颈。
-- 附带事实：mode 2 下 `pmid`（`[c_solve, M, M]`，50.3 MB/call）既不被写也不被读，回收它是后续的
-  清理项（本轮没做，避免动 workspace 池的语义）。
+- 附带事实：mode 2 下 `pmid`（`[c_solve, M, M]`，[1,8192,96,128] 下 25.17 MB/call）既不被写也不被读，
+  回收它是后续的清理项（§11.40 已做；这段里说的 50.3 MB 是它的 GM 往还，写 + 读，不是分配量）。
 
 **默认**：`KDA_ASM_LOADS` = 2，`KDA_CUBE_A16_RESIDENT` = 1。这一轮两个改动合起来把 solve stage 从
 2.538（本轮起点，§11.37 后的生产值）压到 **2.322 ms（−8.5%）**，e2e 从 10.62 压到 **10.408 ms**，
@@ -2536,3 +2536,52 @@ AIC 的尾巴和 AIV 的重叠吃掉了一部分差值。**默认已切到 1**�
 都带、每次调用重读）与新增 `tests/test_solve_cube_a16_resident.py`（两臂位一致、默认 1、每 slice 都带）
 在 C=64 下 6 passed。C=16/32 那两 leg 对 cube 的 a16Mode 也生效（单级 solve 同样走这个 kernel），
 assemble 仍然只在 C=64 上线。
+
+## 11.40. 清理项落地：mode 2 的 P tile 不再分配（25.17 MB/call 的死内存），位一致、stage/e2e 不动（2026-09-24）
+
+§11.39 记了一笔附带事实：mode 2 下 `pmid` 既不被写也不被读。本轮把它从生产里拿掉。这是**清理**，
+不是优化，所以判决口径是"不许有任何变化"，而不是"快了多少"。
+
+**账**（[1,8192,96,128]，C=64：`c_solve` = B * H * nt = 96 * 128 = 12288 个 chunk，`sub` = 32，bf16）：
+
+| 口径 | 字节/call | 说明 |
+|---|---:|---|
+| `pmid` 的分配 | **25.17 MB** | `[c_solve, sub, sub]` bf16 = 12288 * 1024 * 2 = 24 MiB |
+| 它原来的 GM 往还 | 50.3 MB | pass 0 写 + pass 1 读（§11.36/§11.39 里的 50.3 是这个，不是分配量） |
+
+mode 0/1 需要这块 tile（pass 0 的 fixpipe 写 GM、pass 1 的 L0B 从 GM 装），mode 2 两个方向都在片上，
+所以**它的存在与否是 mode 的性质，不是调用点的性质**——这正是把它做成"由 `asm_load_mode()` 决定"
+而不是"从调用点删掉"的理由。
+
+**改法**（`python/kda_ascendc_v1/api.py`，kernel 一个字节没改）：调用点读 `asm_load_mode()`，>= 2 时
+`pmid = None`；`_launch_solve_two_level` 把它按 `None` 传给 `_pack_ptrs`，后者打成空指针。kernel 在
+mode 2 下不 deref 它，这不是新承诺——§11.39 的结构就是保证：pass 0 的 fixpipe 目标是 L1 的 `lp`，
+pass 1 的 L0B 也从 `lp` 填（`k1_solve_assemble.cpp` 里 `P` 这个 `GlobalTensor` 只出现在 `!onchip`
+的两支里）。旋钮每次调用重读，所以探针把 mode 拧回 0/1 时下一次调用会重新分配。
+
+**实测**（`tools/probe_solve_assemble_loads.py`，[1,8192,96,128]，三臂同进程，本轮开头一次跑完）：
+
+| 口径 | mode 0 shipped | mode 1 合并（P 在 GM） | mode 2 P 上片 |
+|---|---:|---:|---:|
+| 输出 | — | 0/100663296 不同，max\|d\| 0 | **0/100663296 不同，max\|d\| 0** |
+| 状态 | — | 相同 | 相同 |
+| e2e（中位 of 3） | 10.577 | 10.425 | **10.402** |
+| ASM（隔离重放，MIN of 5） | 0.897 | 0.678 | 0.569 |
+| CUBE（隔离重放） | 1.506 | 1.511 | 1.508 |
+| AIC（ASM + cube） | 2.548 | 2.241 | **2.134** |
+| sliced（生产 schedule 重放 = stage） | 2.497 | 2.321 | **2.320** |
+| AIV（wide） | 2.125 | 2.125 | 2.132 |
+
+- 对照上一轮（§11.39，同口径）：e2e 10.408 → 10.402，stage 2.322 → 2.320，AIC 2.141 → 2.134——**全在
+  噪声里**。清理项该有的样子：省掉的是 25.17 MB/call 的分配和同样多的 HBM 足迹，不是时间。
+- **两半仍然配平**：AIC 2.134 对 AIV 2.132，差 0.002 ms。§11.39 的结论不变——这条线再动只能成对动。
+- 一个诚实的口径提醒：本轮 ASM 的隔离读数（0.569）比上一轮的 0.513 高 0.056，而 stage/e2e 反向动了
+  0.002/0.006。跨进程的 ASM 隔离读数在这个量级上有抖动（这次少分配一块 25 MB，其余 buffer 的地址
+  布局就变了，L2 命中随之变），**判决一律用 stage/e2e**，这是 §11.34 立下的规矩。
+- 带 sync 的 profile 口径（只做同轮对照）：solve 6.296 / 6.264 / 6.147，total 14.740 / 14.601 / 14.493。
+
+**门禁**：`tests/test_solve_assemble_loads.py` 增一个用例钉住"mode 2 的 P 指针为 0、mode 1/0 非 0"，
+与 `tests/test_solve_cube_a16_resident.py` 一起 7 passed（C=64）；`bash tools/run_chunk_matrix.sh` 在
+C=16/32/64 三个 leg 全部 PASS。生产改动只有 `python/kda_ascendc_v1/api.py`；
+`docs/artifacts/ub_l1_workspace_budget_*.txt` 是旧快照，本轮没有重新生成（它早于工具里 hsnap 那一行，
+生成时刻比本轮的这个改动更早）。

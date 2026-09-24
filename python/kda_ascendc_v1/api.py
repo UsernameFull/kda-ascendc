@@ -226,7 +226,9 @@ def asm_load_mode() -> int:
     block for the A operand, a chunk's two B bands merged, and pass 1's whole B
     operand in one call.  2 is 1 plus P on chip: pass 0's fixpipe writes P into
     L1 in NZ instead of GM and pass 1 builds L0B from it, which drops the tile's
-    50.3 MB (151.0 -> 100.7 MB per call).  2 is production: measured in
+    50.3 MB round trip (151.0 -> 100.7 MB per call of L1 traffic) and, since
+    nothing touches the GM tile any more, the caller stops allocating its
+    25.2 MB as well (section 11.40).  2 is production: measured in
     tools/probe_solve_assemble_loads.py at [1,8192,96,128], the three arms come
     out 0.902 / 0.692 / 0.512 ms isolated, AIC 2.614 / 2.305 / 2.197 and e2e
     10.624 / 10.445 / 10.408 ms.  All three land byte-identical
@@ -277,6 +279,12 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
     up to ``c_solve``, but rk/rv/W/U only carry the c real chunks, so the Cube
     launch - whose kernel clamps its loop to the count it is handed - has to be
     clamped to them (a padded count sends the tail block's stores past W/U).
+    ``pmid`` (the assemble's P tile, 25.2 MB per call at [1,8192,96,128] - the
+    50.3 MB in section 11.39 is its GM round trip, write plus read) is passed as
+    None when the load mode keeps P on chip: the caller does not allocate it,
+    ``_pack_ptrs`` writes a null pointer, and the kernel never dereferences it
+    (docs section 11.40).  Modes 0/1 own the tile and need it non-null, so this
+    is a property of the mode, not of the call site.
     """
     unit = math.lcm(nch, asm_nchunk, wu_nchunk)
     ngrp = c_solve // unit
@@ -297,7 +305,8 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
         lo, n = glo * unit, (ghi - glo) * unit
         wargs = _pack_ptrs([L[lo:], eye, a32[lo:], a16[lo:], xb[lo:],
                             lneg[lo:]]) + [_i(n), _i(a16_mode()), _i(1 if debug_stores else 0)]
-        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:], pmid[lo:]]) + \
+        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:],
+                            None if pmid is None else pmid[lo:]]) + \
             [_i(n), _i(asm_load_mode())]
         cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + \
             [_i(n), _i(cube_a16_resident())]
@@ -741,7 +750,15 @@ def _kda_fwd_impl(
         bf16 = torch.bfloat16
         xb = torch.empty((c_solve, SOLVE_WIDE_SUBB, sub, sub), dtype=bf16, device=q.device)
         lneg = torch.empty((c_solve, sub, sub), dtype=bf16, device=q.device)
-        pmid = torch.empty((c_solve, sub, sub), dtype=bf16, device=q.device)
+        # Load mode 2 keeps P on chip (section 11.39), so its GM tile is
+        # neither written nor read: the 25.17 MB allocation at [1,8192,96,128]
+        # (24 MiB = 12288 chunks of [32, 32] bf16 - the 50.3 MB section 11.39
+        # quotes is the round trip that tile used to carry) is dead memory
+        # under mode 2 and only modes 0/1 need it.  The mode is read per call,
+        # so a probe that flips the knob back gets the tile allocated again on
+        # the next call.
+        pmid = (None if asm_load_mode() >= 2 else
+                torch.empty((c_solve, sub, sub), dtype=bf16, device=q.device))
         _launch_solve_two_level(c_solve, c, SOLVE_WIDE_NCH, ASM_NCHUNK, WU_NCHUNK,
                                 SOLVE_OVERLAP, L,
                                 _tri_eye(q.device, CHUNK // SOLVE_WIDE_SUBB),

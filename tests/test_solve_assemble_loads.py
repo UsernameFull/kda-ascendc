@@ -89,6 +89,16 @@ class _LaunchSpy:
         api.launch_argsarray_engine = self._real
         return False
 
+    def ptrs(self, index, kernel=KERNEL):
+        """Every launch's argument at ``index``, read back as an integer."""
+        out = []
+        for name, args in self.calls:
+            if name == kernel:
+                out.append(int.from_bytes(args[index], "little"))
+        if not out:
+            raise AssertionError("no %s launch was recorded" % kernel)
+        return out
+
     def trailers(self, kernel=KERNEL):
         """Every launch's trailing (C, loadMode) int pair."""
         out = []
@@ -131,6 +141,33 @@ def test_the_mode_is_read_per_call_not_frozen(inputs):
         trailers = spy.trailers()
         assert [t[1] for t in trailers] == [mode] * len(trailers), trailers
         assert len(trailers) >= 2, "the shape did not exercise more than one slice"
+    torch.npu.synchronize()
+
+
+def test_mode_2_leaves_the_p_tile_unallocated(inputs):
+    """P on chip means no GM tile: mode 2 hands the kernel a null pointer.
+
+    The tile is ``[c_solve, M, M]`` bf16 - 25.17 MB per call at [1,8192,96,128]
+    (24 MiB; the 50.3 MB in docs section 11.39 is its GM round trip) - and mode
+    2 neither writes nor reads it (the fixpipe goes to L1, the load comes from
+    L1), so allocating it would be dead memory.  Modes 0 and 1 do use it, which
+    is why this is a property of the mode and not of the call site.
+    """
+    for mode, expect_null in ((2, True), (1, False), (0, False)):
+        os.environ["KDA_ASM_LOADS"] = str(mode)
+        try:
+            with _LaunchSpy() as spy:
+                _call(inputs)
+        finally:
+            os.environ.pop("KDA_ASM_LOADS", None)
+        ptrs = spy.ptrs(3)  # the assemble's fourth argument is the P tile
+        assert ptrs, "no assemble launch was recorded"
+        if expect_null:
+            assert all(p == 0 for p in ptrs), \
+                "mode 2 allocated a P tile it never touches"
+        else:
+            assert all(p != 0 for p in ptrs), \
+                "mode %d needs a P tile and got a null" % mode
     torch.npu.synchronize()
 
 
