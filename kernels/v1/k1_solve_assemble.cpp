@@ -26,6 +26,11 @@
 // has to drain), and both passes stream like the Cube solve does: the L1
 // loads of every chunk of a pass are issued before its arithmetic starts.
 //
+// Both paths are the same arithmetic in the same L1 layout;
+// tools/probe_solve_assemble_coalesce.py checks the two are bit-identical
+// (P and A16) before it times either, and the mode is a runtime argument
+// (api.asm_load_mode(), KDA_ASM_LOADS) so the same binary can be flipped.
+//
 // Load path (section 11.37): the shipped form issues six ND2NZ calls per chunk
 // (one 2 KB whole-tile A load plus two 1 KB B bands per pass, 1.37 KB and
 // 4.25 ns per call) and the block's traffic alone measured 0.313-0.339 ms for
@@ -51,11 +56,17 @@
 //           [k-block][n-block], so the four 16x16 fractals go into L0B in the
 //           order 0, 2, 1, 3 - A16 is bit-identical to mode 0, which is what
 //           says the mapping is right.
-//
-// Both paths are the same arithmetic in the same L1 layout;
-// tools/probe_solve_assemble_coalesce.py checks the two are bit-identical
-// (P and A16) before it times either, and the mode is a runtime argument
-// (api.asm_load_mode(), KDA_ASM_LOADS) so the same binary can be flipped.
+//   mode 3  mode 2 plus the pass-1 A16 store batched (section 11.42,
+//           tools/probe_fixpipe_shape.py): the four lower-left blocks are
+//           PC*PC apart in both the L0C source (srcNdStride = NC * MM / 1024
+//           in 1 KB fractal units = 4) and the GM destination
+//           (dstNdStride = PC * PC, in elements), so one ndNum = nch call
+//           replaces the four strided row-major stores.  The probe measured
+//           the strided form at 0.556 ms against 0.358 for contiguous 2 KB
+//           stores - the row stride itself is the price, and batching is the
+//           only legal way to drop the four descriptors to one.  A16 stays
+//           bit-identical (the probe sweeps srcNdStride and only times the
+//           value that reproduces mode 0).
 //
 // Modes 5-8 of that probe also measured the two structures separately: at the
 // shipped call pattern the queue is worth 0.196 ms over an explicit buffer
@@ -93,13 +104,16 @@ constexpr int32_t PASSES = 2;
 constexpr int32_t LBSZ = MM * 2;   // one [M, M] bf16 operand
 constexpr int32_t SLOTS = PASSES * NC;  // one L0 slot per (pass, chunk) unit
 
-// One chunk's L0 chain and store, shared by both load paths.
+// One chunk's L0 chain and store, shared by both load paths.  `defer_pass1`
+// (mode 3) suppresses pass 1's A16 store: the caller batches the block's four
+// lower-left blocks into one ndNum call after the chunk loop (section 11.42),
+// so this function leaves the store to it.
 static __aicore__ inline void assemble_chunk(
     int32_t pass, int32_t slot, bool onchip, LocalTensor<bfloat16_t> la,
     LocalTensor<bfloat16_t> lb, LocalTensor<bfloat16_t> lp,
     LocalTensor<uint8_t>& a8, LocalTensor<uint8_t>& b8, LocalTensor<float>& cfall,
     GlobalTensor<bfloat16_t>& P, GlobalTensor<bfloat16_t>& A16,
-    int32_t c0, int32_t ch, TEventID e1m, TEventID emf) {
+    int32_t c0, int32_t ch, TEventID e1m, TEventID emf, bool defer_pass1) {
     LocalTensor<bfloat16_t> a = a8[slot * MM * 2].ReinterpretCast<bfloat16_t>();
     LocalTensor<bfloat16_t> b = b8[slot * MM * 2].ReinterpretCast<bfloat16_t>();
     for (int32_t dd = 0; dd < KF; ++dd) {
@@ -142,7 +156,7 @@ static __aicore__ inline void assemble_chunk(
     } else if (pass == 0) {
         Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(
             P[static_cast<uint64_t>(c0 + ch) * MM], cf, ip);
-    } else {
+    } else if (!defer_pass1) {
         Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(
             A16[static_cast<uint64_t>(c0 + ch) * PC * PC + M * PC], cf, ip);
     }
@@ -157,6 +171,13 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     const int32_t nch = ((C - c0) < NC) ? (C - c0) : NC;
     const bool batched = (loadMode != 0);
     const bool onchip = (loadMode >= 2);
+    // Mode 3's batched pass-1 store needs the L0C slot spacing expressible in
+    // the nd words' 1 KB units (srcNdStride = MM / 256): true for M = 32 and
+    // M = 16, false for M = 8, where the mode falls back to per-chunk stores.
+    // The assemble only launches at C = 64 in production, so the fallback is
+    // for the compile-only legs and any future geometry.
+    constexpr bool CAN_BATCH_STORE = (MM % 256) == 0;
+    const bool batched_store = (loadMode >= 3) && CAN_BATCH_STORE;
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
@@ -225,7 +246,21 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
             for (int32_t ch = 0; ch < nch; ++ch) {
                 assemble_chunk(pass, pass * NC + ch, onchip, laAll[ch * MM],
                                lbAll[ch * MM], lpAll, a8, b8, cfall, P, A16,
-                               c0, ch, e1m, emf);
+                               c0, ch, e1m, emf, batched_store);
+            }
+            if (pass == 1 && batched_store) {
+                // Section 11.42: the four lower-left blocks are one nd call -
+                // srcNdStride is the L0C slot spacing (MM floats = MM/256 KB),
+                // dstNdStride the parent tile (PC * PC elements).  The four
+                // Mmads are already M_FIX-confirmed by their chunk's wait, so
+                // the FIX pipe can read the slots directly.
+                auto ipb = FixpipeParamsV220(
+                    M, M, M, PC, false, QuantMode_t::F322BF16, 0,
+                    static_cast<uint16_t>(nch), static_cast<uint16_t>(MM / 256),
+                    static_cast<uint16_t>(PC * PC), 0);
+                Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(
+                    A16[static_cast<uint64_t>(c0) * PC * PC + M * PC],
+                    cfall[NC * MM], ipb);
             }
         } else {
             for (int32_t ch = 0; ch < nch; ++ch) {
@@ -261,7 +296,7 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
                 auto la = qa.DeQue<bfloat16_t>();
                 auto lb = qb.DeQue<bfloat16_t>();
                 assemble_chunk(pass, pass * NC + ch, false, la, lb, lpAll, a8, b8,
-                               cfall, P, A16, c0, ch, e1m, emf);
+                               cfall, P, A16, c0, ch, e1m, emf, false);
                 qa.FreeTensor(la);
                 qb.FreeTensor(lb);
             }

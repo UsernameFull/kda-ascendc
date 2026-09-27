@@ -2647,3 +2647,107 @@ C=64 下 `tests/test_solve_assemble_loads.py` + `tests/test_solve_cube_a16_resid
 
 **另一条环境记录**：第一轮门禁跑在 NPU 0 上时被 `507034 Vector core execution timed out` 打断，
 那块卡 `npu-smi` 本来就在 `Alarm` 健康态；换 NPU 3 重跑即过。**本机 NPU 0 不可用于判据**。
+
+## 11.42. 上板 PipeUtilization 的账，以及它判的三条：批量存储赢隔离输 stage、排水链无收益、NZ 写 L1 免费（2026-09-27）
+
+msopprof 的 on-board 采集（`/data/models/Qwen3-4B/kda_msprof_20260924/`，单次 mode-2 launch，
+3072 块）第一次把 assemble 的块墙按 pipe 拆开：fixpipe 1.812 us（49.6%）+ mte2 1.201
+（32.9%）+ scalar 0.610（16.7%）+ mte1 0.162 + cube 0.098 = **3.884 us** vs 块墙 **3.652 us**，
+逐块 98–101% —— **没有两条 pipe 同时忙**，块墙就是这几条链的和。scalar 的 61% 停在
+`mte1_stall`（0.249）+ `wait_ib`（0.124）；cube 忙占比 2.7%，与"每块 8 个 32³ Mmad、每个
+12.3 ns"的算术量一致（§11.34 的结论不需要修改，只是第一次有了逐 pipe 的实测）。
+
+对着这三条链做了两个探针（`kernels/v1/k1_fixpipe_shape_probe.cpp` +
+`tools/probe_fixpipe_shape.py`，与 `k1_solve_assemble_pipe_probe.cpp` +
+`tools/probe_solve_assemble_pipe.py`，都在 12288 chunk/3072 块、同进程交错 MIN of 5）：
+
+**一、Fixpipe 形态（判决：隔离赢 0.10，stage 不收，生产仍 2）**
+
+| 臂 | 存储形态 | ms |
+|---|---|---:|
+| mode 0 生产形态 | 4x NZ→L1 + 4x 跨行距（stride=PC）行主序→GM = 8 次 | 0.373 |
+| mode 1 批量（`ndNum=4`） | 4x NZ + 1 次跨行距批量 = 5 次 | **0.278** |
+| mode 2 8x NZ→L1 | 8 次 | 0.184 |
+| mode 3 8x 连续 2 KB 行主序（stride=M） | 8 次 | 0.358 |
+| mode 4 8x 跨行距行主序（stride=PC） | 8 次 | 0.556 |
+| mode 5 无存储 | — | 0.174 |
+
+- **批量合法**：`FixpipeParamsV220` 的 `ndNum`/`srcNdStride`/`dstNdStride` 走 NZ2ND；扫描
+  srcNd = 2/4/8/16/32，**只有 4（= MM/256，1 KB 分形单位）位一致**（0/50331648），其余
+  都在 75% 写域外或错块——写域校验要把"kernel 不写的 75%"切掉再比。部署为生产 kernel 的
+  **mode 3**（`KDA_ASM_LOADS=3`，默认仍 2；`CAN_BATCH_STORE = (MM % 256) == 0` 守卫 M=8 的
+  compile-only 档）。
+- **跨行距是真实的 2 倍代价**（mode 4 0.556 vs mode 3 0.358），而 NZ→L1 几乎免费（+0.010）。
+  所以 Fixpipe 那 1.812 us 里主要不是"每次调用的固定价"，是**跨行距写 GM 的那条路径本身**。
+- 生产判决（`tools/probe_solve_assemble_loads.py`，四臂轮转，正序+反序两轮）：
+  ASM 隔离 0.572→**0.471**、AIC 2.146→**2.008**，但 **sliced 2.320→2.335、e2e +0.020
+  （反序 +0.031）**——隔离赢的那 0.10 全被 stage 吃掉还倒亏。机制：批量存储把 4 次 store
+  从"与 Mmad 交错"变成 pass 1 末尾的一条串行尾，而 sliced 的切片内 assemble→cube 是串行的
+  （cube 要等 A16），尾巴直接进关键路径。**判：不启用**（旋钮保留，测试钉住 mode 3 可达、
+  位一致、不分配 P tile）。
+- 顺带一条负结果：`k1_solve_assemble_pipe_probe.cpp` 把每 unit 的排水链拆了三层
+  （hoist pass-1 la / phases 全填充-全 Mmad-全 store / ping-pong M_FIX 交错 / depth-1 装载
+  流水，共 5 个变体），**全部落在 ±0.015 ms**（hoist −0.015 最大，在噪声底内）——那 3.884 us
+  的串行和**不是 flag 编排造成的**，改 flag 结构没有出路；cube 的"等待"就是这么分工的
+  算术量（每块 98 ns）。
+
+## 11.43. K2 的 v_new 重排拆开量：gather 与转置各占一半，TransDataTo5HD 替换更慢（2026-09-27）
+
+§11.25 把 K2 的 v_new 重排（16 次跨步 gather + 16 次 16x16 `Transpose` + packed `Vt`
+store）的总价记成 V4b 的 −0.214（含当时未守卫的 `V` store）。`V` 的守卫已经落地（−0.095），
+本轮把剩下的结构项拆开（`tools/probe_k2_vt_split.py`，[1,8192,96,128]/C=64、24 块、
+同进程 MIN of 11 交错，全部在 `V` store 已守卫的基线上）：
+
+| 变体 | min_ms | Δ | 含义 |
+|---|---:|---:|---|
+| V0 stock（重编译） | 4.002 | +0.006 | 噪声底 |
+| V6 无 gather、无转置（§11.25 地板） | 3.805 | **−0.191** | 整段的上限 |
+| V5a 保 gather、去转置 | 3.915 | −0.082 | 转置的边际 ≈ 0.11 |
+| V5b 一次整块拷贝替 gather、保转置 | 3.864 | −0.132 | gather 的边际 ≈ 0.06–0.14 |
+| **V7 `TransDataTo5HD` 替 `Transpose`** | 4.150 | **+0.154** | **判死** |
+
+判读：
+
+- 这 0.19 ms 由两半组成，且**两半都不小**：gather 的 16 次 32 B/行小拷贝约 0.11–0.14，
+  16 次 `vtranspose` 约 0.06–0.09（配对不同、有重叠，精确分解受限于消融的非可加性）。
+- **V7 是唯一"合法替换"候选，实测比被替换的 16 次原语慢 0.154 ms**——`TransDataTo5HD`
+  在这个尺寸（16x16 bf16、`NCHW_CONV_ADDR_LIST_SIZE` 的地址表构建在标量上）不划算。
+  它的数值未再校验（速度先判死）。
+- 剩下的合法形态只有"把转置搬到 AIC 的 `LoadDataWithTranspose`、省掉 packed `Vt` 与这
+  16 次转置"（§11.7 记过的方向）——那要用 AIC 侧描述符换 AIV 侧指令，且 K2 现代码里 `Vt`
+  的 packed 序正是 §11.11 用 0.82 ms 的 store 换来的，重开需要整段重排 + 两个消费点
+  （stage 1/3 的 A/B 操作数）同步改。本轮不落地，记入待办。
+
+探针入库：`tools/probe_k2_vt_split.py`（原一次性脚本 `tools/probe_k2_vt.py` 也一并入库）。
+
+## 11.44. pre_gram 的 MTE3_V marker 在今天的代码上重验：仍然负载承载，UB 依然放不下（2026-09-27）
+
+§11.25 的 D2 在**当时**的 kernel 上删掉 pass 边界的 `MTE3_V` 自配对 marker 后量到 −0.230 ms，
+但逐位 diff 显示 Rv/U/Vnew/VnewT 动 0.32、L/Aqk/A16/A32 动 ~0.05，所以判"负载承载"并冻结
+（恢复收益需要把跨 pass 复用的 4 个 tile 双缓冲 = 16 KB，而 UB 余量只有 4 KB）。
+此后 kernel 改过多处（mask 提到 per-block、bT0 结构、qgin/qgmk/qgout 等），**这条冻结的理由
+需要复验**。
+
+本轮在同一探针上重跑（`tools/probe_pg_marker.py`，[1,1024,16]/C=64、14 个中间量逐位 diff）：
+
+- 删 marker 后 **Rv/Vnew/VnewT/U 依旧动 3.203e-01、L 4.949e-02、Aqk 1.364e-02、A16/A32
+  4.932e-02**——与 §11.25 表里的数字**逐位相同**，两端的失配没有变；
+- UB 账本（`tools/gen_ub_l1_budget.py` 的 `pre_gram_ub(64)`）：**189792 / 196608 B**，即
+  余 6.8 KB，而双缓冲那 4 个 tile 要 16 KB——**赤字 ~9.5 KB，结论不变**。
+
+**判决：维持冻结。** 恢复这 0.230 需要先腾 ~9.5 KB UB（唯一的大块 bT0 已被 §11.25 证明切不了：
+cumsum 需要整 chunk 顺序链、kg 需要第 M-1 行、XBAND 需要第 MID0+BS 行），或者把 marker 换成
+别的同步形态——两条路都要重跑数值 gate，收益 1% 量级。
+
+**本轮"把方案都试一遍"的收束表**（全部实测量，探针已入库）：
+
+| 项 | 隔离读数 | stage/e2e | 判决 | 阻塞 |
+|---|---:|---:|---|---|
+| solve A16 批量存储（`ndNum`） | −0.095（ASM 0.572→0.471） | **+0.020 / +0.031** | **不启用**（mode 3 保留） | 批量 store 成为 pass 1 串行尾 |
+| solve 排水链 5 变体（hoist/phases/interleave/深度1） | ±0.015 | — | **不改** | flag 编排不是成本 |
+| K2 gather + 16 转置 | −0.191（V6 地板）/ −0.152（本轮复测） | — | 拆解完成 | 合法形态需要 AIC 侧重排（记录待办） |
+| K2 `TransDataTo5HD` 替换转置 | **+0.154** | — | **判死** | 更慢 |
+| pre_gram `MTE3_V` marker | −0.230（§11.25） | — | **维持冻结** | UB 缺 9.5 KB + 负载承载复验 |
+| pre_gram `FL_DONE` 协议加深 | 0.17（§11.20） | — | **不动** | 两次挂死史，风险 >> 2% |
+| solve 切片深度（48/96） | — | 更差（§11.9 已扫） | **已冻结** | — |
+| **stage 配平的墙** | AIC 2.134 vs AIV 2.132 | — | **单侧改动不再动 stage** | 除非成对削（§11.39/§4.10） |

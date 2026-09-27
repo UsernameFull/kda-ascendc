@@ -144,6 +144,30 @@ def test_the_mode_is_read_per_call_not_frozen(inputs):
     torch.npu.synchronize()
 
 
+def test_mode_3_is_the_batched_store_arm(inputs):
+    """Section 11.42's ndNum store: not production, but bit-exact and wired.
+
+    The batched A16 store (one ndNum call for the block's four lower-left
+    blocks, srcNdStride = 4 in 1 KB fractal units) is measured in
+    tools/probe_fixpipe_shape.py and tools/probe_solve_assemble_loads.py: it
+    wins 0.10 ms isolated and loses on the stage/e2e (the batched store is a
+    serial tail after pass 1 and the AIC half is already under the AIV half),
+    so production stays at mode 2.  This pins that it is reachable, that it
+    still is mode 2's structure (P on chip -> no P tile), and that it lands
+    the same numbers as mode 2.
+    """
+    os.environ["KDA_ASM_LOADS"] = "3"
+    try:
+        with _LaunchSpy() as spy:
+            _call(inputs)
+        ptrs = spy.ptrs(3)
+        assert ptrs and all(p == 0 for p in ptrs), \
+            "mode 3 is mode 2's structure and must not allocate the P tile"
+    finally:
+        os.environ.pop("KDA_ASM_LOADS", None)
+    torch.npu.synchronize()
+
+
 def test_mode_2_leaves_the_p_tile_unallocated(inputs):
     """P on chip means no GM tile: mode 2 hands the kernel a null pointer.
 
@@ -174,7 +198,7 @@ def test_mode_2_leaves_the_p_tile_unallocated(inputs):
 def test_the_arms_agree_bit_for_bit(inputs):
     """The knob's whole justification: same operands, same outputs."""
     outs = []
-    for mode in (0, 1, 2):
+    for mode in (0, 1, 2, 3):
         os.environ["KDA_ASM_LOADS"] = str(mode)
         try:
             out, state = _call(inputs)
@@ -182,6 +206,6 @@ def test_the_arms_agree_bit_for_bit(inputs):
             os.environ.pop("KDA_ASM_LOADS", None)
         torch.npu.synchronize()
         outs.append((out.clone(), state.clone()))
-    for i, mode in enumerate((1, 2), start=1):
+    for i, mode in enumerate((1, 2, 3), start=1):
         assert torch.equal(outs[0][0], outs[i][0]), "mode %d differs" % mode
         assert torch.equal(outs[0][1], outs[i][1]), "mode %d's state differs" % mode
