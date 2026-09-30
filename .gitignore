@@ -78,3 +78,7 @@ __pycache__/
 *.log
 plans.zip
 项目总结_服务器连接与现状.md
+
+# Local agent skill mounts (symlinks into /root) and 1.6 GB compiler dumps
+/.agents/
+extra-info/data-dump/0/

@@ -16,6 +16,12 @@ wiring that makes the arm real:
   different A_inv, no exception);
 * every slice of the two-level path carries it, not just the first.
 
+The same file also pins section 11.50's arm: mode 4 is mode 2 with the
+whole-window Xb fill (both passes' Xb operands in one ND2NZ call, so the block
+sends two MTE2 calls instead of 1 + nch + 2); it has to stay bit-identical and
+keep P on chip like mode 2, and modes 3 and 4 must stay separate knobs (the
+batched store is not a window property).
+
 Timings belong to the probe; this is the wiring.
 """
 from __future__ import annotations
@@ -130,7 +136,7 @@ def test_the_mode_is_read_per_call_not_frozen(inputs):
     Both arms have to reach *every* slice: a mode that only made the first
     launch would time a half-converted stage.
     """
-    for mode in (0, 2, 1, 0):
+    for mode in (0, 2, 4, 1, 0):
         os.environ["KDA_ASM_LOADS"] = str(mode)
         try:
             assert api.asm_load_mode() == mode
@@ -177,7 +183,7 @@ def test_mode_2_leaves_the_p_tile_unallocated(inputs):
     L1), so allocating it would be dead memory.  Modes 0 and 1 do use it, which
     is why this is a property of the mode and not of the call site.
     """
-    for mode, expect_null in ((2, True), (1, False), (0, False)):
+    for mode, expect_null in ((2, True), (4, True), (1, False), (0, False)):
         os.environ["KDA_ASM_LOADS"] = str(mode)
         try:
             with _LaunchSpy() as spy:
@@ -198,7 +204,7 @@ def test_mode_2_leaves_the_p_tile_unallocated(inputs):
 def test_the_arms_agree_bit_for_bit(inputs):
     """The knob's whole justification: same operands, same outputs."""
     outs = []
-    for mode in (0, 1, 2, 3):
+    for mode in (0, 1, 2, 3, 4):
         os.environ["KDA_ASM_LOADS"] = str(mode)
         try:
             out, state = _call(inputs)
@@ -206,6 +212,6 @@ def test_the_arms_agree_bit_for_bit(inputs):
             os.environ.pop("KDA_ASM_LOADS", None)
         torch.npu.synchronize()
         outs.append((out.clone(), state.clone()))
-    for i, mode in enumerate((1, 2, 3), start=1):
+    for i, mode in enumerate((1, 2, 3, 4), start=1):
         assert torch.equal(outs[0][0], outs[i][0]), "mode %d differs" % mode
         assert torch.equal(outs[0][1], outs[i][1]), "mode %d's state differs" % mode

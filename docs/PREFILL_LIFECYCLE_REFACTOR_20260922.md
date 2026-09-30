@@ -371,3 +371,38 @@ kernel 在 mode 2 的结构里不碰它（`P` 这个 `GlobalTensor` 只出现在
 3. 同步审计 diff（flag/barrier 数量与配对，含"删除的每一个都要说明为什么安全"）；
 4. 精度 gate：与现有 `run_chunk_matrix.sh`（C=16/32/64）位一致或通过 `--gate`；
 5. 同进程交错 A/B：先用 §11.28 的 1.1 ms 上界对照，再用实测替换估计。
+
+### Level 2 / Level 3 的判决：CLOSED（2026-09-28，见重构账本 §11.48）
+
+按上面五条准入把 Level 2 设计到可实现的粒度之后，两级都关闭。不是"暂缓"，是三条独立约束不相容：
+
+1. **slot 字节账（准入 1）不成立**。§11.47 的 knee 是 16.8 MB 的 live ring，而 `pre_gram->solve` 的
+   交接是 **48 KiB/chunk**（`L masked` fp32 16 KiB + `Rk`/`Rv` bf16 各 16 KiB），所以 depth-2 要求
+   `W ≤ 175` chunk/窗口。但一个 MIX 块 = 1 AIC + 2 AIV，机器 24 AIC，一波 = `24 × 2pu` chunk，而
+   pu 有实测地板（pu=8 已经比 pu=64 慢 0.247 ms）⇒ **一波 ≥ 384 chunk**。两者差 2.2～4.4 倍：
+   **能填满机器的窗口装不进能复用的 L2。**
+2. **credit/free 协议（准入 2）在 Level 3 上必然死锁**。Level 3 的生产者地板很低（cube 每块
+   `WU_NCHUNK=2`，24 块只要 48 chunk ⇒ 3.1 MB 的 ring，在 knee 之内），但消费者
+   `kda_k2_persistent_loop` 的 `nblk = (bh + maxh - 1)//maxh = 24` 恰好等于 `aic_cores = 24`：它的 24
+   个 MIX 块整个 launch 期间占满全部 AIC，并发的 cube 窗口块一块也派不进来。自旋等 credit 没有逃生门
+   （Ascend 无 yield/preempt）。而按 launch 切 K2 又会把它常驻 UB 的 fp32 state 逼回 GM，那是
+   `SPLIT_STATE_OUT` 的 384 MiB 快照形态，新增流量吃掉全部收益。
+3. **收益口径（准入 5）要按配平墙取 min，不是取和**。§11.39 之后 solve 的 AIC 2.141 / AIV 2.134，
+   已成对配平，所以 stage 收益 = `min(Δ_AIV, Δ_AIC) + 0.007`。Level 2 唯一可行点
+   （`W=768, pu=16, n=16`，ring 75.5 MB ⇒ 回收 ~27%）的完整账是 **−0.073 ms 收益对 +0.294 ms 的
+   粒度税（pu +0.103、launch +0.066、slice 24→16 +0.125）= 净 +0.22 ms 变慢**。
+
+顺带关掉两条同族的：cube→K2 融合（把 1.511 ms 的 cube 搬到最长那一段的临界 pipe 上，7.70 对 6.32，
+即使把 W/U 往返的 0.65 ms 全给回来也净亏 0.7 ms），以及 §11.28 表里"`Aqk32` raw 复读 +0.04～0.10 ms"
+那条——它的 store 半边已实测为**负**（去掉 402.65 MB 的 raw Gram Fixpipe 让 pre_gram 慢 0.063～0.085 ms、
+e2e 慢 0.064 ms，两次独立运行同向），因为那两个 Fixpipe 同时是 AIC 侧 L0C 复用的节奏点，与 §11.44 的
+MTE3_V marker 同一形状。
+
+**机制（为什么跨 launch 的字节贵 7 倍）**：launch 内的交接被片上有界队列 pacing——`FL_READY`/`FL_DONE`
+每 chunk-step 握手、AIC 侧只有 4 个 L1 槽——所以在途集合是 2～3 MB，天然是 L2 价（0.2 ms/GB）。跨
+launch 没有握手，生产者跑到底消费者才开始，在途集合就是整个 buffer，于是是 HBM 边际价（1.427 ms/GB）。
+要把 pacing 装回去只有"切窗口"和"设备侧 credit"两种，分别被上面第 1、2 条堵死。**这不是实现难度问题，
+是几何问题**：一波的最小字节数由 `24 块 × 每块最小高效跨度` 决定，而可用 L2 只有 16～32 MB。
+
+Level 4 因此也保持冻结（它的前提是"Level 2/3 有稳定收益"）。要再拿 0.5 ms 以上，只能改变问题本身
+（state dtype、公式、chunk 内并行的算法形态），而 §4.1～§4.5 的四条路线都已实测判死，重开条件在 §4.6。

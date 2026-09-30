@@ -1,3 +1,26 @@
+// PROBE-ONLY clone of k1_pre_gram_mix, driven by tools/probe_pre_gram_addwork.py.
+//
+// Motivation: the on-board PipeUtilization of the shipped kernel
+// (kda_msprof_20260930_pregram) says the AIV vector pipe is busy 647.2 of
+// 820.9 us per subcore (78.8%) and the two halves of a MIX block are balanced
+// (AIV 820.9 against AIC 819.4), yet section 11.20 measured that *deleting*
+// ~128 vector instructions per chunk buys only 1.2%.  A deletion can hide
+// behind a fixed-arrival wait (11.20's post_gram sits right on the FL_DONE
+// stall), so the clean adjudicator is to *add* a known amount of vector work
+// and watch the wall:
+//
+//   addWork (trailing int32, appended after "debugStores" so the shipped
+//   kernel's arg contract is untouched) runs that many extra NG-wide
+//   "Muls(zz, zz, 1.0f)" instructions per pass, right before the Gram block
+//   that reads "zz" - the chain is therefore live (no dead-store elimination
+//   can remove it) and multiplying by exactly 1.0f is an IEEE identity, so
+//   every intermediate and both arm outputs stay bit-for-bit equal to the
+//   shipped kernel.  Only the vector-issue load changes.
+//
+// k1_vec_op_calib.cpp prices the same instruction in isolation on the same
+// device; the wall's response per added instruction is the marginal cost of
+// AIV vector work.  NOT in api._SOURCES, not part of any shipped path.
+//
 // K1 stages 1+2 fused: input normalisation, gate/decay preparation and the
 // intra-chunk Gram matrices in one AIV block per (batch, head, chunk).
 //
@@ -604,7 +627,7 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
     }
 }
 
-extern "C" __global__ __aicore__ void kda_pre_gram_mix(
+extern "C" __global__ __aicore__ void kda_pg_addwork_probe(
     GM_ADDR pQ, GM_ADDR pK, GM_ADDR pV, GM_ADDR pG, GM_ADDR pBeta,
     GM_ADDR pAlog, GM_ADDR pBias,
     GM_ADDR pQn, GM_ADDR pKn, GM_ADDR pGate, GM_ADDR pGc, GM_ADDR pBetaOut,
@@ -614,7 +637,13 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     int32_t B, int32_t T, int32_t H, float lower_bound, float scale, int32_t unroll,
     // ``debugStores`` stays the trailing int32 on purpose: tests/test_dead_store.py
     // reads args[-1] as the flag, so the probe-only ``rawMode`` goes in front of it.
-    int32_t xRowBytes, int32_t gRowBytes, int32_t rawMode, int32_t debugStores) {
+    int32_t xRowBytes, int32_t gRowBytes, int32_t rawMode, int32_t debugStores,
+    // Probe-only: extra NG-wide Muls per pass (see the file banner), plus the
+    // timing-only ablation bitmask (1 = gate cumsum, 2 = sigmoid pass loop,
+    // 4 = both post_gram calls).  An ablated arm is wrong by construction and
+    // only its launch time is read, exactly like 11.16's delete-the-block
+    // method.
+    int32_t addWork, int32_t ablate) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIC {
         run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * (T / M), unroll,
@@ -835,6 +864,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // rest of the chunk: it needs a full-tile "1.0" operand, and the staging
     // only holds an MT-row tile (see the header note).  The cumsum below is
     // the only row-coupled op, so it keeps the whole chunk.
+    if ((ablate & 2) == 0)
     for (int32_t hp = 0; hp < NP; ++hp) {
     LocalTensor<float> gfs = gf[hp * NG];
     Muls(gfs, gfs, aexp, NG);
@@ -846,46 +876,55 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     Muls(gfs, gfs, lower_bound, NG);
     PipeBarrier<PIPE_V>();
     }
-    // Blocked (radix-8) prefix sum, docs 11.55.  The 63-step serial chain
-    // (Add + PipeBarrier per row, ~0.3 ms of the pre_gram launch at
-    // [1,8192,96,128]) is replaced by three phases whose aliasing read/write
-    // pairs are split across instructions - a naive in-place log-scan reads
-    // rows the same instruction wrote, repeat-level RAW that the hardware
-    // does not order, and comes out NaN:
-    //   A) per 8-row block, the serial prefix in 7 levels; a level's two
-    //      calls write rows {8b+j} and read rows {8b+j-1}, disjoint mod 8;
-    //   B) the S block totals (rows 8b+7) scanned serially - 7 dependent
-    //      count-form Adds, the shipped loop's shape over 8 rows;
-    //   C) rows 8b..8b+6 add the previous blocks' cumulative total
-    //      (broadcast source, src1RepStride = 0); row 8b+7 already holds it
-    //      and is skipped, so no phase-C call reads what phase-C wrote.
-    // Same prefix, different summation order: last-ulp changes (measured at
-    // [1,8192,96,128]: out rel 2.5e-6 / max|d| 3.05e-5 against the gate's
-    // own 8.6e-3 margin, e2e -0.112 ms), so this is a tolerance-gated change
-    // rather than a bit-identical one.
-    {
-        constexpr int32_t BS = 8;         // rows per block
-        constexpr int32_t NB = M / BS;    // blocks (8 at CHUNK = 64)
-        constexpr int32_t ROW8 = 8 * 16;  // 8 rows of D fp32 = 128 blocks
-        for (int32_t j = 1; j < BS; ++j) {
+    if ((ablate & 8) != 0) {
+        // Candidate arm (bit 8): hazard-free blocked (radix-8) scan, the
+        // replacement candidate for the 63-step serial prefix sum.  Three
+        // phases; every read/write pair that aliases is split across two
+        // *instructions* (the failed naive log-scan read rows the same
+        // instruction had written - repeat-level RAW, hardware does not
+        // order it - and produced NaN):
+        //   A) within each 8-row block, the serial prefix in 7 levels.  A
+        //      level's calls write rows {8b+j} and read rows {8b+j-1} - the
+        //      two sets differ mod 8, so nothing inside one instruction
+        //      aliases; levels are separated by a barrier because level j+1
+        //      reads what level j wrote.
+        //   B) the S block totals (rows 8b+7) scanned serially, 7 dependent
+        //      count-form Adds - the same shape as the shipped loop, just
+        //      over 8 rows instead of 64.
+        //   C) rows 8b..8b+6 of each block add the cumulative total of the
+        //      blocks before it (broadcast source, src1RepStride = 0).  Row
+        //      8b+7 already holds that cumulative value and is skipped, so
+        //      no phase-C instruction ever reads a row another phase-C
+        //      wrote - the 14 calls run back to back.
+        // Same prefix for every row, summed in a different order: last-ulp
+        // changes, so this arm is priced by the driver's max|d| (and, if it
+        // ever ships, by the tolerance gate), not by bit-identity.
+        constexpr int32_t S = 8;          // rows per block
+        constexpr int32_t NB = M / S;     // blocks (8 at CHUNK = 64)
+        constexpr int32_t ROW = 8 * 16;   // 8 rows of D fp32 = 128 blocks
+        for (int32_t j = 1; j < S; ++j) {
             Add(gf[D * j], gf[D * j], gf[D * (j - 1)], 64, NB,
-                BinaryRepeatParams(1, 1, 1, ROW8, ROW8, ROW8));
+                BinaryRepeatParams(1, 1, 1, ROW, ROW, ROW));
             Add(gf[D * j + 64], gf[D * j + 64], gf[D * (j - 1) + 64], 64, NB,
-                BinaryRepeatParams(1, 1, 1, ROW8, ROW8, ROW8));
+                BinaryRepeatParams(1, 1, 1, ROW, ROW, ROW));
             PipeBarrier<PIPE_V>();
         }
         for (int32_t b = 1; b < NB; ++b) {
-            Add(gf[D * (BS * b + BS - 1)], gf[D * (BS * b + BS - 1)],
-                gf[D * (BS * (b - 1) + BS - 1)], 128);
+            Add(gf[D * (S * b + S - 1)], gf[D * (S * b + S - 1)],
+                gf[D * (S * (b - 1) + S - 1)], 128);
             PipeBarrier<PIPE_V>();
         }
         for (int32_t b = 1; b < NB; ++b) {
-            Add(gf[D * BS * b], gf[D * BS * b], gf[D * (BS * (b - 1) + BS - 1)],
-                64, BS - 1, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
-            Add(gf[D * BS * b + 64], gf[D * BS * b + 64],
-                gf[D * (BS * (b - 1) + BS - 1) + 64], 64, BS - 1,
+            Add(gf[D * S * b], gf[D * S * b], gf[D * (S * (b - 1) + S - 1)],
+                64, S - 1, BinaryRepeatParams(1, 1, 1, 16, 16, 0));
+            Add(gf[D * S * b + 64], gf[D * S * b + 64],
+                gf[D * (S * (b - 1) + S - 1) + 64], 64, S - 1,
                 BinaryRepeatParams(1, 1, 1, 16, 16, 0));
         }
+        PipeBarrier<PIPE_V>();
+    } else if ((ablate & 1) == 0)
+    for (int32_t i = 1; i < M; ++i) {
+        Add(gf[i * D], gf[i * D], gf[(i - 1) * D], D);
         PipeBarrier<PIPE_V>();
     }
     Muls(gf, gf, RCP_LN2, N);
@@ -1067,6 +1106,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // its own: "t2" is dead after the kg cast above, and the -zz exponential
     // is built over "gef" once its last reader has gone.  Both are pure
     // reorganisations - same arithmetic, same rounding points.
+    // Probe-only: addWork extra NG-wide vector instructions on "zz".  The
+    // Muls below reads zz, so the chain is live; 1.0f keeps the value exact.
+    for (int32_t wi = 0; wi < addWork; ++wi) {
+        Muls(zz, zz, 1.0f, NG);
+    }
     Muls(gef, zz, LN2, NG);
     Exp(gef, gef, NG);
     PipeBarrier<PIPE_V>();
@@ -1147,7 +1191,7 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     }
     }
     // ---- previous chunk's Gram: mask, scale, round, store -----------------
-    if (cprev >= 0) {
+    if (cprev >= 0 && (ablate & 4) == 0) {
         post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
                   MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
         masksBuilt = true;
@@ -1173,9 +1217,11 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     }
     // Drain the pipeline: the last chunk's Gram has no later chunk to hide
     // behind (~1/unroll of the stage, and the Cube is idle by then).
-    post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
-              MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
-    masksBuilt = true;
+    if ((ablate & 4) == 0) {
+        post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
+                  MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
+        masksBuilt = true;
+    }
     PipeBarrier<PIPE_ALL>();
     }
 }

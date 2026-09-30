@@ -85,7 +85,23 @@ constexpr int32_t NCH = NC / SB;             // chunks per block
 constexpr int32_t RW = NC * M;    // floats in one row of the tile / of lraw
 constexpr int32_t CH = NC * MM;   // floats in one block's A_inv
 constexpr int32_t CM = 64 * 255;  // largest count-mode calCount
-constexpr int32_t RW21 = NCH * M;  // floats in one row of the L21 tile
+#if KDA_SOLVE_WIDE_SUBB == 4
+// The SB = 4 coupling export: the six strictly-lower 16-blocks of every chunk
+// in one contiguous per-chunk bundle, negated for the Cube.  Layout per chunk:
+//   [ (1,0) 256 | (3,2) 256 | rows 32..63 x cols 0..31  1024 ]  = 1536 bf16
+// The first two are the 16-level couplings, the 32x32 tail is exactly the
+// [2,0|2,1 ; 3,0|3,1] rectangle the assemble's second-level products consume
+// (k1_solve_assemble4.cpp); at SB = 2 the bundle is the single lower-left
+// block (M^2 = 1024 at M = 32), i.e. this constant generalises that export.
+constexpr int32_t CE = 6 * MM;
+#else
+constexpr int32_t CE = MM;        // SB <= 2: one [M, M] block per chunk
+#endif
+// The L21 tile is [chunk][row][lane]: one contiguous [M, M] block per chunk,
+// which is exactly how the Lneg export is laid out in GM.  The per-chunk
+// stride is MM and the tile totals NCH * MM elements; the old [row][chunk]
+// form walked the tile one coupling row at a time, NCH bursts per call, and
+// cost 32 gather + 32 scatter descriptors per block against these 4 + 4.
 
 // ``a16Mode`` is the A16-store ablation (2026-09-23, plan 11.34): the kernel's
 // own share of the solve stage is 55% row recursion and ~45% DMA (L gathers,
@@ -126,8 +142,8 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     pipe.InitBuffer(bEye, MM * 4);
 #if KDA_SOLVE_WIDE_SUBB > 1
     TBuf<TPosition::VECCALC> bL21f, bL21b;
-    pipe.InitBuffer(bL21f, M * RW21 * 4);
-    pipe.InitBuffer(bL21b, M * RW21 * 2);
+    pipe.InitBuffer(bL21f, NCH * CE * 4);
+    pipe.InitBuffer(bL21b, NCH * CE * 2);
 #endif
     LocalTensor<float> lraw = bLraw.Get<float>(), cexp = bCexp.Get<float>();
     LocalTensor<float> af = bAf.Get<float>(), eye = bEye.Get<float>();
@@ -168,10 +184,28 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
     }
 #if KDA_SOLVE_WIDE_SUBB > 1
     // The coupling block wants L21 negated so the Cube can fold the sign into
-    // its operand.  One gather per row, over all NCH chunks at once.
-    for (int32_t i = 0; i < M; ++i) {
-        DataCopy(l21f[i * RW21], L[static_cast<uint64_t>(c0) * PC * PC + (M + i) * PC],
-                 DataCopyParams(NCH, M / 8, (PC * PC - M) / 8, 0));
+    // its operand.  One 2D copy per chunk: the M rows of that chunk's [M, M]
+    // lower-left block (row stride PC) land contiguous, ready for the store.
+    for (int32_t ch = 0; ch < NCH; ++ch) {
+#if KDA_SOLVE_WIDE_SUBB == 4
+        // Three gathers into the chunk's 1536-element slot: the two 16-level
+        // couplings and the 32x32 rectangle.  Each is a straight run of rows
+        // (row stride PC) so the destination is the contiguous bundle.
+        const uint64_t base = static_cast<uint64_t>(c0 + ch) * PC * PC;
+        DataCopy(l21f[ch * CE + 0 * MM],
+                 L[base + M * PC],
+                 DataCopyParams(M, M / 8, (PC - M) / 8, 0));
+        DataCopy(l21f[ch * CE + 1 * MM],
+                 L[base + 3 * M * PC + 2 * M],
+                 DataCopyParams(M, M / 8, (PC - M) / 8, 0));
+        DataCopy(l21f[ch * CE + 2 * MM],
+                 L[base + 2 * M * PC],
+                 DataCopyParams(2 * M, (2 * M) / 8, (PC - 2 * M) / 8, 0));
+#else
+        DataCopy(l21f[ch * MM],
+                 L[static_cast<uint64_t>(c0 + ch) * PC * PC + M * PC],
+                 DataCopyParams(M, M / 8, (PC - M) / 8, 0));
+#endif
     }
 #endif
     SetFlag<HardEvent::MTE2_V>(e2v);
@@ -183,8 +217,8 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
         Muls(lraw[off], lraw[off], -1.0f, n);
     }
 #if KDA_SOLVE_WIDE_SUBB > 1
-    Muls(l21f, l21f, -1.0f, M * RW21);
-    Cast(l21b, l21f, RoundMode::CAST_RINT, M * RW21);
+    Muls(l21f, l21f, -1.0f, NCH * CE);
+    Cast(l21b, l21f, RoundMode::CAST_RINT, NCH * CE);
 #endif
 #if KDA_SOLVE_WIDE_SUBB > 1
     if (writeBlank) {
@@ -269,12 +303,11 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
         }
     }
 #if KDA_SOLVE_WIDE_SUBB > 1
-    // One call per row of the coupling block: the NCH chunks of that row are
-    // contiguous in l21b (M elements apart) and land M elements apart in each
-    // chunk's [M, M] tile, whose rows are MM elements apart.
-    for (int32_t i = 0; i < M; ++i) {
-        DataCopy(Lneg[static_cast<uint64_t>(c0) * MM + i * M], l21b[i * RW21],
-                 DataCopyParams(NCH, M / 16, 0, (MM - M) / 16));
+    // One contiguous 2 KB copy per chunk (the tile is already [chunk][row]):
+    // the per-row scatter this replaces cost 32 small descriptors per block.
+    for (int32_t ch = 0; ch < NCH; ++ch) {
+        DataCopy(Lneg[static_cast<uint64_t>(c0 + ch) * CE], l21b[ch * CE],
+                 DataCopyParams(1, CE / 16, 0, 0));
     }
 #endif
     PipeBarrier<PIPE_ALL>();

@@ -20,6 +20,17 @@ thing, so A16 must be bit-identical in every arm.
   mode 3  interleave: hoist + ping-pong M_FIX ids so Fixpipe ch overlaps
           Mmad ch+1 (<= 1 outstanding set per id)
   mode 4  phases without the hoist (separates the drain change from it)
+  mode 5  depth-1 load pipeline: chunk k+1's L1 fill issues under chunk k
+  mode 6  rolling: every stage a chunk ahead of its consumer, so fill (MTE2),
+          lift (MTE1), mad (M) and fix (FIX) all hold a different chunk at
+          once - the reference page's double buffer applied inside the pass
+  mode 7  coalesced lift: the four single-fractal LoadData and the four
+          LoadDataWithTranspose of the control chain as repeat-2 calls
+          (srcStride 2, consecutive destinations) - instruction diet, no
+          schedule change
+  mode 8  the same permutation with dstGap 1 instead of srcStride 2
+  mode 9  whole-window fill: the block's Xb span (both bands, all chunks) in
+          one Nd2Nz call, so pass 1's A needs no fill - 6 MTE2 calls -> 2
 
   KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 python3 -u tools/probe_solve_assemble_pipe.py
 """
@@ -52,6 +63,10 @@ MODES = [
     (3, "interleave (ping-pong M_FIX)"),
     (4, "phases, no hoist"),
     (5, "depth-1 load pipeline (per-chunk waits)"),
+    (6, "rolling: fill/lift/mad/fix 1 chunk ahead"),
+    (7, "coalesced lift (repeat 2, srcStride 2)"),
+    (8, "coalesced lift (repeat 2, dstGap 1)"),
+    (9, "whole-window fill (2 MTE2 calls/block)"),
 ]
 
 
@@ -121,6 +136,10 @@ def main() -> None:
     print("  interleave + hoist     (0 - 3): %+.3f ms" % (best[0] - best[3]))
     print("  phases alone           (0 - 4): %+.3f ms" % (best[0] - best[4]))
     print("  depth-1 pipeline       (0 - 5): %+.3f ms" % (best[0] - best[5]))
+    print("  rolling pipeline       (0 - 6): %+.3f ms" % (best[0] - best[6]))
+    print("  coalesced lift s2      (0 - 7): %+.3f ms" % (best[0] - best[7]))
+    print("  coalesced lift g1      (0 - 8): %+.3f ms" % (best[0] - best[8]))
+    print("  whole-window fill      (0 - 9): %+.3f ms" % (best[0] - best[9]))
 
 
 if __name__ == "__main__":

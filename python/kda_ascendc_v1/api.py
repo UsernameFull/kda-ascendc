@@ -240,9 +240,51 @@ def asm_load_mode() -> int:
     tools/probe_solve_assemble_l1p.py check P and A16 are equal before timing
     anything), so this is a scheduling knob, not a numeric one.  Read per call
     rather than frozen at import so a probe can flip it between arms of one
-    process.
+    process.  3 is 2 plus the batched pass-1 A16 store (section 11.42, a stage
+    loss) and 4 is 2 plus the whole-window Xb fill (section 11.50: both passes'
+    Xb operands in one ND2NZ call, 2 MTE2 calls per block - bit-identical, block
+    wall 3.7475 -> 2.9236 us and mte2 -64% on board, AIC half -0.150 ms
+    isolated, and the stage flat at 5.957 = 5.957, so 2 stays production and 4
+    is the switch to flip if the assemble half ever becomes the exposed one).
     """
     return int(os.environ.get("KDA_ASM_LOADS", "2"))
+
+
+def asm4_store_mode() -> int:
+    """Store shape for the SB = 4 coupling kernel (kda_solve_assemble4).
+
+    0 is the grouped form: the six coupling blocks leave L0C through three
+    fixpipe calls per chunk (ndNum = 3 / 2 / 1 for the 1-below-diagonal trio,
+    the 2-below pair and X30), copying the ND layout section 11.52 asked for.
+    1 is the per-piece fallback (six 16-row calls), 2 drops the stores (an
+    ablation - the tile is left half-written and the solve is wrong by
+    construction).  Read per call so a probe can flip it between arms.
+    """
+    return int(os.environ.get("KDA_ASM4_STORE", "0"))
+
+
+def asm4_ablate() -> int:
+    """Instruction-group ablation mask for kda_solve_assemble4 (fault bisect).
+
+    Bit 0 skips the Nd2Nz fills, 1 the L0C -> L1 NZ fixpipe, 2 the L0A loads,
+    3 the L0B (transposed) loads, 4 the Mmads and 5/6/7 the three RM stores
+    (the level-1 trio, the level-3 pair, the level-5 X30); the sync events are
+    emitted either way, so an ablated launch is a legal program with the same
+    pipe structure.  Debug knob - a faulting arm names the instruction group that
+    cannot run, not a production configuration.  Read per call.
+    """
+    return int(os.environ.get("KDA_ASM4_ABLATE", "0"))
+
+
+def asm4_level() -> int:
+    """Bisect knob for kda_solve_assemble4: run levels 1..6 of the substitution.
+
+    Level N runs the coupling blocks whose dependency depth is < N (the kernel
+    body is split into six guarded sections, one per level).  Debug only: the
+    guards leave the deeper levels' events unset, which is a legal (if useless)
+    program, so a fault names a level rather than a configuration.
+    """
+    return int(os.environ.get("KDA_ASM4_LEVEL", "6"))
 
 
 def cube_a16_resident() -> int:
@@ -262,9 +304,23 @@ def cube_a16_resident() -> int:
     return int(os.environ.get("KDA_CUBE_A16_RESIDENT", "1"))
 
 
+def pre_raw_mode() -> int:
+    """Ablation arms for pre_gram's two raw fp32 Gram tiles (docs 11.48).
+
+    ``kda_pre_gram_mix``'s paired Cube fixpipes the raw Grams into the Aqk32 and
+    L slots and the AIV band loop reads both back to mask, scale and round them.
+    Bit 0 drops the Aqk32 fixpipe, bit 1 the L one; a dropping arm computes a
+    wrong answer by construction (the AIV still reads the slot), so this prices
+    the store and nothing else - 0 is the only shipping value.  Read per call
+    rather than frozen at import so tools/probe_pre_gram_rawmode.py can flip it
+    between arms of one process, exactly like ``debugStores``.
+    """
+    return int(os.environ.get("KDA_PRE_RAW_MODE", "0"))
+
+
 def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
                             a32, a16, xb, lneg, pmid, rk, rv, W, U, stream,
-                            debug_stores) -> None:
+                            debug_stores, subb=2) -> None:
     """R1 two-level solve: wide kernel (AIV), then assemble + Cube (AIC).
 
     The substitution runs on M = CHUNK/SB sub-blocks (k1_solve_wu_wide.cpp) and
@@ -309,9 +365,19 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
         lo, n = glo * unit, (ghi - glo) * unit
         wargs = _pack_ptrs([L[lo:], eye, a32[lo:], a16[lo:], xb[lo:],
                             lneg[lo:]]) + [_i(n), _i(a16_mode()), _i(1 if debug_stores else 0)]
-        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:],
-                            None if pmid is None else pmid[lo:]]) + \
-            [_i(n), _i(asm_load_mode())]
+        if subb == 4:
+            # The SB = 4 coupling kernel does all six blocks on chip out of one
+            # Lneg bundle per chunk (k1_solve_assemble4.cpp): no P tile, and the
+            # load mode is a store-shape knob instead (KDA_ASM4_STORE).
+            asm_name = "kda_solve_assemble4"
+            aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:]]) + \
+                [_i(n), _i(asm4_store_mode()), _i(asm4_ablate()),
+                 _i(asm4_level())]
+        else:
+            asm_name = "kda_solve_assemble"
+            aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:],
+                                None if pmid is None else pmid[lo:]]) + \
+                [_i(n), _i(asm_load_mode())]
         cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + \
             [_i(n), _i(cube_a16_resident())]
         ncube = min(n, c - lo)
@@ -320,14 +386,14 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
             ev = torch_npu.npu.Event()
             ev.record(sa)
             sb.wait_event(ev)
-            _launch("kda_solve_assemble", (n + asm_nchunk - 1) // asm_nchunk,
+            _launch(asm_name, (n + asm_nchunk - 1) // asm_nchunk,
                     aargs, sb.npu_stream)
             if ncube > 0:
                 _launch("kda_solve_wu_cube_kernel",
                         (ncube + wu_nchunk - 1) // wu_nchunk, cargs, sb.npu_stream)
         else:
             _launch("kda_solve_wu_wide", n // nch, wargs, stream)
-            _launch("kda_solve_assemble", (n + asm_nchunk - 1) // asm_nchunk,
+            _launch(asm_name, (n + asm_nchunk - 1) // asm_nchunk,
                     aargs, stream)
             if ncube > 0:
                 _launch("kda_solve_wu_cube_kernel",
@@ -405,6 +471,7 @@ _SOURCES: list[tuple[str, str]] = [
     ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
     ("kernels/v1/k1_solve_wu_wide.cpp", "kda_solve_wu_wide"),
     ("kernels/v1/k1_solve_assemble.cpp", "kda_solve_assemble"),
+    ("kernels/v1/k1_solve_assemble4.cpp", "kda_solve_assemble4"),
     ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
     ("kernels/v1/k2_init.cpp", "kda_k2_init_kernel"),
     ("kernels/v1/k2_d12.cpp", "kda_k2_d12_kernel"),
@@ -733,7 +800,8 @@ def _kda_fwd_impl(
         pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
                               + pre_tail)
         pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
-                     _i(qk_row_bytes), _i(g_row_bytes), _i(1 if keep_debug else 0)]
+                     _i(qk_row_bytes), _i(g_row_bytes), _i(pre_raw_mode()),
+                     _i(1 if keep_debug else 0)]
         # One MIX block pairs an AIC with two AIV subcores, so it covers
         # 2 * pre_unroll chunks.
         _launch("kda_pre_gram_mix", (c + 2 * pre_unroll - 1) // (2 * pre_unroll),
@@ -753,7 +821,11 @@ def _kda_fwd_impl(
         sub = CHUNK // SOLVE_WIDE_SUBB
         bf16 = torch.bfloat16
         xb = torch.empty((c_solve, SOLVE_WIDE_SUBB, sub, sub), dtype=bf16, device=q.device)
-        lneg = torch.empty((c_solve, sub, sub), dtype=bf16, device=q.device)
+        # SB = 4 exports the six strictly-lower blocks of a chunk in one
+        # bundle (k1_solve_wu_wide.cpp, CE = 6 * M^2); the 32-level build
+        # exports the single lower-left block.
+        lneg = torch.empty((c_solve, (6 * sub * sub) if SOLVE_WIDE_SUBB == 4
+                            else sub * sub), dtype=bf16, device=q.device)
         # Load mode 2 keeps P on chip (section 11.39), so its GM tile is
         # neither written nor read: the 25.17 MB allocation at [1,8192,96,128]
         # (24 MiB = 12288 chunks of [32, 32] bf16 - the 50.3 MB section 11.39
@@ -768,7 +840,8 @@ def _kda_fwd_impl(
                                 _tri_eye(q.device, CHUNK // SOLVE_WIDE_SUBB),
                                 a32, a16,
                                 xb, lneg, pmid, rk, rv, W, U, stream,
-                                1 if keep_debug else 0)
+                                1 if keep_debug else 0,
+                                subb=SOLVE_WIDE_SUBB)
     else:
         # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector
         # instruction (see the kernel header); the padded chunks are solved too

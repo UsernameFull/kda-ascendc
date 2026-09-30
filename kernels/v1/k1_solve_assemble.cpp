@@ -56,6 +56,20 @@
 //           [k-block][n-block], so the four 16x16 fractals go into L0B in the
 //           order 0, 2, 1, 3 - A16 is bit-identical to mode 0, which is what
 //           says the mapping is right.
+//   mode 4  mode 2 plus the whole-window fill (the candidate this file was
+//           last measured for): the block's Xb span [c0*2*MM, (c0+nch)*2*MM)
+//           is contiguous in GM as 4*nch 16-row bands, so ONE ND2NZ call
+//           covers pass 0's B (band 0 of each chunk's window) and pass 1's A
+//           (band 1, which then needs no fill and reads into L0A in one
+//           straight LoadData instead of the four crossed calls).  The
+//           block's MTE2 drops from 1 + nch + 2 calls to two (the batched
+//           Lneg fill and this one).  P still stays on chip and the store
+//           stays per chunk - this is mode 2 plus the fill, nothing else.
+//           Measured (section 11.50): A16 bit-identical, block wall 3.7475 ->
+//           2.9236 us (-22%), mte2 1.203 -> 0.434 (-64%), isolated ASM 0.540
+//           -> 0.474 ms - and the stage solve is flat (5.957 = 5.957 ms), so
+//           mode 2 stays the default and this is the switch to flip if the
+//           AIC half ever becomes the exposed one.
 //   mode 3  mode 2 plus the pass-1 A16 store batched (section 11.42,
 //           tools/probe_fixpipe_shape.py): the four lower-left blocks are
 //           PC*PC apart in both the L0C source (srcNdStride = NC * MM / 1024
@@ -109,17 +123,25 @@ constexpr int32_t SLOTS = PASSES * NC;  // one L0 slot per (pass, chunk) unit
 // lower-left blocks into one ndNum call after the chunk loop (section 11.42),
 // so this function leaves the store to it.
 static __aicore__ inline void assemble_chunk(
-    int32_t pass, int32_t slot, bool onchip, LocalTensor<bfloat16_t> la,
-    LocalTensor<bfloat16_t> lb, LocalTensor<bfloat16_t> lp,
-    LocalTensor<uint8_t>& a8, LocalTensor<uint8_t>& b8, LocalTensor<float>& cfall,
+    int32_t pass, int32_t slot, bool onchip, bool window,
+    LocalTensor<bfloat16_t> la, LocalTensor<bfloat16_t> lb,
+    LocalTensor<bfloat16_t> lp, LocalTensor<uint8_t>& a8,
+    LocalTensor<uint8_t>& b8, LocalTensor<float>& cfall,
     GlobalTensor<bfloat16_t>& P, GlobalTensor<bfloat16_t>& A16,
     int32_t c0, int32_t ch, TEventID e1m, TEventID emf, bool defer_pass1) {
     LocalTensor<bfloat16_t> a = a8[slot * MM * 2].ReinterpretCast<bfloat16_t>();
     LocalTensor<bfloat16_t> b = b8[slot * MM * 2].ReinterpretCast<bfloat16_t>();
-    for (int32_t dd = 0; dd < KF; ++dd) {
-        for (int32_t mm = 0; mm < KF; ++mm) {
-            LoadData(a[(mm * KF + dd) * 256], la[(dd * KF + mm) * 256],
-                     LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+    if (pass == 1 && window) {
+        // The whole-window fill lands pass 1's A in the 16-row (n-block-major)
+        // order that the four crossed calls undo, so it reads straight through
+        // in one call and the permutation is the fill's, not the lift's.
+        LoadData(a, la, LoadData2dParams(0, KF * KF, 1, 0, 0, false, 0));
+    } else {
+        for (int32_t dd = 0; dd < KF; ++dd) {
+            for (int32_t mm = 0; mm < KF; ++mm) {
+                LoadData(a[(mm * KF + dd) * 256], la[(dd * KF + mm) * 256],
+                         LoadData2dParams(0, 1, 1, 0, 0, false, 0));
+            }
         }
     }
     if (pass == 0 || !onchip) {
@@ -177,7 +199,11 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     // The assemble only launches at C = 64 in production, so the fallback is
     // for the compile-only legs and any future geometry.
     constexpr bool CAN_BATCH_STORE = (MM % 256) == 0;
-    const bool batched_store = (loadMode >= 3) && CAN_BATCH_STORE;
+    // Mode 3 is the batched store; mode 4 keeps the per-chunk store (section
+    // 11.42 measured the batching as a stage loss, and the whole-window fill is
+    // orthogonal), so the two knobs do not compose.
+    const bool batched_store = (loadMode == 3) && CAN_BATCH_STORE;
+    const bool window = (loadMode >= 4);
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
     TEventID e1m = pipe.AllocEventID<HardEvent::MTE1_M>();
@@ -201,6 +227,11 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     // is on, so mode 0/1 leave it as 8 KB of unused L1.
     TBuf<TPosition::B1> bufP;
     pipe.InitBuffer(bufP, NC * LBSZ);
+    // Mode 4's whole-Xb window: one 16-row band per band of every chunk's two
+    // [M, M] blocks (4 bands of 512 elements at M = 32), 16 KB at NC = 4.  It
+    // replaces nothing - modes 0-3 leave it as unused L1.
+    TBuf<TPosition::B1> bufX;
+    pipe.InitBuffer(bufX, NC * 2 * MM * 2);
     // One L0 slot per (pass, chunk) unit: 2 * NC * 4 KB = 32 KB of the 128 KB
     // L0C, 16 KB of each of the 64 KB L0A/L0B.
     LocalTensor<float> cfall(TPosition::CO1, 0, SLOTS * MM);
@@ -214,9 +245,22 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     LocalTensor<bfloat16_t> laAll = bufA.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> lbAll = bufB.Get<bfloat16_t>();
     LocalTensor<bfloat16_t> lpAll = bufP.Get<bfloat16_t>();
+    LocalTensor<bfloat16_t> lxAll = bufX.Get<bfloat16_t>();
 
+    if (window) {
+        // Both passes' Xb operands in one call: 4*nch ND matrices of 16 rows at
+        // the uniform band stride.  Band 0 of a chunk's window is pass 0's B
+        // (read with LoadDataWithTranspose, exactly the layout mode 2's
+        // per-chunk band-merged call produced) and band 1 is pass 1's A.
+        DataCopy(laAll, Lneg[static_cast<uint64_t>(c0) * MM],
+                 Nd2NzParams(nch, M, M, MM, M, M, 1, MM));
+        DataCopy(lxAll, Xb[static_cast<uint64_t>(c0) * 2 * MM],
+                 Nd2NzParams(4 * nch, 16, M, BANDE, M, 16, 1, BANDE));
+        SetFlag<HardEvent::MTE2_MTE1>(e21);
+        WaitFlag<HardEvent::MTE2_MTE1>(e21);
+    }
     for (int32_t pass = 0; pass < PASSES; ++pass) {
-        if (batched) {
+        if (batched && !window) {
             // Same bytes, fewer calls: the A tiles of the block in one Nd2Nz
             // (the source stride is MM for Lneg and 2*MM for Xb's pass-1
             // block), a chunk's two B bands merged, and in pass 1 the whole
@@ -243,8 +287,23 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
             }
             SetFlag<HardEvent::MTE2_MTE1>(e21);
             WaitFlag<HardEvent::MTE2_MTE1>(e21);
+        }
+        if (batched) {
+            if (window) {
+                for (int32_t ch = 0; ch < nch; ++ch) {
+                    LocalTensor<bfloat16_t> la =
+                        (pass == 0) ? laAll[ch * MM] : lxAll[ch * 2 * MM + MM];
+                    LocalTensor<bfloat16_t> lb =
+                        (pass == 0) ? lxAll[ch * 2 * MM] : lpAll;
+                    assemble_chunk(pass, pass * NC + ch, true, true, la, lb,
+                                   lpAll, a8, b8, cfall, P, A16, c0, ch, e1m,
+                                   emf, false);
+                }
+                PipeBarrier<PIPE_ALL>();
+                continue;
+            }
             for (int32_t ch = 0; ch < nch; ++ch) {
-                assemble_chunk(pass, pass * NC + ch, onchip, laAll[ch * MM],
+                assemble_chunk(pass, pass * NC + ch, onchip, false, laAll[ch * MM],
                                lbAll[ch * MM], lpAll, a8, b8, cfall, P, A16,
                                c0, ch, e1m, emf, batched_store);
             }
@@ -295,8 +354,9 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
             for (int32_t ch = 0; ch < nch; ++ch) {
                 auto la = qa.DeQue<bfloat16_t>();
                 auto lb = qb.DeQue<bfloat16_t>();
-                assemble_chunk(pass, pass * NC + ch, false, la, lb, lpAll, a8, b8,
-                               cfall, P, A16, c0, ch, e1m, emf, false);
+                assemble_chunk(pass, pass * NC + ch, false, false, la, lb,
+                               lpAll, a8, b8, cfall, P, A16, c0, ch, e1m, emf,
+                               false);
                 qa.FreeTensor(la);
                 qb.FreeTensor(lb);
             }

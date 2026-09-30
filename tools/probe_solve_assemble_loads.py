@@ -45,7 +45,8 @@ D, DEV = 128, torch.device("npu:0")
 B, T, H = 1, 8192, 96
 MODES = [(0, "shipped (queue, P in GM)"), (1, "batched (P in GM)"),
          (2, "batched, P via L0C->L1->L0B"),
-         (3, "mode 2 + batched A16 store (ndNum)")]
+         (3, "mode 2 + batched A16 store (ndNum)"),
+         (4, "mode 2 + whole-window Xb fill (2 MTE2 calls/block)")]
 ENV = "KDA_ASM_LOADS"
 
 
