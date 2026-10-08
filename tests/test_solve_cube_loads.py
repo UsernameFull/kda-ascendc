@@ -1,13 +1,14 @@
-"""The Cube solve's A16-residency knob: wired, per slice, and read per call.
+"""The Cube solve's band-merged RHS load: wired, per slice, read per call.
 
-``docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md`` section 11.38 keeps the block's
-A16 tile in L1 for both passes of ``kda_solve_wu_cube_kernel`` instead of
-re-reading it (the second read is an L2 hit, section 11.35).  The kernel takes
-the mode as a runtime argument (api.cube_a16_resident(), KDA_CUBE_A16_RESIDENT)
-so ``tools/probe_solve_cube_a16_resident.py`` could price both arms in one
-process.  What has to stay true is the wiring: a mode in the wrong slot is read
-as the chunk count, and that failure is silent - the solve computes a different
-A_inv rather than raising.  The timings belong to the probe.
+``docs/ASCENDC_V1_REFACTOR_PLAN_20260913.md`` section 11.63 merges a chunk's
+KF [16, D] right-hand-side bands into one strided Nd2Nz call inside
+``kda_solve_wu_cube_kernel``.  The kernel takes the mode as a runtime argument
+(api.cube_load_mode(), KDA_CUBE_LOADS) so ``tools/probe_solve_cube_knobs.py``
+could price the arms in one process; the modes are byte-identical in L1 by
+construction (same per-matrix layout, bands spanned by the 16 * D element
+stride the single calls used as their destination offsets).  What has to stay
+true is the wiring: a mode in the wrong slot is read as the A16 mode or the
+chunk count, and that failure is silent.  The timings belong to the probe.
 """
 from __future__ import annotations
 
@@ -89,15 +90,15 @@ class _LaunchSpy:
         return out
 
 
-def test_production_keeps_a16_resident(inputs):
-    """KDA_CUBE_A16_RESIDENT unset -> mode 1, on every slice, in the last slot."""
-    os.environ.pop("KDA_CUBE_A16_RESIDENT", None)
-    assert api.cube_a16_resident() == 1
+def test_production_merges_the_bands(inputs):
+    """KDA_CUBE_LOADS unset -> mode 1, on every slice, in the last slot."""
+    os.environ.pop("KDA_CUBE_LOADS", None)
+    assert api.cube_load_mode() == 1
     with _LaunchSpy() as spy:
         _call(inputs)
     trailers = spy.trailers()
     for n, a16, load in trailers:
-        assert a16 == 1, "production is not the resident form"
+        assert load == 1, "production is not the merged form"
     c_solve = -(-(B * H * (T // api.CHUNK)) // api.SOLVE_WIDE_NCH) * api.SOLVE_WIDE_NCH
     assert sum(n for n, _, _ in trailers) == c_solve, trailers
     torch.npu.synchronize()
@@ -106,15 +107,15 @@ def test_production_keeps_a16_resident(inputs):
 def test_the_mode_is_read_per_call_not_frozen(inputs):
     """A probe flips this between two arms of one process: it has to move."""
     for mode in (0, 1, 0):
-        os.environ["KDA_CUBE_A16_RESIDENT"] = str(mode)
+        os.environ["KDA_CUBE_LOADS"] = str(mode)
         try:
-            assert api.cube_a16_resident() == mode
+            assert api.cube_load_mode() == mode
             with _LaunchSpy() as spy:
                 _call(inputs)
         finally:
-            os.environ.pop("KDA_CUBE_A16_RESIDENT", None)
+            os.environ.pop("KDA_CUBE_LOADS", None)
         trailers = spy.trailers()
-        assert [t[1] for t in trailers] == [mode] * len(trailers), trailers
+        assert [t[2] for t in trailers] == [mode] * len(trailers), trailers
     torch.npu.synchronize()
 
 
@@ -122,11 +123,11 @@ def test_the_two_arms_agree_bit_for_bit(inputs):
     """The knob's whole justification: same operands, same outputs."""
     outs = []
     for mode in (0, 1):
-        os.environ["KDA_CUBE_A16_RESIDENT"] = str(mode)
+        os.environ["KDA_CUBE_LOADS"] = str(mode)
         try:
             out, state = _call(inputs)
         finally:
-            os.environ.pop("KDA_CUBE_A16_RESIDENT", None)
+            os.environ.pop("KDA_CUBE_LOADS", None)
         torch.npu.synchronize()
         outs.append((out.clone(), state.clone()))
     assert torch.equal(outs[0][0], outs[1][0]), "the two arms disagree"

@@ -4010,3 +4010,93 @@ asm 0.47 + cube 1.53 = 2.00。§11.42 的 mode 3（批量 store）与 §11.50 �
 **下一步**：本轮把 asm 侧的存量旋钮收完（mode 5 后 asm 的余量不明，device 分解被污染没读）；
 solve 地板账仍是 AIC = asm + cube 1.53 的大头，可动项回到 cube（§11.38/11.39 已动过 A16
 常驻与 P 上片）与 K2。
+
+## 11.62. 跨段切片流水（§11.61 的下一步 #4）测死结案：核占用是墙——P∥下游三臂全是纯和（−0.02~−0.04），"能藏 0.57"的 K2 读数是无门控的调度幻觉；依赖序（solve 按 head 主序切片 vs K2 逐 head 递推）也不许提前消费（2026-10-08 凌晨）
+
+**动机**：§11.61 下一步清单 #4——把 solve 内部"生产者切片 + 按片事件门控、AIV/AIC 双流重叠"的形状往上下游扩：pre_gram→solve（P2S）与 solve→K2（S2K）。动任何切片机械之前先测一个事实：阶段 N 运行时，N+1 的块能不能真拿到核。
+
+**方法**（新工具 `tools/probe_stage_coresidency.py`）：从一次真实生产调用捕获全部 launch（指针/内核/形状原样），按臂重放、只读 span（MIN of 8，臂序每轮轮转）。并发臂**故意不做依赖门控**——它测的是调度层（核是否被占用），不是合法性。占用模型：一个块在一台核上跑到程序结束才释放（MIX 块占 1 AIC + 2 AIV，与管级忙闲无关）。
+
+| 臂 | span | 对"纯和"的差 |
+|---|---:|---:|
+| p（pre_gram，MIX×1） | 3.878 | — |
+| w（wide，AIV-only×20） | 1.739 | — |
+| ac（asm+cube，AIC-only×40） | 1.803 | — |
+| k2（persistent loop，MIX×1） | 3.101 | — |
+| solve（生产调度，控制臂） | 1.979 | 和=3.542 → 重叠 1.56（仪器锚） |
+| p\|ac | 5.664 | **−0.017** |
+| p\|w | 5.593 | **−0.023** |
+| p\|k2 | 6.935 | **−0.043** |
+| w\|k2 | 4.196 | −0.644 |
+| ac\|k2 | 4.340 | −0.564 |
+| solve\|k2 | 4.507 | −0.573 |
+
+（两轮复现：轮 1 的 p|ac −0.006 / p|k2 −0.039 / w|k2 −0.630 与轮 2 一致。）
+
+**判词**：
+
+1. **P 占满两种核，P2S 死**：p|ac、p|w、p|k2 三臂都是纯和（−0.02~−0.04，即仅有调度漂移）。§11.58 读到的"pre_gram 的 AIC 只忙 28.5%"是**管级**空闲——它的 MIX 块在块生命周期里占着 AIC 核，别的内核拿不到。零和：任何从 P 抢核的方案都要按同比例延长 P 自己。
+2. **"能藏 0.57"是调度幻觉，S2K 死**：w|k2 / ac|k2 / solve|k2 在依赖不存在时读到 −0.56~−0.64（K2 的块能抢进另一个内核的块缝里）——这是仪器灵敏度的正控制，不是收益。合法门控只能等"覆盖整段 chunk 的最后一个 slice"，收益归零；且 solve 阶段两引擎占用 88%/91%，尾部只留 ~0.2 ms 碎片，装不下 K2 的毫秒级块。
+3. **依赖序本身也堵死早期消费**：solve 的实例序是 (b,h,chunk) 的 **head 主序**（slice s = head 5s..5s+4），K2 的每个 block 要"某些 head 的整条 chunk 链"——每个 chunk 索引 c 的数据横跨所有 slice（head 95 的 chunk 0 在最后一片）。想提前吃必须换实例序或内核自节流（Level 4 调度器），都超出本轮范围。
+4. **仪器自证**：控制臂 1.979 ≈ max(1.74, 1.80)+0.2 而不是和 3.54——跨引擎不对齐时重叠真实存在；w|k2 又能把 −0.64 这类真实共享读出来。所以 p|ac ≈ 和是"确实没共享"，不是"探针看不见"。
+
+**结论**：跨段流水在"各阶段都占满核 + 依赖为 head 主序"的现状下没有可兑现收益，**#4 结案（测死）**。下一步回到 §11.61 的排序：① cube 的 1.53 ms（同族旋钮迁移 + 账）；② K2 的 ~640 descriptor/chunk-head 发行成本——K2 内核头注释自己点名的下一杠杆（plan §11.6.5）。
+
+**复原**：`KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 KDA_CORES_ROUNDS=8 python3 -u tools/probe_stage_coresidency.py`；日志归档 `/data/models/Qwen3-4B/kda_probe_20261008_stage_pipe/`。
+
+## 11.63. cube 的上板账与行带合并落地：块墙 4.382→2.850 us、Task 1348.5→878.0 us（−0.470，省的全在 MTE2）；e2e 配对 −0.022/−0.032——切片结构下舞台的墙已换到 wide 半边，cube 的余量转为宽侧之下的隐藏头寸（2026-10-08）
+
+**背景**：§11.61 下一步 #1——先给 cube 做上板账（msprof op PipeUtilization），再迁移 asm 已验证的同族旋钮（装载合并、store 批量、WU_NCHUNK 整波扫）。
+
+**账（装载前）**：满网格单发（`KDA_SOLVE_OVERLAP=0`，12288 chunk / grid 6144 / NC=2），经 `tools/msop/run_msop_capture.py` 用 spy 抓生产指针、`build/msop_shim` 重放（msopprof 拦不到 `aclrtLaunchKernelWithArgsArray`，必须重放）。归档 `/data/models/Qwen3-4B/kda_msprof_20261008_cube/`（含 INDEX.md/SUMMARY.txt），解析 `tools/parse_msop_pipeutilization.py`。OpBasicInfo：Task 1348.53 us。
+
+| 项 | 每块 (us) | 占比 | 说明 |
+|---|---:|---:|---|
+| 块墙 | 4.382 | — | min 3.616 / max 5.589，≈7884 周期 @1.8 GHz |
+| mte2 | 3.271 | 74.6% | rk/rv 16×4 KB + A16 2×8 KB |
+| scalar | 0.943 | 21.5% | scalar_mte1_stall 2.891（等 LoadData 链） |
+| fixpipe | 0.875 | 20.0% | 4 次 M×D store |
+| mte1 | 0.419 | 9.6% | 16 次 LoadData + 1 次转置/块 |
+| cube | 0.338 | **7.7%** | 真实算力（全 launch 103.8 us） |
+| 六管和/墙 | 1.335 | — | 有重叠，远没打满 |
+
+三角验证（§11.46 的同一 kernel 转录：控制 1.422 / L2 热 0.847 / 地板 0.615 ms）：RHS 值 0.807 = 字节 0.575（1.427 ms/GB、读+写混合 4 KB 颗粒）+ 调用 0.232（16 次/块 × 47 ns）。本账推得的 mte2 分解与之一致（调用 ~0.85 us/块 ≈ 0.26 ms；字节 ~2.42 us/块 ≈ 0.74 ms）。
+
+**实验**（新 `kernels/v1/k1_solve_cube_knobs_probe.cpp` + `tools/probe_solve_cube_knobs.py`：生产 launch 捕获逐臂重放、W/U 逐位 gate、MIN of 5×5 轮序轮转）：
+
+| 臂 | 隔离回放 (ms) | Δ | 逐位 |
+|---|---:|---:|---|
+| 生产锚（原样重放） | 1.467 | — | — |
+| mode 0 shipped（KF 次/chunk-pass + A16×nch） | 1.463 | — | 0/0 |
+| **mode 1 行带合并**（ndNum=KF，1 次/chunk-pass） | **0.996** | **−0.467** | 0/0 |
+| mode 2 块合并（ndNum=KF·nch + A16×1） | 0.988 | −0.475 | 0/0 |
+
+- 合并的合法性是构造性的：单带调用本来就写 `lb + mm·(16·D)` 元素，ndNum 调用的 `srcNdMatrixStride = dstNzMatrixStride = 16·D` 元素与之逐字节相同；W/U 0/100663296 位一致。
+- **mode 2 只比 mode 1 快 0.008**（跨 chunk 合并 + A16 合并）——不采纳，留最简形态。
+- **NC 整波扫**（同探针 `KDA_WU_NCHUNK=1`）：mode 1 下 NC=2 的 0.996 对 NC=1 的 1.205（NC=1 基线本身就慢 0.21）→ **NC=2 不动**。
+- **store 批量不做**：fixpipe 0.875 us/块 × 6144 / 20 = 0.269 ms 对应 393 MB 写 = 1.46 TB/s 聚合，已在写屋顶附近——它是字节价不是调用价，nd Fixpipe 省不到。
+
+**落地**：`k1_solve_wu_cube.cpp` 加运行期 `loadMode`（0 shipped / 1 合并；`api.cube_load_mode()`，`KDA_CUBE_LOADS` 默认 1，每次调用重读）；`api.py` 两处发射点（两级/单级）都带第三个 int；新 `tests/test_solve_cube_loads.py`（默认 1、每 slice 都带、每次调用重读、两臂逐位），`tests/test_solve_cube_a16_resident.py` 的 trailer 读取随签名更新。
+
+**合并后的账**（同配方重采，`/data/models/Qwen3-4B/kda_msprof_20261008_cube_merged/`）：Task **1348.53 → 877.998 us（−470.5 us）**；块墙 4.382 → **2.850**：mte2 3.271→**1.726**（−1.545/块 × 6144/20 = −0.475 ms，省的全在这一条）、scalar 0.938（stall 2.891→1.374）、fixpipe 0.904、mte1 0.419、cube 0.338 全部未动；六管和/墙 1.335→**1.518**（重叠更深）。MTE2 折 46 GB/s/核（原 24.5）。
+
+**e2e 与"墙去哪了"**（`tools/probe_cube_loads_e2e.py`，两轮 12/24 回合，臂序轮转）：
+
+| 口径 | mode 0 | mode 1 | Δ |
+|---|---:|---:|---:|
+| wall（轮 1 / 轮 2） | 9.604 / 9.616 | 9.572 / 9.594 | **−0.032 / −0.022** |
+| span（轮 1 / 轮 2） | 9.541 / 9.554 | 9.509 / 9.528 | −0.032 / −0.026 |
+| device sums cube（污染列，只作方向） | 1.597 / 1.567 | 1.063 / 1.014 | −0.53 |
+| **切片舞台回放**（按片事件，MIN of 5） | **2.078** | **2.046** | **−0.032** |
+| 逐位 out/state | — | — | 0/0 |
+
+**断案**：设备腿 −0.53、舞台回放只 −0.03。按片结构模型 stage = max(sa 总量, max_i(event_i 结束 + Σ_{k≥i} a_k))：mode 0 时 i=0 项 = 1.91 + Σa(1.98) ≈ 2.07（实测 2.078）；mode 1 把 Σa 压到 1.45、i=0 项降到 1.54，但 **i=19 项 = wide 总量 1.912 + 尾片 AIC 链 ≈ 1.98** 顶住了（实测 2.046）。即 **stage 的墙已经换到 wide（AIV）半边**；cube 的 −0.55 变成宽侧之下的隐藏头寸（这也解释了 e2e −0.03 而不是零——最后一片的 AIC 链被收进去）。与 §11.39 的"两半配平后必须成对动"同一台机器：现在 AIC 1.45 < wide 1.91。
+
+**其余口径**：
+- 门禁：`tests/test_solve_cube_loads.py` + `tests/test_solve_cube_a16_resident.py` 6 passed（C=64）；`bash tools/run_chunk_matrix.sh`（带 `ASCEND_RT_VISIBLE_DEVICES=3`）C=16/32/64 全 PASS（本轮）。
+- 正典 bench：**8.949 ms（p20 8.936 / p80 8.960）** 对前最佳 8.980 → −0.031；与同进程配对同量级。对 golden 8.0035 ≈ 1.118×。
+- 归档：`/data/models/Qwen3-4B/kda_probe_20261008_cube_knobs/`（NC 两轮扫描、e2e 两轮、两份采集日志）。
+
+**下一步**：solve 的墙回到 **wide（AIV，~1.9 ms）**与片结构开销（~0.13）；cube 侧若再被暴露，下一刀是 scalar/队列协议（0.94 us/块）与 fixpipe（0.90），MTE2 已不是第一项。K2（~3.1 ms）照旧在队列里。
+
+**复原**：采集 `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 KDA_MSOPP_CAPTURE=kda_solve_wu_cube_kernel KDA_MSOPP_ITERS=3 KDA_SOLVE_OVERLAP=0 msprof op --application="python3 tools/msop/run_msop_capture.py" --aic-metrics=PipeUtilization --kernel-name=kda_solve_wu_cube_kernel --launch-count=1 --output=<dir>`；隔离 `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 python3 -u tools/probe_solve_cube_knobs.py`；e2e `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 KDA_CUBE_ROUNDS=24 python3 -u tools/probe_cube_loads_e2e.py`。

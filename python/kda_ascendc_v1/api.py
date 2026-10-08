@@ -425,6 +425,23 @@ def cube_a16_resident() -> int:
     return int(os.environ.get("KDA_CUBE_A16_RESIDENT", "1"))
 
 
+def cube_load_mode() -> int:
+    """RHS load shape for the solve's Cube kernel (kda_solve_wu_cube_kernel).
+
+    0 keeps the shipped per-band loop: KF single-band Nd2Nz calls per
+    chunk-pass, 16 calls of 4 KB per block.  1 merges a chunk's KF [16, D]
+    bands into one strided ND run (ndNum = KF, source stride 16 * D elements),
+    which lands byte-identical in L1 - the single-band calls already wrote at
+    exactly those destination offsets.  1 is production: the on-board account
+    (docs section 11.63, archive .../kda_msprof_20261008_cube) read the block
+    wall as 4.382 us with MTE2 at 3.271 (74.6%), and the merged form measured
+    -0.467 ms of the cube's 1.463 ms isolated replay with W/U bit-identical
+    (tools/probe_solve_cube_knobs.py).  Read per call so a probe can flip it
+    between two arms of one process; the arithmetic is identical either way.
+    """
+    return int(os.environ.get("KDA_CUBE_LOADS", "1"))
+
+
 def pre_raw_mode() -> int:
     """Ablation arms for pre_gram's two raw fp32 Gram tiles (docs 11.48).
 
@@ -523,7 +540,7 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
                                 None if pmid is None else pmid[lo:]]) + \
                 [_i(n), _i(asm_load_mode())]
         cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + \
-            [_i(n), _i(cube_a16_resident())]
+            [_i(n), _i(cube_a16_resident()), _i(cube_load_mode())]
         ncube = min(n, c - lo)
         if ovl:
             _launch("kda_solve_wu_wide", n // nch, wargs, sa.npu_stream)
@@ -997,7 +1014,8 @@ def _kda_fwd_impl(
         # The Cube needs the bf16 A_inv the substitution just wrote, so the two
         # launches stay ordered on the stream.
         _launch("kda_solve_wu_cube_kernel", (c + WU_NCHUNK - 1) // WU_NCHUNK,
-                _pack_ptrs([a16, rk, rv, W, U]) + [_i(c), _i(cube_a16_resident())],
+                _pack_ptrs([a16, rk, rv, W, U]) +
+                [_i(c), _i(cube_a16_resident()), _i(cube_load_mode())],
                 stream)
     finish("solve_ms", "solve_start")
 
