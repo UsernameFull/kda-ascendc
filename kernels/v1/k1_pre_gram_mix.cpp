@@ -261,24 +261,37 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
     // UB and the kernel faulted with a VEC out-of-bounds.  Every element goes
     // through the same compare/select/scale/round sequence either way, so the
     // outputs are bit-identical.
+    // One-band-ahead (docs 11.60): band 0 is issued once before the loop and
+    // every iteration dequeues the current band first, then issues the NEXT
+    // band's loads before computing on the current one, so one MTE2 latency is
+    // covered by one band body (the queue is FIFO; depth 2 is enough, and the
+    // slot order - alloc next before free current - keeps two tensors live).
+    {
+        LocalTensor<float> gpre = qin.AllocTensor<float>();
+        DataCopy(gpre, Aqk32[m0], 16 * M);
+        DataCopy(gpre[16 * M], L[m0], 16 * M);
+        qin.EnQue(gpre);
+    }
     for (int32_t mm = 0; mm < KF; ++mm) {
     const uint64_t o = m0 + static_cast<uint64_t>(mm) * 16 * M;
     const uint64_t mo = static_cast<uint64_t>(mm) * 16 * M;
     constexpr int32_t NB = 16 * M;   // elements in one band
-    LocalTensor<float> gin = qin.AllocTensor<float>();
-    LocalTensor<float> ga32i = gin, gl32i = gin[NB];
-    DataCopy(ga32i, Aqk32[o], DataCopyParams(16, M / 8, 0, 0));
-    DataCopy(gl32i, L[o], DataCopyParams(16, M / 8, 0, 0));
-    qin.EnQue(gin);
+    LocalTensor<float> gA = qin.DeQue<float>();
+    if (mm + 1 < KF) {
+        LocalTensor<float> gnx = qin.AllocTensor<float>();
+        const uint64_t on = m0 + static_cast<uint64_t>(mm + 1) * 16 * M;
+        DataCopy(gnx, Aqk32[on], NB);
+        DataCopy(gnx[NB], L[on], NB);
+        qin.EnQue(gnx);
+    }
     LocalTensor<float> gmk, gmaskS, gmaskL;
     if (buildMasks) {
         gmk = qmk.AllocTensor<float>();
         gmaskS = gmk; gmaskL = gmk[NB];
-        DataCopy(gmaskS, MaskS[mo], DataCopyParams(16, M / 8, 0, 0));
-        DataCopy(gmaskL, MaskL[mo], DataCopyParams(16, M / 8, 0, 0));
+        DataCopy(gmaskS, MaskS[mo], NB);
+        DataCopy(gmaskL, MaskL[mo], NB);
         qmk.EnQue(gmk);
     }
-    LocalTensor<float> gA = qin.DeQue<float>();
     LocalTensor<float> ga32 = gA, gl32 = gA[NB];
     LocalTensor<float> gM;
     if (buildMasks) {
@@ -323,9 +336,9 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
     // not from the store.  It exists for the ``return_intermediates`` views, so
     // ``debugStores == 0`` skips the 201 MB (C=64) store (docs 11.29).  The raw
     // Aqk32 pointer has to stay valid either way - this function reads it.
-    if (keepAqk32) DataCopy(Aqk32[o], ga32s, DataCopyParams(16, M / 8, 0, 0));
-    DataCopy(L[o], gl32s, DataCopyParams(16, M / 8, 0, 0));
-    DataCopy(Aqk16[o], g16s, DataCopyParams(16, M / 16, 0, 0));
+    if (keepAqk32) DataCopy(Aqk32[o], ga32s, NB);
+    DataCopy(L[o], gl32s, NB);
+    DataCopy(Aqk16[o], g16s, NB);
     qout.FreeTensor(gA2);
     qo16.FreeTensor(g16s);
     qin.FreeTensor(gA);
@@ -835,12 +848,12 @@ extern "C" __global__ __aicore__ void kda_pre_gram_mix(
     // rest of the chunk: it needs a full-tile "1.0" operand, and the staging
     // only holds an MT-row tile (see the header note).  The cumsum below is
     // the only row-coupled op, so it keeps the whole chunk.
+    Duplicate(t2, 1.0f, NG);
     for (int32_t hp = 0; hp < NP; ++hp) {
     LocalTensor<float> gfs = gf[hp * NG];
     Muls(gfs, gfs, aexp, NG);
     Exp(gfs, gfs, NG);
     Adds(gfs, gfs, 1.0f, NG);
-    Duplicate(t2, 1.0f, NG);
     PipeBarrier<PIPE_V>();
     Div(gfs, t2, gfs, NG);
     Muls(gfs, gfs, lower_bound, NG);

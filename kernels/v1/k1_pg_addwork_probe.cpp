@@ -21,6 +21,27 @@
 // device; the wall's response per added instruction is the marginal cost of
 // AIV vector work.  NOT in api._SOURCES, not part of any shipped path.
 //
+// Round 2 (docs 11.58): the same add/delete question on the *AIC* side, where
+// the protocol question lives.  The AIC replies to every step through
+// CrossCoreSetFlag(FL_DONE), the AIV waits that reply before it can mask the
+// previous chunk's Gram, and the flags are level-triggered with a strict
+// one-step backlog - so the AIC's reply *latency* per step, not its pipe
+// utilisation (scalar 233.9 of 819.4 us busy), is what any deepening of the
+// handshake (ping-pong ids, depth 2) would have to decouple.  Two more
+// trailing int32s:
+//   aicWork    runs that many extra "Mmad(cf0, la0, lb0)" instructions per
+//              step, right after the genuine pair.  Same operands and
+//              cmatrixInitVal = true, so the re-run is bit-exact and only the
+//              M pipe and the M_FIX -> Fixpipe -> FL_DONE reply path lengthen.
+//              A 64x64x128 Mmad is ~56 ns on this device (measured below).
+//   aicScalar  runs that many dependent scalar ops ("sacc = sacc * 3 + i")
+//              immediately before the FL_DONE set.  The chain is kept live by
+//              a comparison against two runtime values whose side effect (an
+//              unused flag id) is unreachable in practice but not provably
+//              dead, which is what stops the loop from being folded away.
+// Both are read as the slope of launch time against reply-path length per
+// step; the flag ops a deeper handshake would add are the same kind of work.
+//
 // K1 stages 1+2 fused: input normalisation, gate/decay preparation and the
 // intra-chunk Gram matrices in one AIV block per (batch, head, chunk).
 //
@@ -265,9 +286,16 @@ static __aicore__ inline void post_gram(TQue<TPosition::VECIN, 2>& qin,
                                         const GlobalTensor<float> MaskS,
                                         const GlobalTensor<float> MaskL,
                                         int32_t c, float scale, bool buildMasks,
-                                        bool keepAqk32) {
+                                        bool keepAqk32, bool skipWait) {
     const uint64_t m0 = static_cast<uint64_t>(c) * M * M;
-    CrossCoreWaitFlag(FL_DONE);
+    // Bit 32: skip only the FL_DONE wait and keep the rest of post_gram, so
+    // the difference against the control prices the AIV's accumulated stall
+    // on the Cube's reply - the ceiling a deeper handshake (ping-pong ids,
+    // depth 2) could recover (docs 11.58).  The arm reads whatever the slots
+    // hold, so it is wrong by construction and timing-only; removing a wait
+    // cannot hang, and the READY/step pairing survives because both subcores
+    // skip it symmetrically.
+    if (!skipWait) CrossCoreWaitFlag(FL_DONE);
     // P2-1: the two triangular masks are the same [M, M] tile for every chunk
     // of every block, so their *bit* form - the only thing the select consumes
     // - is built once per block into mbitsAll and read back band by band.  The
@@ -364,7 +392,8 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
                                            GM_ADDR pGx,
                                            GM_ADDR pAqk32, GM_ADDR pL,
                                            int32_t nchunk, int32_t unroll,
-                                           int32_t rawMode) {
+                                           int32_t rawMode, int32_t aicWork,
+                                           int32_t aicScalar, int32_t ablate) {
     const int32_t base = GetBlockIdx() * 2 * unroll;
     // Ablation arms that price the two raw fp32 Gram tiles (docs 11.48): bit 0
     // drops the Aqk32 Fixpipe, bit 1 the L one.  Both slots stay allocated and
@@ -569,11 +598,24 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
             LocalTensor<float> cf0 = qc.AllocTensor<float>();
             LocalTensor<float> cf1 = qc.AllocTensor<float>();
             if (s == 0) {
-                Mmad(cf0, la0, lb0, MmadParams(M, M, D, 0, false, true));
-                Mmad(cf1, lk0, lb0, MmadParams(M, M, D, 0, false, true));
+                if ((ablate & 16) == 0) {
+                    Mmad(cf0, la0, lb0, MmadParams(M, M, D, 0, false, true));
+                    Mmad(cf1, lk0, lb0, MmadParams(M, M, D, 0, false, true));
+                }
+                // Probe-only: aicWork extra Mmad instructions per step, on
+                // the s = 0 pair only so the count per step is exactly
+                // aicWork.  cmatrixInitVal = true re-initialises the
+                // accumulator, so re-running the same product is bit-exact;
+                // what grows is the M pipe and, behind M_FIX, the Fixpipe ->
+                // FL_DONE reply path.
+                for (int32_t wi = 0; wi < aicWork; ++wi) {
+                    Mmad(cf0, la0, lb0, MmadParams(M, M, D, 0, false, true));
+                }
             } else {
-                Mmad(cf0, la1, lb1, MmadParams(M, M, D, 0, false, true));
-                Mmad(cf1, lk1, lb1, MmadParams(M, M, D, 0, false, true));
+                if ((ablate & 16) == 0) {
+                    Mmad(cf0, la1, lb1, MmadParams(M, M, D, 0, false, true));
+                    Mmad(cf1, lk1, lb1, MmadParams(M, M, D, 0, false, true));
+                }
             }
             SetFlag<HardEvent::M_FIX>(emf);
             WaitFlag<HardEvent::M_FIX>(emf);
@@ -597,8 +639,10 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
                 LocalTensor<bfloat16_t> lx = s == 0 ? lx0 : lx1;
                 LocalTensor<float> cf2 = qc.AllocTensor<float>();
                 LocalTensor<float> cf3 = qc.AllocTensor<float>();
-                Mmad(cf2, laX, lx, MmadParams(BS, BS, D, 0, false, true));
-                Mmad(cf3, lkX, lx, MmadParams(BS, BS, D, 0, false, true));
+                if ((ablate & 16) == 0) {
+                    Mmad(cf2, laX, lx, MmadParams(BS, BS, D, 0, false, true));
+                    Mmad(cf3, lkX, lx, MmadParams(BS, BS, D, 0, false, true));
+                }
                 SetFlag<HardEvent::M_FIX>(emf);
                 WaitFlag<HardEvent::M_FIX>(emf);
                 if (keepAqk32Raw) {
@@ -623,6 +667,19 @@ static __aicore__ inline void run_gram_aic(GM_ADDR pGa, GM_ADDR pGk, GM_ADDR pGb
             qx.FreeTensor(tx0);
             qx.FreeTensor(tx1);
         }
+        // Probe-only: aicScalar dependent scalar ops on the reply path (see
+        // the banner).  The loop is kept live by a comparison against two
+        // runtime values; its side effect - setting flag id 15, which no one
+        // waits - is unreachable in practice but not provably so.
+        if (aicScalar > 0) {
+            int32_t sacc = GetBlockIdx() + 1;
+            for (int32_t wi = 0; wi < aicScalar; ++wi) {
+                sacc = sacc * 3 + (wi & 7);
+            }
+            if (sacc == 0x5F5E101 && nchunk == sacc) {
+                CrossCoreSetFlag<2, PIPE_FIX>(15);
+            }
+        }
         CrossCoreSetFlag<2, PIPE_FIX>(FL_DONE);
     }
 }
@@ -640,14 +697,16 @@ extern "C" __global__ __aicore__ void kda_pg_addwork_probe(
     int32_t xRowBytes, int32_t gRowBytes, int32_t rawMode, int32_t debugStores,
     // Probe-only: extra NG-wide Muls per pass (see the file banner), plus the
     // timing-only ablation bitmask (1 = gate cumsum, 2 = sigmoid pass loop,
-    // 4 = both post_gram calls).  An ablated arm is wrong by construction and
-    // only its launch time is read, exactly like 11.16's delete-the-block
-    // method.
-    int32_t addWork, int32_t ablate) {
+    // 4 = both post_gram calls, 8 = serial cumsum, the pre-11.56 form, 16 =
+    // skip every Mmad on the AIC, 32 = skip only the FL_DONE wait inside
+    // post_gram; the last three are wrong by construction and only their
+    // launch time is read, exactly like 11.16's delete-the-block method).
+    // The final two ints are the round-2 AIC-side addWork knobs.
+    int32_t addWork, int32_t ablate, int32_t aicWork, int32_t aicScalar) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIC {
         run_gram_aic(pGa, pGk, pGb, pGx, pAqk32, pL, B * H * (T / M), unroll,
-                     rawMode);
+                     rawMode, aicWork, aicScalar, ablate);
     }
     if ASCEND_IS_AIV {
     const int32_t nt = T / M;
@@ -877,12 +936,20 @@ extern "C" __global__ __aicore__ void kda_pg_addwork_probe(
     PipeBarrier<PIPE_V>();
     }
     if ((ablate & 8) != 0) {
-        // Candidate arm (bit 8): hazard-free blocked (radix-8) scan, the
-        // replacement candidate for the 63-step serial prefix sum.  Three
-        // phases; every read/write pair that aliases is split across two
-        // *instructions* (the failed naive log-scan read rows the same
-        // instruction had written - repeat-level RAW, hardware does not
-        // order it - and produced NaN):
+        // Bit 8: the 63-step serial prefix sum this kernel (and the shipped
+        // one) ran before docs 11.56 replaced it with the blocked scan
+        // below.  Kept as the timing reference arm for that change.
+        for (int32_t i = 1; i < M; ++i) {
+            Add(gf[i * D], gf[i * D], gf[(i - 1) * D], D);
+            PipeBarrier<PIPE_V>();
+        }
+    } else if ((ablate & 1) == 0) {
+        // Blocked (radix-8) prefix sum, production since docs 11.56, so the
+        // control arm is the shipped arithmetic.  Three phases; every
+        // read/write pair that aliases is split across two *instructions*
+        // (the failed naive log-scan read rows the same instruction had
+        // written - repeat-level RAW, hardware does not order it - and
+        // produced NaN):
         //   A) within each 8-row block, the serial prefix in 7 levels.  A
         //      level's calls write rows {8b+j} and read rows {8b+j-1} - the
         //      two sets differ mod 8, so nothing inside one instruction
@@ -897,8 +964,9 @@ extern "C" __global__ __aicore__ void kda_pg_addwork_probe(
         //      no phase-C instruction ever reads a row another phase-C
         //      wrote - the 14 calls run back to back.
         // Same prefix for every row, summed in a different order: last-ulp
-        // changes, so this arm is priced by the driver's max|d| (and, if it
-        // ever ships, by the tolerance gate), not by bit-identity.
+        // changes against the serial arm, so the serial-vs-scan delta is
+        // priced by the driver's max|d| (the production shift is
+        // tolerance-gated, docs 11.56), not by bit-identity.
         constexpr int32_t S = 8;          // rows per block
         constexpr int32_t NB = M / S;     // blocks (8 at CHUNK = 64)
         constexpr int32_t ROW = 8 * 16;   // 8 rows of D fp32 = 128 blocks
@@ -921,10 +989,6 @@ extern "C" __global__ __aicore__ void kda_pg_addwork_probe(
                 gf[D * (S * (b - 1) + S - 1) + 64], 64, S - 1,
                 BinaryRepeatParams(1, 1, 1, 16, 16, 0));
         }
-        PipeBarrier<PIPE_V>();
-    } else if ((ablate & 1) == 0)
-    for (int32_t i = 1; i < M; ++i) {
-        Add(gf[i * D], gf[i * D], gf[(i - 1) * D], D);
         PipeBarrier<PIPE_V>();
     }
     Muls(gf, gf, RCP_LN2, N);
@@ -1193,7 +1257,8 @@ extern "C" __global__ __aicore__ void kda_pg_addwork_probe(
     // ---- previous chunk's Gram: mask, scale, round, store -----------------
     if (cprev >= 0 && (ablate & 4) == 0) {
         post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
-                  MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
+                  MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0,
+                  (ablate & 32) != 0);
         masksBuilt = true;
     }
     // ---- publish + hand off ---------------------------------------------
@@ -1219,7 +1284,8 @@ extern "C" __global__ __aicore__ void kda_pg_addwork_probe(
     // behind (~1/unroll of the stage, and the Cube is idle by then).
     if ((ablate & 4) == 0) {
         post_gram(qgin, qgmk, qgout, qgo16, mbitsAll, Aqk32, L, Aqk16,
-                  MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0);
+                  MaskS, MaskL, cprev, scale, !masksBuilt, debugStores != 0,
+                  (ablate & 32) != 0);
         masksBuilt = true;
     }
     PipeBarrier<PIPE_ALL>();

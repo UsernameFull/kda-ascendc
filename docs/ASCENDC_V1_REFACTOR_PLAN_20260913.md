@@ -3637,6 +3637,8 @@ probe@0/@32 全链路 out/state 逐位一致（0/100663296 与 0/1572864）。`a
    ablate 分支）；e2e 判词见 §11.56。
 2. **sigmoid：0.3 ms**，但已是 6 条/趟的最小 sigmoid 形态（Muls/Exp/Adds/Dup/Div/Muls），压不动。
 3. **post_gram：0.3 ms** = ~0.17 的 FL_DONE 协议等待（两次挂死史，维持冻结）+ 必需的选择/取整/读写。
+   **【§11.58 直接修正（2026-10-07）：只删等待臂读 −0.001 ms——"0.17 协议等待"是推断账、不成立；
+   这 0.33 ms 全是 AIV 自己的选择/取整/读写工作，③（握手加深）据此判死。】**
 4. §11.16 其余大项（early stores 0.22、RowReduce 0.19、Exp 0.175）都是承重数学或必须 I/O。
 
 → 今天可兑现 = **0.1 ms / 4.2 ms launch（e2e 10.4 ms 口径 ≈ 1%）**：cumsum 扫描已验证；sigmoid（0.3 ms）
@@ -3697,3 +3699,314 @@ out rel 3.47e-04 / max|d| 3.05e-05、state rel 7.60e-05 / max|d| 9.63e-05。三�
 （全 74 launch 时间线）、`... tools/probe_pg_host_floor.py`（主机地板/launch 计数）。
 回归（扫描是数值改动）：`bash tools/run_chunk_matrix.sh` → **C=16 / C=32 / C=64 三档全过**（C=16 是 M=16、
 NB=2 的扫描形态；三档都跑 test_chunk_shape_matrix + test_stability_gate + test_c64_gate_overflow）。
+
+## 11.57. 20 核上的两个"整 wave"选择器：pre_gram 96→80 块、K2 24→32 块，e2e 10.19 → 9.19 ms（2026-10-07）
+
+**背景**：10-07 复测后给 pre_gram 列的缩减清单第 ① 条是"wave 尾巴负载平衡"（按 20 核估 0.10–0.16 ms）。
+本轮做它时发现同一根因还压着 K2：两处都是"grid 不是核数整倍数、尾波空转"。
+
+**设备真相**：`torch_npu.npu.get_device_properties` 报 **cube_core_num 20 / vector_core_num 40 / L2 192 MB**；
+设备事件扫描三重互证（全流程 call、事件对、MIN of 4）：pre_gram 48 块 = 4.81–4.82 ms、24 块 = 6.34 ms，
+24 核模型对这两臂预言 3.2 ms——20 核模型成立。api.py 里"4 waves of 24 AICs"（K2 的 `aic_cores = 24`）
+是 910_9382 金标设备（24 核）的残留；§11.55 的"96 块 / 20 核 = 5 wave × 819.4 = 4097 + 尾 ≈ 4112"本来就是
+对的口径（其 31.7 ns/条 定价不受影响）。
+
+**pre_gram**（`tools/probe_pg_grid_sweep.py`，`KDA_PRE_UNROLL` 逐 call 翻、设备事件、两轮）：
+
+| arm（grid×u） | 模型步数(20核) | R1 span | R2 span |
+|---|---:|---:|---:|
+| 96×64（出厂） | 5×64=320 | 4.013 | 4.011 |
+| **80×77** | **4×77=308** | **3.881** | **3.901** |
+| 100×62 | 5×62=310 | 3.900 | 3.903 |
+| 60×103 | 3×103=309 | 3.922 | 3.927 |
+| 40×154 | 2×154=308 | 3.914 | 3.912 |
+| 20×308 | 1×308=308 | 3.897 | 3.898 |
+| 48×128 / 24×256 | 24 核模型断言臂 | 4.816 / 6.336 | 4.814 / 6.344 |
+
+数值 64 vs 77、64 vs 308 两次全部逐位（out 0/100663296、state 0/1572864）。e2e 配对（同进程 10 轮 MIN）：
+u=64 11.311 对 u=77 11.263 = **−0.048 ms**（44% 透传，落在 §11.56 的 44–65% 带）。
+生产化：`_pre_gram_unroll(c, cores)` 全 wave 搜索（min waves×u、同分取小 k、u 封顶 88、核数读
+`cube_core_num`、`KDA_AIC_CORES` 可覆盖；24 核设备同一搜索仍得 64 = 旧行为；`KDA_PRE_UNROLL` 覆盖保留）。
+正典 bench 同场 ABA：默认(77) **10.104 / 10.096**，`KDA_PRE_UNROLL=64` 10.182。
+
+**K2**（`tools/probe_k2_maxh_wave.py`，同进程四臂交错、MIN of 4、设备事件）：出厂启发式 `aic_cores = 24`
+→ `maxh = min(4, ceil(96/24)) = 4`、nblk=24 = 2×512 = **1024 head-steps**；本机最优 32 块 ×3 heads
+= 2×3 = **768**。kernel 的 head map 是运行期 stride（`for (h = blk; h < BH && nh < MAXH; h += NBLK)`，
+编译期 `KDA_MAXH` 只是数组上限），所以只动 nblk，不必改 define：
+
+| 臂 | nblk | k2 span | e2e wall MIN |
+|---|---:|---:|---:|
+| 默认（picker） | 32 | **3.075** | 10.503 |
+| 24×4（旧形状，`KDA_PERSIST_LOOP_BLOCKS=24`） | 24 | **4.002** | 11.621 |
+| 48×2 | 48 | 3.298 | 10.996 |
+| 96×1 | 96 | 4.862 | 12.495 |
+
+全部 out/state 逐位一致（两次独立运行）。96×1 的步价 0.97 ms/步对 32×3 的 0.51——nh=1 丢引擎重叠，
+与旧记录"6.04→3.91"同向。生产化：heads/block ∈ 1..`PERSIST_MAXH` 搜整 wave 最小 waves×heads、同分取
+大块（3 赢 2：3.075 vs 3.298）；bh ≤ 核数时保留 1 head/块路径；覆盖 clamp 用数组上限 `PERSIST_MAXH`
+而不是本次选中的 maxh（`KDA_PERSIST_LOOP_BLOCKS=24` 因此能真实复现旧形状）。24 核设备同一搜索仍选 4。
+正典 bench 同场：10.096/10.104（旧 K2）→ **9.190 / 9.193 / 9.189**（三次）。
+
+**判词**：e2e **10.19 → 9.19 ms（−1.00，−9.8%）**，两处改动全部逐位一致；`run_chunk_matrix.sh` 重跑
+C=16/32/64 全过；K2 的 `test_persistent_loop` / `test_state_out_split` / `test_api_k2_mode` 全过。
+对 golden（8.0035 ms，910_9382）比值 **1.27× → 1.149×**。
+
+**仪器诚信（本轮三条）**：① 用 `launch_argsarray_engine` 直放"真实 kernel 的 captured launch"会静默丢发射
+（12 臂里 7 个读到 0.000 ms；没被丢的 24×256 臂读 6.336 = 2×256 步，把 20 核钉死）——本轮所有 span 走
+`KDA_PRE_UNROLL` / `KDA_PERSIST_LOOP_BLOCKS` 的生产路径；② 老 R3 的 host-sync 读数（pu 256 → 3.4、
+pu 64 → 3.27）比设备真值（6.34 / 4.01）低 0.7–3 ms，§11.56 记过一次、这里二次记档；③ `--stages` 的
+`KDA_PROFILE` stage 账（本轮读数 pre 4.058 / solve 6.020 / k2 3.119）同样是 host-sync 口径，不可用于
+阶段定价，只用设备 span。
+
+**复原**：`KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 python3 -u tools/probe_pg_grid_sweep.py`
+（含默认自检、e2e 配对、数值）、`... tools/probe_k2_maxh_wave.py`。
+**下一步（排队）**：solve 的 24 片 × (wide 64 块 = 3.2 wave / assemble+cube 256 块 = 12.8 wave) 有同型
+尾波结构（slice 边界不可被 20 整除，需要单独实验）；§11.55 清单里的 ②（AIC 侧加/删双向定价）**已做**、
+③（FL_DONE 握手加深）**已判死**，见 §11.58（回复路径有 ≥1.8 us/步余量、等待本身 −0.001 ms）。
+【§11.59 已做：wide 实为 40 AIV 核、128 块/片 = 3.2 波 → 整波切片落生产（19×640+128），设备事件
+Σwide 2.15→1.85、Σasm 0.60→0.47，e2e 配对 −0.035~−0.133（均值 ≈ −0.08）。】
+
+## 11.58. AIC 侧加/删双向定价结案：回复路径有 ~2–4 us/步的余量、FL_DONE 等待本身 ≈ 0 —— ③（握手加深）判死；§11.55 的"0.17 ms 协议等待"分解被直接测量修正（2026-10-07）
+
+**动机**：§11.55 清单第 ②：AIC 每块墙 819.4 us 里 scalar 只忙 233.9（28.5%），且 launch 内交接是每 step
+一次、严格 backlog ≤ 1 的 level 标志（AIC `CrossCoreSetFlag<2,PIPE_FIX>(FL_DONE)` / AIV `post_gram` 的
+`CrossCoreWaitFlag(FL_DONE)`），所以"AIC/协议层面还能不能挤"只剩一个可测的形态：**AIC 的回复
+（READY→DONE）是不是 AIV 的等待源**。本轮把 §11.55 的加/删双向法搬到 AIC 侧，并在 AIV 侧把
+post_gram 的 0.3 ms 拆成"等待"与"工作"两半，一次量清。
+
+**方法**（`tools/probe_pre_gram_addwork.py`，探针 `kernels/v1/k1_pg_addwork_probe.cpp` 追加两个尾参 +
+两个删向 bit（16 = 删 Mmad、32 = 只删 FL_DONE 等待），bit 8 语义翻转为"旧串行"）：探针整轮重基线到生产算术（默认 = 11.56 的分块扫描，bit 8 = 旧 63 步串行），回放捕获的
+**生产 launch**（80 块 × u 77、4 wave，20 AIC），MIN of 5、臂序轮转，读 launch+sync wall（11.55 同一口径）。
+
+| 臂 | 注入（/步 = 每 u 迭代，2 chunk） | Δ launch（ms） |
+|---|---|---:|
+| control（= 生产算术，逐位 0/0） | — | 3.920 |
+| AIV +32 Muls/pass（§11.55 锚） | 39424 条向量 | **+1.259 → 31.9 ns/条**（轮 1 读 31.7） |
+| AIC +8 Mmad | 8 × (64,64,128) | +0.004 |
+| AIC +32 Mmad | 32 × 64³ | +0.010 |
+| AIC +96 Mmad | 96 × 64³ | +0.535 |
+| AIC +512 标量（依赖链） | 512 条 | +0.002 |
+| AIC −全部 Mmad（删向） | −8/步 | −0.011 |
+| AIV −FL_DONE 等待（**只删等待**，保留 post_gram 全部工作） | — | **−0.001** |
+| AIV −gate cumsum（删扫描） | — | −0.167 |
+| AIV −sigmoid | — | −0.276 |
+| AIV −cumsum,sigmoid | — | −0.398（单删之和 −0.443） |
+| AIV −post_gram（含等待） | — | −0.331 |
+| AIV 串行 cumsum（对照） | 63 步 | +0.120 |
+
+**判词**：
+
+1. **AIC 侧没有 wall，回复路径有余量**：+32 Mmad/步 ≈ 1.8 us/步的 M 工作量（按 msprof 的 56 ns/Mmad
+   参考价，1:1 应 +0.55 ms）只读到 **+0.010 ms（2%）**；512 条标量/步完全免费（+0.002）；删向
+   −8 Mmad/步 ≈ 0（−0.011）。余量 **≥1.8 us/步**；到 +96（5.4 us/步）开始外溢：+0.535 ms，两臂斜率
+   26.6 ns/Mmad ≈ 48% 参考价，膝点约 3.5–4 us/步。**协议 backlog ≤ 1 本身不是成本。**
+2. **FL_DONE 等待本身 ≈ 0**：只删等待（mask/scale/round 与读写全保留）读 **−0.001 ms**。§11.55 把
+   −post_gram 的 0.3 ms 拆成"~0.17 协议等待 + 必需工作"是推断账，直接测量不成立：这 0.33 ms 是 AIV
+   自己的选择/取整/读写向量工作。→ **③（FL_DONE 握手加深：乒乓 id + 深度 2）判死**——即使做成零成本、
+   深度无穷，恢复上限也只是这 −0.001；两次挂死史不必再进。§11.55 第 3 条已就地加注。
+3. **加/删两向互证**：AIC 加向免费、AIC 删向免费、AIV 加向 1:1（31.9 ns/条）、AIV 删向 −0.17～−0.28 ms/删项
+   ——同一句话：**pre_gram 的墙只是 AIV 的指令流，其中不含任何跨核等待**。msprof 里 AIV 的
+   `scalar_vector_stall` 612.3 us、零 MTE 停顿，是本核标量等自己的向量队列，不是等 Cube。
+4. **复现账**：serial−scan 的数值/时间同 11.56（out 944586/100663296、max|d| 3.052e-05、state
+   9.632e-05、+0.120 对 11.56 设备账 −0.115）；sigmoid −0.276、post_gram −0.331 与 11.55 的 −0.3
+   一致；两删臂次可加（−0.398 对 −0.443，差 0.045）。
+
+**剩余路线（pre_gram 侧）**：墙既然是 AIV 指令流，且 −post_gram 的 0.33 是最后一个没动过的大删项，
+下一步只剩"更少指令的合法改写"：post_gram 的选择/取整/读写（B 组：合并 4 次 strided gather、Cube 直读
+公共布局、sigmoid 的 `Duplicate(1.0)` 提出循环 ~0.02 ms 位一致）与 solve 的 24 片尾波实验；AIC/协议
+侧在本机复核后再无立项。
+
+**仪器诚信**：① control 与生产逐位一致（out 0/100663296、state 0/1572864）——探针重基线成立，本表所有
+delta 都锚在生产算术上；② MIN of 5 的 spread 读到 0.0 ms（一位小数口径，即 <0.05 ms），故 +8/+32/−wait
+三点只能读"≤分辨率"（本表按此口径判词；+96 是唯一超噪的 AIC 剂量点）；③ 本轮生产 kernel/api 零改动；
+`k1_pg_addwork_probe.cpp` 不在 `_SOURCES`；两个借用它的历史工具（`probe_pg_scan_timeline.py`、
+`probe_pg_cumsum_scan_e2e.py`）已同步四尾参 + bit 8 语义翻转。
+
+**复原**：`KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 python3 -u tools/probe_pre_gram_addwork.py`
+
+## 11.59. 两级 solve 的切片改按"整 AIV 波"尺寸：宽的 Σspan 2.15→1.85 ms、asm 0.60→0.47（三次复现），e2e 配对 −0.035~−0.133；细分片被宿主杀掉（2026-10-07）
+
+**背景**：§11.57 排队项——solve 的 24 片 × (wide / assemble / cube 网格) 是同型尾波结构，而 slice
+边界"不可被 20 整除"。本轮先把它量清再改。
+
+**设备真相（本轮量出）**：`kda_solve_wu_wide` 是 AIV-only kernel，一块 `SOLVE_WIDE_NCH`=4 chunk，
+每片的 wide 网格 = 片长/4；本机 `vector_core_num`=**40**（cube_core_num 20 的 MIX 配比）→ **一波 =
+40 块 = 160 chunk**。出厂均分 24 片 × 512 chunk → 128 块 = **3.2 波**，硬件按 4 波收费：24 片付 96
+波，而 3072 块只需 76.8 波——宽半边白付 ~25%。span 算术两次对上：wave1280 臂 320 块 = 8 波读
+179.5 us → 22.4 us/波；出厂臂 4×22.4 = 89.6 对实测 89.7 us/slice。
+
+**仪器**（`tools/probe_solve_slices.py`，新）：probe-only 地 monkeypatch
+`api._launch_solve_two_level`（生产函数零改动），按策略重切同一批 launch（同指针、同 kernel），
+片内两流 + 事件协议与生产一致；pass1 对每个 solve launch 打设备事件读 span 之和，pass2 无事件读
+配对 wall；全部臂 out/state 逐位 0/0。
+
+| 臂（片数） | Σwide | Σasm | Σcube | e2e Δ（配对） |
+|---|---:|---:|---:|---:|
+| 出厂 24 均分 ×512 | 2.153–2.173 | 0.580–0.618 | 1.533–1.562 | 0（9.84–9.89，三场） |
+| wave 640（19×640+128，20 片） | 1.862 | 0.470 | 1.538 | −0.133 / −0.066 |
+| wave 640f（余片在前） | 1.849 | 0.450 | 1.470 | −0.086 / −0.108 |
+| wave 800（15×800+288，16 片） | 1.844–1.868 | 0.452–0.459 | 1.545–1.563 | −0.077 / −0.129 |
+| wave 1280（9×1280+768，10 片） | 1.795–1.798 | 0.463–0.468 | 1.542–1.551 | −0.057 / −0.061 |
+| wave 480（25×480+288，26 片） | 1.954 | 0.627 | 1.587 | **+0.441** |
+| even 48 | 2.668 | 1.192 | 1.733 | **+5.827** |
+| wave 160（77 片） | 2.678 | 1.711 | 1.933 | **+12.491** |
+
+**判词**：
+
+1. **整波切片删掉宽半边的尾巴**：Σwide −0.28（2.15→1.85）、Σasm −0.11（0.60→0.47）、Σcube 平；
+   stage 地板 max(2.15, 2.15)=2.15 → max(1.85, 2.00)=**2.00（AIC 侧成为地板）**。按 §11.48 的
+   min-规则预期 −0.14，e2e 实测 −0.035~−0.133（四场；生产路径三臂标定：auto2−auto=+0.010 噪声底、
+   legacy−auto=**+0.072**），均值 ≈ **−0.08**（透明传输 ~57%）。正典 bench 跨进程 ABA（p20/p80）：
+   新 **9.142 / 9.149**（9.133/9.139，9.158/9.159）对 legacy **9.195**（9.180/9.210）→ **−0.05**。
+2. **细分片被宿主杀掉，别再试**：+0.24 ms/片（even48 +5.83 / wave320 +3.44 / wave160 +12.49，都在
+   无事件 wall 遍）；同一遍里"事件打在每次 launch"的 stage 账（出厂读 5.2–5.7 对真值 2.32）也是宿主
+   口径。~24 片是本机宿主供得起的上限；device 结构再好也换不回来。**span 之和仍是干净事件账**（事件
+   不打在空隙里），stage/manual-sync 数第三次记档不可用。
+3. **生产化**：`python/kda_ascendc_v1/api.py` 的 `_solve_slice_chunks`（wave = lcm(unit, aiv×nch)，
+   尺寸取靠近 c_solve/`SOLVE_SLICE_TARGET`(=20) 的整数倍，余片尾置）+ `_aiv_core_count`
+   （vector_core_num，回退 2×cube、`KDA_AIV_CORES` 可覆盖）；本形状 = 19×640 + 128（20 片）。
+   `KDA_SOLVE_SLICE_CHUNKS`：0=auto、>0=固定尺寸、<0=旧均分（逃生）。C=16/32 走不到此路径（SUBB=1）。
+4. **回归**：`bash tools/run_chunk_matrix.sh` C=16/32/64 全过（本轮一次）；`tools/probe_solve_slice_policy.py`
+   （新，生产路径 A/B）auto 对 legacy 逐位 0/0（out 0/100663296、state 0/1572864）。
+
+**下一步（solve 侧）**：地板已是 AIC（asm 0.47 + cube 1.53 = 2.00 对 AIV 1.85），下一步只能动 cube 的
+1.53（§11.38/11.39 已做过 A16 常驻与 P 片上）或再配平；宽侧（AIV）现在有 0.15 余量可给。
+
+**复原**：`KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 python3 -u tools/probe_solve_slices.py`
+（`KDA_SLICE_ARMS=default,wavef:640,wavef:800`、`KDA_SLICE_WALL_ROUNDS=24` 可复现本轮三臂）；
+`... python3 -u tools/probe_solve_slice_policy.py`（生产路径 A/B）。
+
+## 11.60. post_gram 的 B 组合法改写：平铺拷贝 + 预取 + Duplicate 外提，device 回放 −0.041、e2e 配对 −0.052~−0.062、正典 9.098（新最佳）；−0.331 的构成也拆开了（2026-10-07 下午）
+
+**背景**：§11.58 队尾的 B 组清单（"更少指令的合法改写"）。方法：新探针
+`tools/probe_pg_bgroup.py`——从 pinned base（`git show 7d628eb:kernels/v1/k1_pre_gram_mix.cpp`，
+`KDA_BG_BASE` 可换）文本生成**孪生 kernel**（逐条锚断言、同签名），同进程回放生产 launch
+（grid 80 × unroll 77，即 §11.57 的 20-AIC 形状），host wall + 设备事件 span 双仪器，
+MIN of 8（轮 1）/24（轮 2），臂序每轮旋转。
+
+| 臂（相对 production 的文本差） | 轮 1 span/wall Δ | 轮 2 wall Δ（24 轮） | 逐位 |
+|---|---:|---:|---|
+| ctrl（同源重编，噪声锚） | 3.902 / 3.957 | 3.946 | 0/0 |
+| **flat**：band 收发从 `(16, M/8)` 2-D 描述符改成 16*M 元素的 1-D 突发（区域本就连续） | −0.010 / −0.010 | — | 0/0 |
+| **hoist**：sigmoid 的 `Duplicate(t2, 1.0)` 提出 NP 循环（t2 是常量、循环间无人写） | 0.000* / −0.026 | — | 0/0 |
+| **flat+** = flat+hoist | 0.000* / −0.037 | **−0.026** | 0/0 |
+| **pf**：band 级 one-ahead 预取（band 0 先发，循环里先 DeQue 当前、再发下一 band 的 load） | −0.030 / −0.027 | — | 0/0 |
+| **pf+** = pf+flat+hoist（= 本轮落地） | −0.041 / −0.038 | **−0.041（span −0.045）** | 0/0 |
+| nobar：删 band 内两条 `PipeBarrier<PIPE_V>` | — | +0.008 | 0/0 |
+| dbl：band 循环跑两遍（剂量臂，幂等重算） | — | **+0.306** | 错 |
+| noV：band 的 4 条 V 操作全删（保留队列协议） | — | **−0.097** | 错 |
+| nosel：8 次位掩码 Select → 普通 Muls(·,1.0) | — | −0.064 | 错 |
+| nostore：三处 band store 全删（保留协议） | — | −0.004 | 错 |
+
+（*：span 在部分轮读到 0.000 的仪器毛刺，该臂只用 wall 读数；合法臂的 wall 两轮一致。）
+
+**判词（把 −0.331 拆开）**：
+
+1. **合法可收的就只有 ~−0.04 ms**：flat+hoist 与 pf 各自 −0.026~−0.037、合起来
+   −0.038~−0.045（次可加）。其余部分是**结构成本**，不是指令数：
+2. **剂量臂定住单价**：dbl（每 chunk 多跑一遍 band 循环）**+0.306 ms** → 一个 band 迭代
+   ≈ 0.25 µs、post_gram 全量 ≈ 1.0 µs/chunk——与 §11.58 的 −post_gram = 0.331 ms
+   （= 1.07 µs/chunk）**对上**。其中：
+   - 16 条 V 操作（4 band × Select/Muls/Select/Cast）只占 **0.097**（≈ 20 ns/条）；
+   - band store 全部（含 DeQue 等待链）≈ **0**（−0.004，MTE3 藏在流后面）；
+   - MTE2 延迟暴露很小：pf 只收回 −0.03（≈ 0.09 µs/chunk）；
+   - 剩余的 ~0.6 µs/chunk 是**队列协议（3 条深度 2 队列 × Alloc/EnQue/DeQue/Free × 4 band）
+     加发射**。要再削它只能"整 chunk 单迭代"，而 §11.12 已实测 TQue 的 UB 代价（名义 +34 KB、
+     实际吃掉 ~90 KB 余量），72 KB 的整 chunk staging 放不下——此路留给未来结构改动，本轮封账。
+3. **两个"看起来很香"的项都被单价否掉**：位掩码 Select 比 Muls 贵 ~1 倍（nosel −0.064），
+   但合法替身（fp32 mask 乘法）有 C=32 NaN 史（§11.12 的 select 注释），不采用；
+   band 内 barrier 免费（nobar +0.008，V 管道 in-order），删了也只错不错。
+4. **AIC 侧没有可分担项**：§11.58 已证 reply 路径余量 ≥1.8 µs/step，post_gram 的墙
+   纯粹是 AIV 自己的量。
+
+**落地（`kernels/v1/k1_pre_gram_mix.cpp`，本轮唯一的生产内核改动）**：`post_gram` 的
+band 收发改 1-D 拷贝、`Duplicate(t2)` 提出 sigmoid 循环、band 级 one-ahead 预取
+（FIFO 深度 2 足够：alloc 下一个在 free 当前之前，最多两个 tensor 在飞）。
+
+**验证**：
+
+- `tools/verify_pg_bgroup_ident.py`（新）：反向孪生（`git show HEAD` 的改写前源）+
+  `return_intermediates=True` 全张量比对——**C=16 / 32 / 64 全部 0.000e+00**
+  （out、state、Qg/Kg/Kn/Qn/Rk/Rv/L/Decay/Gate/Gc/W/U/Vnew/VnewT/d1–d4/state_s32）。
+- `bash tools/run_chunk_matrix.sh`：**C=16/32/64 全 PASS**（含稳定性门）。
+- `tools/probe_pg_bgroup_e2e.py`（新）：整管线同进程配对 MIN of 12——
+  **new 9.709 / old 9.771（wall −0.062）、span 9.640 / 9.691（−0.052）**，out/state 0/0。
+- 正典 bench（跨进程 ABA）：**9.098 ms（p20 9.090 / p80 9.109）**对前最佳 9.142/9.149
+  → **−0.045~−0.05**；对 golden 8.0035 ≈ **1.137×**。
+
+**复原**：`KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 python3 -u tools/probe_pg_bgroup.py`
+（`KDA_BG_ROUNDS=24 KDA_BG_ONLY=ctrl,flat+,pf+,nobar,dbl,noV` 是轮 2 的组合）；
+`... python3 -u tools/verify_pg_bgroup_ident.py`；`... python3 -u tools/probe_pg_bgroup_e2e.py`。
+日志归档 `/data/models/Qwen3-4B/kda_probe_20261007_pg_bgroup/`。
+
+**下一步（队列）**：pre_gram 侧此轮封账（合法改写收完，结构项卡 UB）；solve 地板在 AIC
+（asm 0.47 + cube 1.53 = 2.00），宽侧（AIV 1.85）有 0.15 余量；可动项回到 solve cube 的
+1.53（§11.38/11.39 已做过 A16 常驻与 P 上片）与 K2。
+
+## 11.61. solve 再配平：mode 3/4 两个存量旋钮在 AIC-limited 制度下各是赢，叠加为 mode 5（窗口填充 + 批量 store），e2e −0.134/−0.141（两轮 24-round），生产默认翻到 5（2026-10-07 傍晚）
+
+**背景（why now）**：§11.59 整波切片把宽侧（AIV）压到 1.85 ms 后，solve 的地板换到 AIC：
+asm 0.47 + cube 1.53 = 2.00。§11.42 的 mode 3（批量 store）与 §11.50 的 mode 4（整窗 Xb 装载）
+都留下了同一句判词——"隔离是赢、stage 平局，哪一半暴露就翻转"。本轮在 11.59 的制度下把这两个
+旋钮放回生产路径复测，并按派生论证叠加成 mode 5。
+
+**方法**：新探针 `tools/probe_asm_mode_e2e.py`——生产路径（`api.kda_bt16_fwd_ascendc`）
+轮转 `KDA_ASM_LOADS`，同进程、每轮旋转臂序、MIN of 24；wall = 宿主墙钟、span = 两个设备事件
+夹住整次调用；每轮对 mode 2 逐位 out/state。`KDA_ASM_SKIP_SPANS=1` 跳过 per-launch 事件遍
+（launch 循环里打事件会把运行变成 host-paced，§11.59 已记档——本轮再次绕开）。
+
+**两轮 24-round（wall / span，脚标 = 对基线的 Δ）**：
+
+| 臂 | 轮 1 wall | 轮 1 span | 轮 2 wall | 轮 2 span | 逐位 |
+|---|---:|---:|---:|---:|---|
+| mode 2（基线） | 9.736 | 9.670 | 9.719 | 9.660 | 0/0 |
+| mode 3 批量 store | 9.665（−0.071） | 9.607（−0.063） | 9.648（−0.071） | 9.584（−0.076） | 0/0 |
+| mode 4 整窗装载 | 9.687（−0.049） | 9.622（−0.048） | 9.672（−0.047） | 9.614（−0.046） | 0/0 |
+| **mode 5 = 4+3** | **9.602（−0.134）** | **9.542（−0.128）** | **9.578（−0.141）** | **9.517（−0.143）** | 0/0 |
+
+- 两轮一致（±0.007 内）；组合近可加（−0.071 + −0.049 = −0.120，实测略超）。
+- 仪器注记：device-sums 一列在 mode 4 读到 asm 0.650 / cube 1.570 的反常值
+  （per-launch 事件污染，与 §11.59 同源），弃用，只信 wall/span；mode 2 的 spread 里有一个
+  ~152 s 的宿主离群轮（MIN 统计不受影响）。
+
+**mode 5 的派生论证（为什么两个开关能叠）**：
+
+1. 批量 store 的 `srcNdStride = MM/256`（1 KB 分形单位，M=32 → 4）要求 pass 1 的 L0C 槽位是
+   一段等距连续区域：槽序 = `pass*NC + ch`，pass 1 从 `NC*MM` 起每 `MM` 一个槽——整窗填充
+   不动槽序，nd 调用照样一次覆盖 nch 个槽；
+2. P 仍由 pass 0 的 CFG_NZ fixpipe 上片、不进 GM ⇒ `pmid` 判据（mode ≥ 2 不分配 P 表）不变；
+3. §11.42/§11.50 的"不能叠加"只是当时的 stage 平局判词，不是结构矛盾：两个旋钮一个改读路径
+   （窗口填充）、一个改写路径（批量 store），在 kernel 里正交。
+
+**落地**：
+
+- `kernels/v1/k1_solve_assemble.cpp`：`batched_store = (loadMode == 3 || loadMode == 5)`；
+  window 分支 `assemble_chunk(..., batched_store)` + pass 1 后一次 nd Fixpipe（与 mode 3 同形）。
+- `python/kda_ascendc_v1/api.py`：`asm_load_mode()` 默认 `"2" → "5"`，docstring 更新
+  （模式表 + 本轮两轮数；P 表分配判据 `>= 2` 不变）。
+- `tests/test_solve_assemble_loads.py`：生产断言翻到 5；逐位/接线/P 表空指针三处臂表加 5；
+  `test_mode_3...` 判词更新（11.42 的 stage 输 → 11.61 的 −0.071、组合进 mode 5）。
+
+**验证**：
+
+- `tests/test_solve_assemble_loads.py`：**5 passed**（含 mode 5 逐位 0/0，C=64 形状）。
+- 顺带一条回归修正：§11.59 的整波切片让该测试的 128-chunk 形状只切 1 片（< 一个 AIV 波
+  160 chunk），`test_the_mode_is_read_per_call_not_frozen` 的"每片都携带 mode"断言改为显式
+  `KDA_SOLVE_SLICE_CHUNKS=32` 强制 4 片；此前该测试自 11.59 起其实是红的（本轮才发现）。
+- `bash tools/run_chunk_matrix.sh`（带 `ASCEND_RT_VISIBLE_DEVICES=3`）：**C=16/32/64 全 PASS**。
+- 正典 bench（跨进程，含 160 s 编译）：**8.980 ms（p20 8.966 / p80 8.993）**对前最佳 9.098
+  （§11.60）→ **−0.118**；对 golden 8.0035 ≈ **1.122×**。与同进程配对的 −0.134/−0.141 同量级
+  （bench 的 MIN-of-p20 口径与探针的 MIN-of-24 口径不同，取整不追）。
+- 环境注记（跑法教训）：matrix 前两次跑忘了 `ASCEND_RT_VISIBLE_DEVICES=3`，落在本机
+  Alarm 状态的物理设备 0 上——plog 的 fault kernel 是 torch_npu 内置
+  `Mul_..._high_performance`（测试造数 `randn*0.1`）3 分钟超时、C=16 leg 全红；带上设备 3
+  复跑干净。与内核代码无关（C=16 也不走两级 solve），但 matrix 脚本自身不设设备号，
+  以后跑门禁必须显式带 env。
+
+**复原**：
+`KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 KDA_ASM_ARMS=2,3,4,5 KDA_ASM_SKIP_SPANS=1 KDA_ASM_ROUNDS=24 python3 -u tools/probe_asm_mode_e2e.py`；
+日志归档 `/data/models/Qwen3-4B/kda_probe_20261007_asm_rebalance/`。
+
+**下一步**：本轮把 asm 侧的存量旋钮收完（mode 5 后 asm 的余量不明，device 分解被污染没读）；
+solve 地板账仍是 AIC = asm + cube 1.53 的大头，可动项回到 cube（§11.38/11.39 已动过 A16
+常驻与 P 上片）与 K2。

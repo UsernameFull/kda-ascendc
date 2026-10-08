@@ -76,6 +76,11 @@ ASM_NCHUNK = int(os.environ.get("KDA_ASM_NCHUNK", "0")) or 4
 # AIC halves overlap better with smaller slices, but only down to the point
 # where the per-slice launch pair (and the AIC side's tail) starts to show.
 SOLVE_OVERLAP = int(os.environ.get("KDA_SOLVE_OVERLAP", "24"))
+# Two-level solve slice sizing (docs 11.59).  The default path sizes slices by
+# whole AIV waves targeting this many slices (KDA_SOLVE_SLICE_CHUNKS=0 is
+# auto; >0 fixes a chunk size, <0 goes back to the even split into
+# SOLVE_OVERLAP slices that shipped through docs 11.57).
+SOLVE_SLICE_TARGET = int(os.environ.get("KDA_SOLVE_SLICE_TARGET", "20"))
 # Heads per block in the persistent K2 loop, and therefore the KDA_MAXH the
 # kernel is compiled with (they must agree: the kernel's head map only walks
 # MAXH heads per block, so a smaller define silently drops heads).
@@ -89,16 +94,24 @@ SOLVE_OVERLAP = int(os.environ.get("KDA_SOLVE_OVERLAP", "24"))
 # the old layout capped C=64/32 at 2 (176.5 KB).  A UB overrun is a
 # kernel-side aivec error, not a host-side allocation failure, so this is
 # arithmetic, not a probe.
-# Heads per block is not a free knob: 4 heads/block puts the whole 96-head
-# grid on 24 blocks, i.e. one wave per AIC instead of two, and the second wave
-# costs a whole second pass over the chunks.  Measured same-process A/B at
-# [1,8192,96,128] (interleaved MIN of 4, bit-identical outputs incl. the fp32
-# state): C=64 k2 6.23 (MAXH 2, 2 waves) -> 5.97 ms (MAXH 4, 1 wave); C=32
-# 6.12 -> 5.81 ms.  The aliasing is *not* free at a fixed head count - it
-# needs the stage-4 recurrence split into four 16-row quarters instead of two
-# 32-row halves, worth +0.54 ms at C=64/MAXH 2 - so the MAXH 4 gain is what
-# pays for it, and the pairing is the point (2 + 56.5 = 120.5 KB wastes the
-# diet).
+# Heads per block is not a free knob: it sets the block count, and the
+# block count sets the waves, and the second wave costs a whole second
+# pass over the chunks.  The kernel's head map strides by the runtime
+# block count ("for (h = blk; h < BH && nh < MAXH; h += NBLK)"), so any
+# heads-per-block in 1..PERSIST_MAXH is one nblk away.  The old form
+# here chose "one wave per AIC" for the 24-core golden device (96 heads
+# / 24 = 4 heads/block); this part has 20 AIC cores, and full-call
+# device events read the three candidates at [1,8192,96,128] (interleaved
+# MIN, tools/probe_k2_maxh_wave.py, bit-identical outputs incl. the fp32
+# state): 24 blocks x 4 heads = 2 waves = 8 head-steps -> k2 4.025 ms;
+# 32 x 3 = 2 waves = 6 -> 3.081 ms; 48 x 2 = 3 waves = 6 -> 3.276 ms.
+# The picker below therefore searches whole-wave block counts and takes
+# the smallest waves x heads, ties to the larger block (3 heads wins
+# the 6/6 tie against 2 by retired work and prologue: 3.081 vs 3.276).
+# On the 24-core part the same search keeps 4 heads/block, and one head
+# per block stays available only while it fits a single wave (the old
+# 4.38-vs-4.55 note at [2,4096,8]; past that a second wave of one-head
+# blocks loses the engine overlap badly, 17.2 vs 13.8 at [1,8192,32]).
 # nh = 1 is not just "one fewer head": the depth-one flag protocol only
 # overlaps the two engines when a block has two or more heads in flight, so at
 # C=64 the second head is worth k2 6.04 -> 3.91 ms and e2e 12.79 -> 10.74 ms
@@ -176,6 +189,105 @@ def _tri_eye(device: torch.device, n: int | None = None) -> torch.Tensor:
     return eye
 
 
+# The pre_gram launch's grid: one MIX block pairs an AIC with two AIV subcores
+# and walks 2 * `pre_unroll` chunks, so the grid is ceil(c / (2u)) blocks and
+# the stage's wall is (whole waves) x u block-steps.  The waves term is what a
+# block count that is not a multiple of the AIC count costs.  At
+# [1,8192,96,128]/C=64 this part has 20 AIC cores, so the shipped 96-block
+# grid (u = 64) runs 5 waves of 64 = 320 steps, while the same 6144 steps
+# land in 4 waves of 77 = 308 at 80 blocks - measured on device events
+# through this very path (tools/probe_pg_grid_sweep.py, full calls, MIN of 4:
+# 4.013 -> 3.881 ms, outputs and states bit-identical; 48/24-block arms
+# confirm 20 and not 24 cores: 4.816 / 6.336 ms, the 24-core model would read
+# 3.2 for both).  The old "4 waves of 24 AICs" reading came from the 24-core
+# golden device.  A different part changes the arithmetic, so the picker
+# reads cube_core_num (KDA_AIC_CORES overrides it for experiments) and picks
+# the whole-wave block count by minimizing waves x u, fewest waves first, with
+# u capped at 88 (the largest per-block walk whose price is measured; every
+# real shape below the cap is exact).  u is a runtime arg: a tiling choice,
+# not a recompile.
+_AIC_CORES: dict = {}
+
+
+def _aic_core_count(device) -> int:
+    key = str(device)
+    n = _AIC_CORES.get(key)
+    if n is None:
+        n = int(os.environ.get("KDA_AIC_CORES", "0") or 0)
+        if not n:
+            try:
+                idx = device.index
+                if idx is None:
+                    idx = torch_npu.npu.current_device()
+                n = int(torch_npu.npu.get_device_properties(idx).cube_core_num)
+            except Exception:
+                n = 20
+        _AIC_CORES[key] = n
+    return n
+
+
+_AIV_CORES: dict = {}
+
+
+def _aiv_core_count(device) -> int:
+    """Vector (AIV) core count - the unit the wide solve schedules over.
+
+    The two-level solve's wide half is an AIV-only kernel with one block per
+    SOLVE_WIDE_NCH chunks, so its wave length is this many blocks.  The CANN
+    property reads 40 on the 20-AIC part (one AIC + two AIV per MIX block);
+    the fallbacks are the MIX ratio and the AIC count.
+    """
+    key = str(device)
+    n = _AIV_CORES.get(key)
+    if n is None:
+        n = int(os.environ.get("KDA_AIV_CORES", "0") or 0)
+        if not n:
+            try:
+                idx = device.index
+                if idx is None:
+                    idx = torch_npu.npu.current_device()
+                props = torch_npu.npu.get_device_properties(idx)
+                n = int(getattr(props, "vector_core_num", 0) or 0)
+                if not n:
+                    n = 2 * int(props.cube_core_num)
+            except Exception:
+                n = 2 * _aic_core_count(device)
+        _AIV_CORES[key] = n
+    return n
+
+
+def _solve_slice_chunks(c_solve: int, unit: int, nch: int, aiv_cores: int,
+                        target: int) -> int:
+    """Two-level solve slice size: a whole number of AIV waves.
+
+    One wave is `aiv_cores * nch` chunks, lcm'd with the wiring unit so a
+    slice boundary is still a whole (wide / assemble / Cube) group.  The size
+    is the multiple closest to `c_solve / target`, so the slice count stays
+    near `target` whatever c_solve is; a smaller remainder slice carries the
+    tail.  Measured in tools/probe_solve_slices.py at [1,8192,96,128]: the
+    old even split into 24 gave every slice a 128-block wide grid = 3.2 waves
+    of 40 and the sum of wide spans read 2.15 ms; whole-wave slices read 1.85
+    (summed assemble 0.60 -> 0.45, Cube flat), e2e paired MIN -0.07~-0.13 ms.
+    """
+    wave = math.lcm(unit, aiv_cores * nch)
+    k = max(1, int(round(c_solve / float(target) / wave)))
+    return k * wave
+
+
+def _pre_gram_unroll(c: int, cores: int) -> int:
+    """Chunk pairs per block whose launch is a whole number of AIC waves."""
+    if c < 256:
+        return 1
+    best = None
+    for k in range(1, 65):
+        u = min(88, max(1, -(-c // (2 * cores * k))))
+        grid = -(-c // (2 * u))
+        steps = -(-grid // cores) * u
+        if best is None or steps < best[0]:
+            best = (steps, k, u)
+    return best[2]
+
+
 def _pack_ptrs(xs):
     return [struct.pack("<Q", 0 if x is None else int(x.data_ptr())) for x in xs]
 
@@ -232,7 +344,7 @@ def asm_load_mode() -> int:
     L1 in NZ instead of GM and pass 1 builds L0B from it, which drops the tile's
     50.3 MB round trip (151.0 -> 100.7 MB per call of L1 traffic) and, since
     nothing touches the GM tile any more, the caller stops allocating its
-    25.2 MB as well (section 11.40).  2 is production: measured in
+    25.2 MB as well (section 11.40).  Measured in
     tools/probe_solve_assemble_loads.py at [1,8192,96,128], the three arms come
     out 0.902 / 0.692 / 0.512 ms isolated, AIC 2.614 / 2.305 / 2.197 and e2e
     10.624 / 10.445 / 10.408 ms.  All three land byte-identical
@@ -240,14 +352,23 @@ def asm_load_mode() -> int:
     tools/probe_solve_assemble_l1p.py check P and A16 are equal before timing
     anything), so this is a scheduling knob, not a numeric one.  Read per call
     rather than frozen at import so a probe can flip it between arms of one
-    process.  3 is 2 plus the batched pass-1 A16 store (section 11.42, a stage
-    loss) and 4 is 2 plus the whole-window Xb fill (section 11.50: both passes'
-    Xb operands in one ND2NZ call, 2 MTE2 calls per block - bit-identical, block
-    wall 3.7475 -> 2.9236 us and mte2 -64% on board, AIC half -0.150 ms
-    isolated, and the stage flat at 5.957 = 5.957, so 2 stays production and 4
-    is the switch to flip if the assemble half ever becomes the exposed one).
+    process.  3 is 2 plus the batched pass-1 A16 store (section 11.42) and
+    4 is 2 plus the whole-window Xb fill (section 11.50: both passes' Xb
+    operands in one ND2NZ call, 2 MTE2 calls per block).  Both were measured
+    as "isolated win, stage flat" while the AIV (wide) half was the wall; when
+    section 11.59's whole-wave slices cut that half to 1.85 ms, the AIC
+    (assemble + Cube) half became the floor and section 11.61 re-measured
+    both on the production path in one process, alternating arms, MIN of 24:
+    against mode 2's 9.736 / 9.719 wall, mode 3 lands -0.071 / -0.071 and
+    mode 4 -0.049 / -0.047.  The two knobs compose - the pass*NC+ch slot
+    order keeps the batched store's srcNdStride (MM/256 KB = 4) valid under
+    the window fill and P still never leaves the chip - as mode 5
+    (window fill + batched store), which measured -0.134 / -0.141 wall and
+    -0.128 / -0.143 span, i.e. 9.602 / 9.578 against the same 9.736 / 9.719.
+    5 is production; every arm is bit-identical (same file, and
+    tools/probe_asm_mode_e2e.py checks out/state per round).
     """
-    return int(os.environ.get("KDA_ASM_LOADS", "2"))
+    return int(os.environ.get("KDA_ASM_LOADS", "5"))
 
 
 def asm4_store_mode() -> int:
@@ -332,7 +453,10 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
     cores, so the chunk range is cut into ``overlap`` slices and the two halves
     run on their own streams behind a per-slice event - at [1,8192,96,128] and
     CHUNK = 64 that takes the stage from 3.22 to 2.51 ms with bit-identical
-    outputs.  Slices hold whole ``unit`` (wide block / assemble / Cube unit)
+    outputs.  Slice sizes are whole AIV waves by default (docs 11.59,
+    ``_solve_slice_chunks``); KDA_SOLVE_SLICE_CHUNKS overrides the size (>0)
+    or restores the legacy even split (<0).  Slices hold whole ``unit``
+    (wide block / assemble / Cube unit)
     groups, which is what keeps a padded tail from leaking into the next slice;
     ``overlap = 0`` runs everything on the caller's stream.  ``c`` is the real
     chunk count: the wide/assemble halves own c-sized-per-chunk buffers padded
@@ -348,14 +472,34 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
     """
     unit = math.lcm(nch, asm_nchunk, wu_nchunk)
     ngrp = c_solve // unit
+    # Slice sizes.  Whole AIV waves by default (docs 11.59): an even split
+    # into SOLVE_OVERLAP slices gives every slice a wide grid that is not a
+    # multiple of the vector-core count, so each one pays a partial last wave.
     # Slices have to stay fat enough to keep a block's fixed cost amortised:
     # at most ngrp/8 of them, and never more than one per group.
-    slices = min(overlap, max(1, ngrp // 8)) if overlap > 0 else 0
-    ovl = slices >= 2
-    overlap = slices
+    mode = int(os.environ.get("KDA_SOLVE_SLICE_CHUNKS", "0"))
+    if overlap <= 0:
+        pairs = [(0, ngrp)]
+    elif mode < 0:
+        # Legacy: the even split into SOLVE_OVERLAP slices (docs 11.38-11.57).
+        slices = min(overlap, max(1, ngrp // 8))
+        pairs = [(i * ngrp // slices, (i + 1) * ngrp // slices)
+                 for i in range(slices)]
+    else:
+        if mode > 0:
+            sgrp = max(1, min(ngrp, mode // unit))
+        else:
+            sgrp = max(1, min(ngrp, _solve_slice_chunks(
+                c_solve, unit, nch, _aiv_core_count(a16.device),
+                SOLVE_SLICE_TARGET) // unit))
+        slices = -(-ngrp // sgrp)
+        pairs = [(i * sgrp, min((i + 1) * sgrp, ngrp)) for i in range(slices)]
+        if slices > max(1, ngrp // 8):
+            slices = max(1, ngrp // 8)
+            pairs = [(i * ngrp // slices, (i + 1) * ngrp // slices)
+                     for i in range(slices)]
+    ovl = len(pairs) >= 2
     cur = torch_npu.npu.current_stream()
-    pairs = [(0, ngrp)] if not ovl else \
-        [(i * ngrp // overlap, (i + 1) * ngrp // overlap) for i in range(overlap)]
     if ovl:
         sa, sb = _solve_streams(a16.device)
         # The wide slices read what the caller's stream produced (L, the aqk
@@ -762,18 +906,17 @@ def _kda_fwd_impl(
     # few hundred chunks up (measured 2.679 -> 2.342 ms at [1,8192,32]); tiny
     # grids (fewer than 256 chunks) stay at 1 because the loop wrapper itself
     # costs a few percent there.
-    # R3: the block count is what costs - every 24-block wave re-pays the
-    # block prologue - so aim at a fixed number of *waves* rather than at a
-    # block-count floor.  The earlier sweep (768 blocks (pu 8) 4.163, 384 (16)
-    # 4.099, 192 (32) 4.043, 96 (64) 4.031 at pre_gram ~4.0 ms) pointed at
-    # ~4 waves of 24 AICs = 96 blocks, i.e. one block per 128 chunks
-    # (pu = c / 192); re-measured on the current stage (3.31 ms baseline,
-    # interleaved MIN of 3: pu 8 3.518, 16 3.374, 32 3.315, 64 3.271, and past
-    # the cap 96 3.771, 128 3.508, 192 4.872, 256 3.416), so the 4-wave target
-    # holds and pu = 64 is the optimum at c = 12288.  c // 192 keeps 96 blocks
-    # (pu capped at 64) for every larger shape and leaves the tiny grids at 1.
+    # R3: the block count is what costs - every extra wave re-pays the block
+    # prologue - so the grid has to be a whole number of AIC waves, and the
+    # device-event span (not the host-synced stage times the old sweeps used,
+    # which read 0.7 ms low) is what prices it.  The R3 sweeps picked 96
+    # blocks / u = 64 on the assumption of 4 waves of 24 AICs; this part has
+    # 20 AIC cores, so that grid is 5 waves = 320 steps.  Full-call device
+    # events at [1,8192,96,128] read 4.013 (96 x 64) -> 3.881 ms (80 x 77,
+    # 4 waves = 308 steps), bit-identical, and _pre_gram_unroll finds the
+    # 80 x 77 shape from the core count alone (tools/probe_pg_grid_sweep.py).
     pre_unroll = (int(os.environ.get("KDA_PRE_UNROLL", "0"))
-                  or (1 if c < 256 else min(64, max(2, c // 192))))
+                  or _pre_gram_unroll(c, _aic_core_count(q.device)))
     mark("pre_gram_start")
     if os.environ.get("KDA_PRE_GRAM", "mix") == "aiv":
         # The vector-only experiment path has no debugStores flag: it keeps
@@ -917,19 +1060,28 @@ def _kda_fwd_impl(
         # the AIC count (measured at [2,4096,8]: 4.38 vs 4.55 ms); past that,
         # two heads per block keep every block resident instead of queueing a
         # second wave (32 blocks at [1,8192,32] cost 17.2 vs 13.8 ms).
-        aic_cores = 24
-        # Heads per block.  The kernel keeps up to MAXH=4 heads resident and one
-        # block per AIC is all the parallelism this part has, so ask for as few
-        # blocks as the head count allows while still filling all 24 AICs - a
-        # second wave costs a whole pass over the chunks.  Measured at
-        # [1,8192,96,128]: 4 heads/block 6.53-6.56 ms against 6.71-6.88 for
-        # 2 heads/block (MIN of 3 in-process rounds, 3 rounds each), so the
-        # auto value is ceil(bh / 24) capped at the kernel's MAXH.
-        maxh = max(1, min(PERSIST_MAXH, (bh + aic_cores - 1) // aic_cores))
+        aic_cores = _aic_core_count(q.device)
+        # Hunt over the heads-per-block candidates the kernel can carry (the
+        # runtime head map strides by nblk, PERSIST_MAXH is only the array
+        # cap): minimize whole waves x heads; ties go to the larger block.
+        # One head per block only while it fits a single wave (see above).
+        best = None
+        for mh in range(1, PERSIST_MAXH + 1):
+            if mh == 1 and bh > aic_cores:
+                continue
+            nb = (bh + mh - 1) // mh
+            steps = -(-nb // aic_cores) * mh
+            if best is None or steps <= best[0]:
+                best = (steps, mh)
+        maxh = best[1]
         want = int(os.environ.get("KDA_PERSIST_LOOP_BLOCKS", "0"))
         nblk = want if 0 < want <= bh else (bh if bh <= aic_cores
                                            else (bh + maxh - 1) // maxh)
-        nblk = max(nblk, (bh + maxh - 1) // maxh)
+        # The stride map is total as long as ceil(bh / nblk) fits the array
+        # cap *PERSIST_MAXH*, not the heads the picker chose - so a `want`
+        # below the picked heads-per-block stays legal (that is how the
+        # KDA_PERSIST_LOOP_BLOCKS probe arm reproduces the 24 x 4 shape).
+        nblk = max(nblk, (bh + PERSIST_MAXH - 1) // PERSIST_MAXH)
         s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
         # The fused loop publishes the bf16 state into one slot it overwrites
         # every chunk; the split's state kernel publishes the same bytes into a

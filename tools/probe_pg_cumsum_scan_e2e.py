@@ -44,13 +44,17 @@ PROBE = "kda_pg_addwork_probe"
 EVENTS = __import__("os").environ.get("KDA_PG_E2E_EVENTS", "1") == "1"
 # arms as name:addWork:ablate; the ablation bits are documented in
 # k1_pg_addwork_probe.cpp (1 = gate cumsum, 2 = sigmoid pass loop, 4 =
-# post_gram, 8 = blocked scan).  Ablated arms are wrong by construction and
-# are timing-only *controls* for the wall's sensitivity floor: if deleting
-# 0.3-0.6 ms of device work from pre_gram does not move the e2e wall either,
-# then the 0.1 ms scan never had a wall to move.
+# post_gram, 8 = *serial* cumsum, the pre-11.56 form; the default is the
+# blocked scan that shipped in 11.56).  Ablated arms are wrong by
+# construction and are timing-only *controls* for the wall's sensitivity
+# floor: if deleting 0.3-0.6 ms of device work from pre_gram does not move
+# the e2e wall either, then the 0.1 ms scan never had a wall to move.
+# NOTE (round 2, docs 11.58): the probe grew two more trailing ints and the
+# bit-8 meaning flipped when the scan became production - the arms below
+# carry the mapping for both tools.
 ARMS = [tuple(a.split(":")) for a in
         __import__("os").environ.get(
-            "KDA_PG_E2E_ARMS", "serial:0:0,scan:0:8").split(",")]
+            "KDA_PG_E2E_ARMS", "serial:0:8,scan:0:0").split(",")]
 ARMS = [(n, int(a), int(b)) for n, a, b in ARMS]
 
 
@@ -110,7 +114,7 @@ def main() -> None:
                     cur = torch.npu.current_stream()
                     ev0.record(cur)
                 api.launch_argsarray_engine(PROBE, int(blocks), stream,
-                                            list(ksargs) + [api._i(add), api._i(abl)], 0)
+                                            list(ksargs) + [api._i(add), api._i(abl), api._i(0), api._i(0)], 0)
                 if EVENTS:
                     ev1.record(cur)
                     pg_ev["pg"] = (ev0, ev1)

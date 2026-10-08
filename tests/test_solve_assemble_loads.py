@@ -9,8 +9,9 @@ answer was bit-identical outputs and -0.178 ms on the stage; this file pins the
 wiring that makes the arm real:
 
 * ``api.asm_load_mode()`` reads ``KDA_ASM_LOADS`` per call (not frozen at
-  import), so one process can round-robin the two arms, and production is the
-  batched path (1) rather than whatever happens to be in the environment;
+  import), so one process can round-robin the arms, and production is mode 5
+  (window fill + batched store, section 11.61) rather than whatever happens to
+  be in the environment;
 * ``kda_solve_assemble`` carries the mode in its *last* argument slot - a mode
   in the wrong slot is read as the chunk count, and that failure is silent (a
   different A_inv, no exception);
@@ -19,8 +20,11 @@ wiring that makes the arm real:
 The same file also pins section 11.50's arm: mode 4 is mode 2 with the
 whole-window Xb fill (both passes' Xb operands in one ND2NZ call, so the block
 sends two MTE2 calls instead of 1 + nch + 2); it has to stay bit-identical and
-keep P on chip like mode 2, and modes 3 and 4 must stay separate knobs (the
-batched store is not a window property).
+keep P on chip like mode 2.  Modes 3 (batched store) and 4 (window fill) were
+separate knobs while the wide half was the wall; section 11.61 re-measured
+both in the AIC-limited regime (each a win) and composed them as mode 5 =
+window fill + batched store, which has to stay bit-identical too - and 5 is
+now production.
 
 Timings belong to the probe; this is the wiring.
 """
@@ -116,15 +120,20 @@ class _LaunchSpy:
         return out
 
 
-def test_production_is_the_batched_path(inputs):
-    """KDA_ASM_LOADS unset -> mode 2, on every slice, in the last slot."""
+def test_production_is_mode_5(inputs):
+    """KDA_ASM_LOADS unset -> mode 5, on every slice, in the last slot.
+
+    Mode 5 is section 11.61's composition (window fill + batched store); the
+    default moved there from 2 once the wide half stopped being the wall and
+    the AIC half's two stored knobs were re-measured as wins.
+    """
     os.environ.pop("KDA_ASM_LOADS", None)
-    assert api.asm_load_mode() == 2
+    assert api.asm_load_mode() == 5
     with _LaunchSpy() as spy:
         _call(inputs)
     trailers = spy.trailers()
     for n, mode in trailers:
-        assert mode == 2, "production is not the batched, P-on-chip path"
+        assert mode == 5, "production is not mode 5 on every slice"
     c_solve = -(-(B * H * (T // api.CHUNK)) // api.SOLVE_WIDE_NCH) * api.SOLVE_WIDE_NCH
     assert sum(n for n, _ in trailers) == c_solve, trailers
     torch.npu.synchronize()
@@ -135,15 +144,21 @@ def test_the_mode_is_read_per_call_not_frozen(inputs):
 
     Both arms have to reach *every* slice: a mode that only made the first
     launch would time a half-converted stage.
+    The test shape (128 chunks) is smaller than one AIV wave, so the default
+    whole-wave slice policy (docs 11.59) makes it a single slice; a fixed
+    32-chunk slice size (KDA_SOLVE_SLICE_CHUNKS) forces the multi-slice shape
+    this test exists to cover.
     """
-    for mode in (0, 2, 4, 1, 0):
+    for mode in (0, 2, 4, 5, 1, 0):
         os.environ["KDA_ASM_LOADS"] = str(mode)
+        os.environ["KDA_SOLVE_SLICE_CHUNKS"] = "32"
         try:
             assert api.asm_load_mode() == mode
             with _LaunchSpy() as spy:
                 _call(inputs)
         finally:
             os.environ.pop("KDA_ASM_LOADS", None)
+            os.environ.pop("KDA_SOLVE_SLICE_CHUNKS", None)
         trailers = spy.trailers()
         assert [t[1] for t in trailers] == [mode] * len(trailers), trailers
         assert len(trailers) >= 2, "the shape did not exercise more than one slice"
@@ -151,16 +166,17 @@ def test_the_mode_is_read_per_call_not_frozen(inputs):
 
 
 def test_mode_3_is_the_batched_store_arm(inputs):
-    """Section 11.42's ndNum store: not production, but bit-exact and wired.
+    """Section 11.42's ndNum store: kept as an arm, bit-exact and wired.
 
     The batched A16 store (one ndNum call for the block's four lower-left
     blocks, srcNdStride = 4 in 1 KB fractal units) is measured in
     tools/probe_fixpipe_shape.py and tools/probe_solve_assemble_loads.py: it
-    wins 0.10 ms isolated and loses on the stage/e2e (the batched store is a
-    serial tail after pass 1 and the AIC half is already under the AIV half),
-    so production stays at mode 2.  This pins that it is reachable, that it
-    still is mode 2's structure (P on chip -> no P tile), and that it lands
-    the same numbers as mode 2.
+    won 0.10 ms isolated but lost on the stage/e2e while the AIV half was the
+    wall (the batched store is a serial tail after pass 1); once section 11.59
+    made the AIC half the floor, section 11.61 re-measured it as -0.071 wall
+    and it is half of production mode 5.  This pins that the bare arm is
+    reachable, that it still is mode 2's structure (P on chip -> no P tile),
+    and that it lands the same numbers as mode 2.
     """
     os.environ["KDA_ASM_LOADS"] = "3"
     try:
@@ -183,7 +199,8 @@ def test_mode_2_leaves_the_p_tile_unallocated(inputs):
     L1), so allocating it would be dead memory.  Modes 0 and 1 do use it, which
     is why this is a property of the mode and not of the call site.
     """
-    for mode, expect_null in ((2, True), (4, True), (1, False), (0, False)):
+    for mode, expect_null in ((2, True), (4, True), (5, True), (1, False),
+                              (0, False)):
         os.environ["KDA_ASM_LOADS"] = str(mode)
         try:
             with _LaunchSpy() as spy:
@@ -204,7 +221,7 @@ def test_mode_2_leaves_the_p_tile_unallocated(inputs):
 def test_the_arms_agree_bit_for_bit(inputs):
     """The knob's whole justification: same operands, same outputs."""
     outs = []
-    for mode in (0, 1, 2, 3, 4):
+    for mode in (0, 1, 2, 3, 4, 5):
         os.environ["KDA_ASM_LOADS"] = str(mode)
         try:
             out, state = _call(inputs)
@@ -212,6 +229,6 @@ def test_the_arms_agree_bit_for_bit(inputs):
             os.environ.pop("KDA_ASM_LOADS", None)
         torch.npu.synchronize()
         outs.append((out.clone(), state.clone()))
-    for i, mode in enumerate((1, 2, 3, 4), start=1):
+    for i, mode in enumerate((1, 2, 3, 4, 5), start=1):
         assert torch.equal(outs[0][0], outs[i][0]), "mode %d differs" % mode
         assert torch.equal(outs[0][1], outs[i][1]), "mode %d's state differs" % mode

@@ -202,7 +202,11 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
     // Mode 3 is the batched store; mode 4 keeps the per-chunk store (section
     // 11.42 measured the batching as a stage loss, and the whole-window fill is
     // orthogonal), so the two knobs do not compose.
-    const bool batched_store = (loadMode == 3) && CAN_BATCH_STORE;
+    // Mode 3 (batched store) and mode 4 (whole-window fill) were measured as
+    // separate lines before the AIC half became the wall; docs section 11.61
+    // re-measured both in that regime (each is a real win now) and composes
+    // them as mode 5 = window fill + batched store.
+    const bool batched_store = (loadMode == 3 || loadMode == 5) && CAN_BATCH_STORE;
     const bool window = (loadMode >= 4);
     TPipe pipe;
     TEventID e21 = pipe.AllocEventID<HardEvent::MTE2_MTE1>();
@@ -297,7 +301,22 @@ extern "C" __global__ __aicore__ void kda_solve_assemble(
                         (pass == 0) ? lxAll[ch * 2 * MM] : lpAll;
                     assemble_chunk(pass, pass * NC + ch, true, true, la, lb,
                                    lpAll, a8, b8, cfall, P, A16, c0, ch, e1m,
-                                   emf, false);
+                                   emf, batched_store);
+                }
+                if (pass == 1 && batched_store) {
+                    // Mode 5: the window fill and the batched store composed
+                    // (docs 11.61).  Same nd call as mode 3's - here the
+                    // pass-1 slots are one region too (slot = pass * NC + ch)
+                    // and every Mmad is already M_FIX-confirmed by its
+                    // chunk's wait.
+                    auto ipb = FixpipeParamsV220(
+                        M, M, M, PC, false, QuantMode_t::F322BF16, 0,
+                        static_cast<uint16_t>(nch),
+                        static_cast<uint16_t>(MM / 256),
+                        static_cast<uint16_t>(PC * PC), 0);
+                    Fixpipe<bfloat16_t, float, CFG_ROW_MAJOR>(
+                        A16[static_cast<uint64_t>(c0) * PC * PC + M * PC],
+                        cfall[NC * MM], ipb);
                 }
                 PipeBarrier<PIPE_ALL>();
                 continue;

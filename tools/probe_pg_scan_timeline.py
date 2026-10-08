@@ -37,7 +37,9 @@ B, T, H = 1, 8192, 96
 REPS = int(os.environ.get("KDA_PG_TL_REPS", "8"))
 DO_ARMS = os.environ.get("KDA_PG_TL_ARMS", "1") == "1"
 PROBE = "kda_pg_addwork_probe"
-ARMS = [("serial", 0, 0), ("scan", 0, 8)]
+# Round 2 (docs 11.58): the probe default is now the production blocked
+# scan and bit 8 selects the pre-11.56 serial form.
+ARMS = [("serial", 0, 8), ("scan", 0, 0)]
 
 
 def stream_map():
@@ -61,7 +63,7 @@ def run_call(q, k, v, g, beta, kw, arm=None):
         ev0.record(obj)
         if kernel == "kda_pre_gram_mix" and arm is not None:
             api.launch_argsarray_engine(PROBE, int(blocks), stream,
-                                        list(args) + [api._i(arm[0]), api._i(arm[1])], 0)
+                                        list(args) + [api._i(arm[0]), api._i(arm[1]), api._i(0), api._i(0)], 0)
         else:
             orig(kernel, blocks, args, stream)
         ev1.record(obj)
