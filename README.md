@@ -36,16 +36,31 @@ chunk steps and its per-chunk cost does not fall with the tile).
 
 ## Build
 
+One-shot: builds the launcher, then precompiles all five kernels at the
+production `KDA_CHUNK=64` (prints `RTC_ALL_OK`):
+
+```bash
+./build.sh
+```
+
+`build.sh` is a thin wrapper around the two steps below; `--launcher-only`
+runs just the launcher (needs no NPU) and `--kernels-only` just the
+precompile (the launcher must already exist).
+
 ```bash
 # 1. Launcher: aclrtLaunchKernel wrapper + the RTC kernel compiler.
 LAUNCHER_NAME=kda_ascendc_v1_launcher bash aclab/launcher/build_launcher.sh
 #   -> build/S02_clean/torch_extensions/kda_ascendc_v1_launcher
 
-# 2. Optional: precompile every kernel before first use (prints RTC_ALL_OK).
+# 2. Precompile every kernel before first use.
 python3 tools/compile_all_server.py
 ```
 
-Kernels are compiled at first call if step 2 is skipped (a few minutes).
+Build knobs (env): `KDA_CHUNK` (default 64; 16/32 also supported), `PY`
+(default `python3`), and `ASCEND_RT_VISIBLE_DEVICES` for the precompile step
+(it opens in-process device 0, so `ASCEND_RT_VISIBLE_DEVICES=3 ./build.sh`
+precompiles on physical device 3). Kernels are compiled at first call if the
+precompile step is skipped (a few minutes).
 
 ## Run
 
@@ -105,6 +120,7 @@ Configuration knobs (env, read per build/call): `KDA_CHUNK`,
 ```
 README.md
 LICENSE
+build.sh                           # one-shot build: launcher + kernel precompile
 aclab/launcher/build_launcher.sh   # builds the torch-extension launcher
 aclab/launcher/launcher.cpp        # aclrtLaunchKernel + rtc_compile (pybind11)
 kernels/v1/k1_pre_gram_mix.cpp     # stage 1: fused preprocess + Gram
