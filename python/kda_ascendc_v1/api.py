@@ -1,4 +1,4 @@
-"""S07 separated AscendC device closure for KDA v1."""
+"""AscendC (RTC-compiled) KDA v1 forward."""
 from __future__ import annotations
 
 import math
@@ -55,12 +55,10 @@ SOLVE_WIDE_NCHUNK = (int(os.environ.get("KDA_SOLVE_WIDE_NCHUNK", "0"))
                      or (32 if CHUNK <= 16 else (16 if CHUNK <= 32 else 12)))
 # Two-level solve (R1): the wide kernel runs the row recursion on M = CHUNK/SB
 # sub-blocks and the assemble kernel forms the coupling block on the Cube, so
-# the substitution's M^3/2 vector lanes per chunk drop with SB^2 (64 -> 16 -> 4
-# kLane for SB = 1/2/4).  SB = 2 needs M >= 16 for the 16-row fractal copies
-# of the assemble kernel, i.e. CHUNK >= 32; the 64-wide chunk is the one the
-# e2e spends its time in, so it is the one that gets the two-level path.
-SOLVE_WIDE_SUBB = (int(os.environ.get("KDA_SOLVE_WIDE_SUBB", "0"))
-                   or (2 if CHUNK >= 64 else 1))
+# the substitution's M^3/2 vector lanes per chunk drop with SB^2.  SB = 2
+# needs M >= 16 for the 16-row fractal copies of the assemble kernel, so the
+# C = 64 build is the one that gets the two-level path.
+SOLVE_WIDE_SUBB = 2 if CHUNK >= 64 else 1
 # Chunks one wide block solves (the wide kernel's tile runs over sub-blocks x
 # chunks, see its header): SB sub-blocks of every chunk share one tile.
 SOLVE_WIDE_NCH = SOLVE_WIDE_NCHUNK // SOLVE_WIDE_SUBB
@@ -127,43 +125,15 @@ SOLVE_SLICE_TARGET = int(os.environ.get("KDA_SOLVE_SLICE_TARGET", "20"))
 PERSIST_MAXH = max(1, min(4 if CHUNK <= 64 else 2,
                           int(os.environ.get("KDA_PERSIST_LOOP_MAXH", "0"))
                           or (4 if CHUNK <= 64 else 2)))
-KGT_NCHUNK = 8
 WU_NCHUNK = int(os.environ.get("KDA_WU_NCHUNK", "0")) or (4 if CHUNK <= 32 else 2)
 D = 128
 BV = 64
 NV = 2
-# The K2 recurrence has exactly one implementation that is part of the API:
-# the device-side chunk loop walks KDA_CHUNK rows at a time, so it is the only
-# one that follows the build (kernels/v1/k2_persistent_loop.cpp).  Every other
-# mode in this file is a checkpoint of the S12-S15 experiments and carries the
-# 16-row tile as a literal (``constexpr int32_t M = 16`` in k2_d12.cpp,
-# k2_vnew.cpp, k2_d34.cpp, k2_outstate*.cpp, the k2_mix_* trio and the two
-# persistent_scan kernels): they *are* the C=16 implementation, so at any
-# other chunk size they would read 16 rows of a CHUNK-row chunk and return a
-# plausible-looking wrong answer - which is how a C=64 build once got a
-# "1.45 ms" number that was really the C=16 kernel.  They stay reachable for
-# benchmarking through kda_ascendc_v1.experimental, and the C=16 check is
-# enforced centrally in _kda_fwd_impl so no caller can bypass it.
+# The K2 recurrence has exactly one implementation: the device-side chunk
+# loop walks KDA_CHUNK rows at a time and follows the build
+# (kernels/v1/k2_persistent_loop.cpp).
 PERSISTENT_LOOP = "persistent_loop"
-# Route 1 of the 2026-09-22 redesign (docs/PREFILL_LIFECYCLE_REFACTOR_20260922.md
-# section 4.1): the serial state chain (kda_k2_state_loop) and the output
-# (kda_k2_out_parallel) as two kernels.  Only Z and the state gate the next
-# chunk, so the output of every chunk is computable in parallel from the
-# chunk-entry state the state kernel publishes; the pair is a candidate only
-# if its *total* beats the fused loop (tools/probe_state_out_split.py).  It is
-# not in C16_ONLY_K2_MODES: both kernels are KDA_CHUNK-generic, exactly like
-# the loop they were split out of.
-SPLIT_STATE_OUT = "split_state_out"
-C16_ONLY_K2_MODES = frozenset({
-    "separated", "cube_separated", "cube_d3_separated", "cube_full_d4",
-    "mix_aic_1_2", "mix_d12_vnew", "persistent", "persistent_scan",
-    "persistent_scan_cube", "triton_aiv",
-})
-K2_MODES = frozenset(C16_ONLY_K2_MODES | {PERSISTENT_LOOP, SPLIT_STATE_OUT})
 _COMPILED = False
-_PERSISTENT_COMPILED = False
-_PERSISTENT_SCAN_COMPILED = False
-_TRITON_AIV_COMPILED = False
 _LAST_PROFILE: dict[str, object] = {}
 # Triangular 0/1 masks for the intra-chunk Gram kernel, built once per device.
 _GRAM_MASKS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -393,43 +363,6 @@ def asm_load_mode() -> int:
     return int(os.environ.get("KDA_ASM_LOADS", "5"))
 
 
-def asm4_store_mode() -> int:
-    """Store shape for the SB = 4 coupling kernel (kda_solve_assemble4).
-
-    0 is the grouped form: the six coupling blocks leave L0C through three
-    fixpipe calls per chunk (ndNum = 3 / 2 / 1 for the 1-below-diagonal trio,
-    the 2-below pair and X30), copying the ND layout section 11.52 asked for.
-    1 is the per-piece fallback (six 16-row calls), 2 drops the stores (an
-    ablation - the tile is left half-written and the solve is wrong by
-    construction).  Read per call so a probe can flip it between arms.
-    """
-    return int(os.environ.get("KDA_ASM4_STORE", "0"))
-
-
-def asm4_ablate() -> int:
-    """Instruction-group ablation mask for kda_solve_assemble4 (fault bisect).
-
-    Bit 0 skips the Nd2Nz fills, 1 the L0C -> L1 NZ fixpipe, 2 the L0A loads,
-    3 the L0B (transposed) loads, 4 the Mmads and 5/6/7 the three RM stores
-    (the level-1 trio, the level-3 pair, the level-5 X30); the sync events are
-    emitted either way, so an ablated launch is a legal program with the same
-    pipe structure.  Debug knob - a faulting arm names the instruction group that
-    cannot run, not a production configuration.  Read per call.
-    """
-    return int(os.environ.get("KDA_ASM4_ABLATE", "0"))
-
-
-def asm4_level() -> int:
-    """Bisect knob for kda_solve_assemble4: run levels 1..6 of the substitution.
-
-    Level N runs the coupling blocks whose dependency depth is < N (the kernel
-    body is split into six guarded sections, one per level).  Debug only: the
-    guards leave the deeper levels' events unset, which is a legal (if useless)
-    program, so a fault names a level rather than a configuration.
-    """
-    return int(os.environ.get("KDA_ASM4_LEVEL", "6"))
-
-
 def cube_a16_resident() -> int:
     """A16 residency for the solve's Cube kernel (kda_solve_wu_cube_kernel).
 
@@ -480,7 +413,7 @@ def pre_raw_mode() -> int:
 
 def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, eye,
                             a32, a16, xb, lneg, pmid, rk, rv, W, U, stream,
-                            debug_stores, subb=2) -> None:
+                            debug_stores) -> None:
     """R1 two-level solve: wide kernel (AIV), then assemble + Cube (AIC).
 
     The substitution runs on M = CHUNK/SB sub-blocks (k1_solve_wu_wide.cpp) and
@@ -548,19 +481,10 @@ def _launch_solve_two_level(c_solve, c, nch, asm_nchunk, wu_nchunk, overlap, L, 
         lo, n = glo * unit, (ghi - glo) * unit
         wargs = _pack_ptrs([L[lo:], eye, a32[lo:], a16[lo:], xb[lo:],
                             lneg[lo:]]) + [_i(n), _i(a16_mode()), _i(1 if debug_stores else 0)]
-        if subb == 4:
-            # The SB = 4 coupling kernel does all six blocks on chip out of one
-            # Lneg bundle per chunk (k1_solve_assemble4.cpp): no P tile, and the
-            # load mode is a store-shape knob instead (KDA_ASM4_STORE).
-            asm_name = "kda_solve_assemble4"
-            aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:]]) + \
-                [_i(n), _i(asm4_store_mode()), _i(asm4_ablate()),
-                 _i(asm4_level())]
-        else:
-            asm_name = "kda_solve_assemble"
-            aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:],
-                                None if pmid is None else pmid[lo:]]) + \
-                [_i(n), _i(asm_load_mode())]
+        asm_name = "kda_solve_assemble"
+        aargs = _pack_ptrs([a16[lo:], xb[lo:], lneg[lo:],
+                            None if pmid is None else pmid[lo:]]) + \
+            [_i(n), _i(asm_load_mode())]
         cargs = _pack_ptrs([a16[lo:], rk[lo:], rv[lo:], W[lo:], U[lo:]]) + \
             [_i(n), _i(cube_a16_resident()), _i(cube_load_mode())]
         ncube = min(n, c - lo)
@@ -638,7 +562,7 @@ def _rtc(rel: str, name: str) -> None:
     ``#include`` is not a warning here but a hard compile error
     (``unexpected character <U+FEFF>``, followed by every type name in the
     file turning unknown), and it is invisible in an editor - a BOM once made
-    ``k2_persistent_scan.cpp`` uncompilable with no trace of why.  Reading it
+    one of the kernels uncompilable with no trace of why.  Reading it
     away in the one place every compile goes through keeps that from coming
     back through any of the kernels.
     """
@@ -647,32 +571,11 @@ def _rtc(rel: str, name: str) -> None:
 
 
 _SOURCES: list[tuple[str, str]] = [
-    ("kernels/v1/preprocess.cpp", "kda_preprocess_kernel"),
-    ("kernels/v1/k1_gram.cpp", "kda_gram_kernel"),
-    ("kernels/v1/k1_pre_gram.cpp", "kda_pre_gram_kernel"),
     ("kernels/v1/k1_pre_gram_mix.cpp", "kda_pre_gram_mix"),
-    ("kernels/v1/k1_solve_wu.cpp", "kda_solve_wu_kernel"),
     ("kernels/v1/k1_solve_wu_wide.cpp", "kda_solve_wu_wide"),
     ("kernels/v1/k1_solve_assemble.cpp", "kda_solve_assemble"),
-    ("kernels/v1/k1_solve_assemble4.cpp", "kda_solve_assemble4"),
     ("kernels/v1/k1_solve_wu_cube.cpp", "kda_solve_wu_cube_kernel"),
-    ("kernels/v1/k2_init.cpp", "kda_k2_init_kernel"),
-    ("kernels/v1/k2_d12.cpp", "kda_k2_d12_kernel"),
-    ("kernels/v1/k2_d12_cube.cpp", "kda_k2_d12_cube_kernel"),
-    ("kernels/v1/k2_vnew.cpp", "kda_k2_vnew_kernel"),
-    ("kernels/v1/k2_d34.cpp", "kda_k2_d34_kernel"),
-    ("kernels/v1/k2_d3_cube_bv64.cpp", "kda_k2_d3_cube_bv64"),
-    ("kernels/v1/k2_d4_only.cpp", "kda_k2_d4_only_kernel"),
-    ("kernels/v1/k2_kg_transpose.cpp", "kda_kg_transpose"),
-    ("kernels/v1/k2_d4_full.cpp", "kda_k2_d4_full"),
-    ("kernels/v1/k2_mix_d4_outstate.cpp", "kda_k2_mix_d4_outstate"),
-    ("kernels/v1/k2_mix_d12_vnew.cpp", "kda_k2_mix_d12_vnew"),
-    ("kernels/v1/k2_mix_all_cube.cpp", "kda_k2_mix_all_cube"),
     ("kernels/v1/k2_persistent_loop.cpp", "kda_k2_persistent_loop"),
-    ("kernels/v1/k2_state_loop.cpp", "kda_k2_state_loop"),
-    ("kernels/v1/k2_out_parallel.cpp", "kda_k2_out_parallel"),
-    ("kernels/v1/k2_outstate_full.cpp", "kda_k2_outstate_full_kernel"),
-    ("kernels/v1/k2_outstate.cpp", "kda_k2_outstate_kernel"),
 ]
 
 
@@ -684,28 +587,6 @@ def _compile_all() -> None:
         _rtc(rel, name)
     _COMPILED = True
 
-
-def _compile_persistent() -> None:
-    global _PERSISTENT_COMPILED
-    if _PERSISTENT_COMPILED:
-        return
-    _rtc("kernels/v1/k2_persistent.cpp", "kda_k2_persistent_kernel")
-    _PERSISTENT_COMPILED = True
-
-
-def _compile_persistent_scan() -> None:
-    global _PERSISTENT_SCAN_COMPILED
-    if _PERSISTENT_SCAN_COMPILED:
-        return
-    _rtc("kernels/v1/k2_persistent_scan.cpp", "kda_k2_persistent_scan_kernel")
-    _PERSISTENT_SCAN_COMPILED = True
-
-def _compile_triton_aiv() -> None:
-    global _TRITON_AIV_COMPILED
-    if _TRITON_AIV_COMPILED:
-        return
-    _rtc("kernels/v1/k2_triton_aiv.cpp", "kda_k2_triton_aiv")
-    _TRITON_AIV_COMPILED = True
 
 def _tri_masks(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     masks = _GRAM_MASKS.get(device)
@@ -780,23 +661,13 @@ def kda_bt16_fwd_ascendc(
 
     ``k2_mode`` names the K2 (state recurrence) implementation and defaults to
     ``"persistent_loop"``: one MIX launch runs the whole chunk loop and keeps
-    the fp32 state in UB, and it is the only implementation that follows the
-    build's ``KDA_CHUNK``.  The historical per-chunk modes are C=16-only
-    kernels; they are reachable through ``kda_ascendc_v1.experimental`` and
-    are rejected here so that a caller cannot silently run one at another
-    chunk size.
+    the fp32 state in UB; it is the implementation this release ships.
     """
     if k2_mode is None:
         k2_mode = PERSISTENT_LOOP
     if k2_mode != PERSISTENT_LOOP:
-        if k2_mode in C16_ONLY_K2_MODES:
-            raise ValueError(
-                "k2_mode=%r is an experimental C=16-only kernel; the public "
-                "API serves %r only (use "
-                "kda_ascendc_v1.experimental.kda_bt16_fwd_ascendc_experimental "
-                "to benchmark the historical modes)" % (k2_mode, PERSISTENT_LOOP))
-        raise ValueError("unsupported k2_mode %r (choose from %s)"
-                         % (k2_mode, ", ".join(sorted(K2_MODES))))
+        raise ValueError("unsupported k2_mode %r (only %r)"
+                         % (k2_mode, PERSISTENT_LOOP))
     return _kda_fwd_impl(
         q, k, v, g, beta, scale=scale, initial_state=initial_state,
         output_final_state=output_final_state, A_log=A_log, bias=bias,
@@ -821,22 +692,17 @@ def _kda_fwd_impl(
     k2_mode: str = PERSISTENT_LOOP,
 ):
     """The one implementation both entry points call; ``k2_mode`` is validated.
-
-    The public wrapper only lets ``persistent_loop`` through; this is where the
-    remaining modes are checked against the build, because the C=16-only
-    kernels would otherwise silently compute a 16-row answer.
     """
     # Builds outside the validated set are refused before anything is compiled
     # or launched: a silently wrong answer is the one failure mode this package
-    # cannot afford (see C16_ONLY_K2_MODES for the other half of the same rule).
+    # cannot afford.
     if CHUNK not in SUPPORTED_CHUNKS and os.environ.get(
             "KDA_ALLOW_UNSUPPORTED_CHUNK", "0") != "1":
         raise ValueError(
             "KDA_CHUNK=%d is an unsupported build: the kernels do follow the "
             "chunk size (M = KDA_CHUNK, and stage 3 contracts over K = M), but "
-            "only the sizes in api.SUPPORTED_CHUNKS (16, 32, 64) are gated by "
-            "the CHUNK x shape correctness matrix in "
-            "tests/test_chunk_shape_matrix.py.  Anything else is unchecked, and "
+            "only the sizes in api.SUPPORTED_CHUNKS (16, 32, 64) are "
+            "supported.  Anything else is unchecked, and "
             "a tile that is wrong for its chunk size is a silently wrong answer "
             "here (or a kernel-side aivec error), never a host-side report - "
             "C=128, for instance, sizes its L0C queue and its L0A allocation to "
@@ -858,14 +724,9 @@ def _kda_fwd_impl(
             torch.npu.synchronize()
             prof[name] = (time.perf_counter() - prof[start_name]) * 1e3
     b, t, h = _check_inputs(q, k, v, g, beta, A_log, bias, initial_state)
-    if k2_mode not in K2_MODES:
-        raise ValueError("unsupported k2_mode %r" % (k2_mode,))
-    if k2_mode in C16_ONLY_K2_MODES and CHUNK != 16:
-        raise ValueError(
-            "k2_mode=%r is a C=16 implementation (M = 16 is a literal in its "
-            "kernels) but this build has KDA_CHUNK=%d: it would solve 16 rows "
-            "of every %d-row chunk.  Rebuild with KDA_CHUNK=16 or use %r."
-            % (k2_mode, CHUNK, CHUNK, PERSISTENT_LOOP))
+    if k2_mode != PERSISTENT_LOOP:
+        raise ValueError("unsupported k2_mode %r (only %r)"
+                         % (k2_mode, PERSISTENT_LOOP))
     if scale is None:
         scale = D ** -0.5
     nt = t // CHUNK
@@ -957,37 +818,29 @@ def _kda_fwd_impl(
     pre_unroll = (int(os.environ.get("KDA_PRE_UNROLL", "0"))
                   or _pre_gram_unroll(c, _aic_core_count(q.device)))
     mark("pre_gram_start")
-    if os.environ.get("KDA_PRE_GRAM", "mix") == "aiv":
-        # The vector-only experiment path has no debugStores flag: it keeps
-        # writing its Aqk32/BetaOut tiles, exactly as before this change.
-        pre_args = _pack_ptrs(pre_head + pre_tail)
-        pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
-                     _i(qk_row_bytes), _i(g_row_bytes)]
-        _launch("kda_pre_gram_kernel", (c + pre_unroll - 1) // pre_unroll, pre_args, stream)
-    else:
-        # The two intra-chunk Grams run on the paired Cube: the AIVs publish
-        # ga/gk1/gb in bf16 (12 KB per chunk) and the AIC does both 16x16x128
-        # Mmads per step.  The Gram half is 1.05 ms of the vector-only block's
-        # 2.21 ms and the vector pipe is the bottleneck of the whole stage, so
-        # the Cube's work is hidden behind the AIV's remaining ~3.3 us per chunk
-        # (see kernels/v1/k1_pre_gram_mix.cpp).
-        gram_ops = torch.empty((3, c, CHUNK, D), dtype=torch.bfloat16, device=q.device)
-        # The cross-band k side of the (1, 0) Gram block: a CHUNK = 64 gate
-        # needs one decay reference per 32-row band, and the Gram block that
-        # spans two bands is served by a second copy of band 0's k rows
-        # published under band 1's centre (the kernel note).  A single-band
-        # chunk writes no tile here, so CHUNK <= 32 keeps a one-row stand-in.
-        gram_x = torch.empty((c, max(1, CHUNK // 2), D), dtype=torch.bfloat16,
-                             device=q.device)
-        pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
-                              + pre_tail)
-        pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
-                     _i(qk_row_bytes), _i(g_row_bytes), _i(pre_raw_mode()),
-                     _i(1 if keep_debug else 0)]
-        # One MIX block pairs an AIC with two AIV subcores, so it covers
-        # 2 * pre_unroll chunks.
-        _launch("kda_pre_gram_mix", (c + 2 * pre_unroll - 1) // (2 * pre_unroll),
-                pre_args, stream)
+    # The two intra-chunk Grams run on the paired Cube: the AIVs publish
+    # ga/gk1/gb in bf16 (12 KB per chunk) and the AIC does both 16x16x128
+    # Mmads per step.  The Gram half is 1.05 ms of the vector-only block's
+    # 2.21 ms and the vector pipe is the bottleneck of the whole stage, so
+    # the Cube's work is hidden behind the AIV's remaining ~3.3 us per chunk
+    # (see kernels/v1/k1_pre_gram_mix.cpp).
+    gram_ops = torch.empty((3, c, CHUNK, D), dtype=torch.bfloat16, device=q.device)
+    # The cross-band k side of the (1, 0) Gram block: a CHUNK = 64 gate
+    # needs one decay reference per 32-row band, and the Gram block that
+    # spans two bands is served by a second copy of band 0's k rows
+    # published under band 1's centre (the kernel note).  A single-band
+    # chunk writes no tile here, so CHUNK <= 32 keeps a one-row stand-in.
+    gram_x = torch.empty((c, max(1, CHUNK // 2), D), dtype=torch.bfloat16,
+                         device=q.device)
+    pre_args = _pack_ptrs(pre_head + [gram_ops[0], gram_ops[1], gram_ops[2], gram_x]
+                          + pre_tail)
+    pre_args += [_i(b), _i(t), _i(h), _f(lower_bound), _f(scale), _i(pre_unroll),
+                 _i(qk_row_bytes), _i(g_row_bytes), _i(pre_raw_mode()),
+                 _i(1 if keep_debug else 0)]
+    # One MIX block pairs an AIC with two AIV subcores, so it covers
+    # 2 * pre_unroll chunks.
+    _launch("kda_pre_gram_mix", (c + 2 * pre_unroll - 1) // (2 * pre_unroll),
+            pre_args, stream)
     finish("pre_gram_ms", "pre_gram_start")
 
     a32 = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
@@ -1003,11 +856,8 @@ def _kda_fwd_impl(
         sub = CHUNK // SOLVE_WIDE_SUBB
         bf16 = torch.bfloat16
         xb = torch.empty((c_solve, SOLVE_WIDE_SUBB, sub, sub), dtype=bf16, device=q.device)
-        # SB = 4 exports the six strictly-lower blocks of a chunk in one
-        # bundle (k1_solve_wu_wide.cpp, CE = 6 * M^2); the 32-level build
-        # exports the single lower-left block.
-        lneg = torch.empty((c_solve, (6 * sub * sub) if SOLVE_WIDE_SUBB == 4
-                            else sub * sub), dtype=bf16, device=q.device)
+        # The 32-level build exports the single lower-left coupling block.
+        lneg = torch.empty((c_solve, sub * sub), dtype=bf16, device=q.device)
         # Load mode 2 keeps P on chip (section 11.39), so its GM tile is
         # neither written nor read: the 25.17 MB allocation at [1,8192,96,128]
         # (24 MiB = 12288 chunks of [32, 32] bf16 - the 50.3 MB section 11.39
@@ -1022,8 +872,7 @@ def _kda_fwd_impl(
                                 _tri_eye(q.device, CHUNK // SOLVE_WIDE_SUBB),
                                 a32, a16,
                                 xb, lneg, pmid, rk, rv, W, U, stream,
-                                1 if keep_debug else 0,
-                                subb=SOLVE_WIDE_SUBB)
+                                1 if keep_debug else 0)
     else:
         # One AIV block solves SOLVE_WIDE_NCHUNK chunks with every vector
         # instruction (see the kernel header); the padded chunks are solved too
@@ -1041,56 +890,7 @@ def _kda_fwd_impl(
                 stream)
     finish("solve_ms", "solve_start")
 
-    # Historical name: ``persistent_scan_cube`` has always been served by the
-    # fused per-chunk Cube kernel, never by a single-kernel persistent loop.
-    if k2_mode == "persistent_scan_cube":
-        k2_mode = "mix_all_cube"
-
-    if k2_mode == "triton_aiv":
-        _compile_triton_aiv()
-        out_task = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
-        h0 = None if initial_state is None else initial_state.view(bh, D, D)
-        htf = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device) if output_final_state else None
-        pargs = _pack_ptrs([W, qg, U, aqk16, kg, decay, h0, out_task, htf])
-        pargs += [_i(bh), _i(nt), _i(NV), _f(scale)]
-        mark("k2_start")
-        _launch("kda_k2_triton_aiv", tasks, pargs, stream)
-        finish("k2_ms", "k2_start")
-        out_public = out_task.view(b, h, NV, nt, CHUNK, BV).permute(0, 3, 4, 1, 2, 5).contiguous().view(b, t, h, D)
-        final_state = None if htf is None else htf.view(bh, NV, BV, D).reshape(b, h, D, D)
-        if profile:
-            prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
-            _LAST_PROFILE = prof
-        return out_public, final_state
-
-    if k2_mode in {"persistent", "persistent_scan"}:
-        if k2_mode == "persistent_scan":
-            _compile_persistent_scan()
-        else:
-            _compile_persistent()
-        out_task = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
-        h0 = None if initial_state is None else initial_state.view(bh, D, D)
-        htf = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device) if output_final_state else None
-        pargs = _pack_ptrs([W, qg, U, aqk16, kg, decay, h0, out_task, htf])
-        pargs += [_i(bh), _i(nt), _i(NV), _f(scale)]
-        mark("k2_start")
-        _launch("kda_k2_persistent_scan_kernel" if k2_mode == "persistent_scan" else "kda_k2_persistent_kernel", tasks, pargs, stream)
-        finish("k2_ms", "k2_start")
-        out_public = out_task.view(b, h, NV, nt, CHUNK, BV).permute(0, 3, 4, 1, 2, 5).contiguous().view(b, t, h, D)
-        final_state = None if htf is None else htf.view(bh, NV, BV, D).reshape(b, h, D, D)
-        if profile:
-            prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
-            _LAST_PROFILE = prof
-        if not return_intermediates:
-            return out_public, final_state
-        debug = {"Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
-                 "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
-                 "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
-                 "W": W, "U": U, "persistent": True}
-        return out_public, final_state, debug
-
-    if k2_mode in (PERSISTENT_LOOP, SPLIT_STATE_OUT):
-        split = k2_mode == SPLIT_STATE_OUT
+    if k2_mode == PERSISTENT_LOOP:
         # One device-side chunk loop.  Each block owns up to MAXH=4 heads (both
         # AIV subcores run the same flag sequence and split the value dim), keeps
         # its fp32 state in UB across all chunks and never writes S32 until the
@@ -1124,14 +924,8 @@ def _kda_fwd_impl(
         nblk = max(nblk, (bh + PERSIST_MAXH - 1) // PERSIST_MAXH)
         s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
         # The fused loop publishes the bf16 state into one slot it overwrites
-        # every chunk; the split's state kernel publishes the same bytes into a
-        # per-chunk slot, which is what the output kernel reads as H[c].  The
-        # 384 MiB snapshot is the split's whole extra allocation and the only
-        # reason its write side is free (see k2_state_loop.cpp).
-        s16 = (None if split else
-               torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device))
-        hsnap = (torch.empty((tasks, nt, BV, D), dtype=torch.bfloat16, device=q.device)
-                 if split else None)
+        # every chunk.
+        s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
         # d1/d2/d3 cross to the vector side as bf16 (the loop's fixpipe rounds
         # them), so they are allocated bf16 here as well: the loop indexes the
         # buffers in bf16 elements and an fp32 allocation silently half-filled
@@ -1158,36 +952,12 @@ def _kda_fwd_impl(
         h0 = None if initial_state is None else initial_state.view(bh, D, D)
         # kg goes to the loop in its public [c, CHUNK, D] layout: the AIC loads
         # it into L1 with Nd2Nz and transposes each 16x16 fractal on the way
-        # into L0B (LoadDataWithTranspose), which is what kg_t fed and what
-        # kda_kg_transpose built.  Dropping that launch saves its 0.16 ms of
-        # device time (and the 67 MB round trip) per pass.
+        # into L0B (LoadDataWithTranspose).
         mark("k2_start")
-        if split:
-            # Two launches, both on the caller's stream: the output kernel
-            # needs every chunk's H[c], and a device-side "chunk c is ready"
-            # hand-off between two launches is the Level 4 scheduler, not
-            # this candidate.  The pair's total is the number that decides.
-            mark("k2_state_start")
-            _launch("kda_k2_state_loop", nblk,
-                    _pack_ptrs([U, W, kg, decay, d1, d4f, hsnap,
-                                vnew, vnew_t, h0, s32]) +
-                    [_i(bh), _i(nt), _i(NV), _i(nblk), _i(h)], stream)
-            # Not "..._ms": total_ms sums every *_ms key, and these two are
-            # inside the k2_ms span.
-            finish("k2_state", "k2_state_start")
-            mark("k2_out_start")
-            # `d2`/`d3` are the same per-(task, chunk) bf16 slots the fused
-            # loop's fixpipes wrote, so the arithmetic (and the rounding
-            # positions) of out = d2*scale + d3 are unchanged.
-            _launch("kda_k2_out_parallel", nblk,
-                    _pack_ptrs([qg, aqk16, kg, d2, d3, hsnap, out_public, vnew_t]) +
-                    [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
-            finish("k2_out", "k2_out_start")
-        else:
-            _launch("kda_k2_persistent_loop", nblk,
-                    _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
-                                out_public, vnew, vnew_t, h0, s32, s16]) +
-                    [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
+        _launch("kda_k2_persistent_loop", nblk,
+                _pack_ptrs([U, W, qg, aqk16, kg, decay, d1, d2, d3, d4f,
+                            out_public, vnew, vnew_t, h0, s32, s16]) +
+                [_i(bh), _i(nt), _i(NV), _i(nblk), _f(scale), _i(h)], stream)
         finish("k2_ms", "k2_start")
         final_state = None if not output_final_state else s32.view(bh, NV, BV, D).reshape(b, h, D, D)
         if profile:
@@ -1199,99 +969,6 @@ def _kda_fwd_impl(
                  "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
                  "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
                  "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
-                 "d3": d3, "d4": d4f, "state_s32": s32,
-                 "persistent_loop": not split, "split_state_out": split,
-                 "S16snap": hsnap}
+                 "d3": d3, "d4": d4f, "state_s32": s32}
         return out_public, final_state, debug
 
-    s32 = torch.empty((tasks, BV, D), dtype=torch.float32, device=q.device)
-    s16 = torch.empty((tasks, BV, D), dtype=torch.bfloat16, device=q.device)
-    h0 = None if initial_state is None else initial_state.view(bh, D, D)
-    init_args = _pack_ptrs([h0, s32, s16]) + [_i(bh), _i(NV)]
-    mark("init_start")
-    _launch("kda_k2_init_kernel", tasks, init_args, stream)
-    finish("init_ms", "init_start")
-
-    # Modes that route d3/d4 through the Cube kernels need the K-major kg^T
-    # staging buffer produced by kda_kg_transpose.
-    cube_d4_modes = {"cube_full_d4", "mix_aic_1_2", "mix_d12_vnew", "mix_all_cube"}
-    separated_modes = {"separated", "cube_separated", "cube_d3_separated"}
-    needs_kg_t = k2_mode in cube_d4_modes or k2_mode in separated_modes
-    d1 = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.float32, device=q.device)
-    d2 = torch.empty_like(d1)
-    vnew = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
-    vnew_t = torch.empty((tasks, nt, BV, CHUNK), dtype=torch.bfloat16, device=q.device)
-    d3 = torch.empty_like(d1)
-    d4 = None if k2_mode in cube_d4_modes else torch.empty((c, D, D), dtype=torch.float32, device=q.device)
-    d4_full = (torch.empty((bh, D, D), dtype=torch.float32, device=q.device)
-                if k2_mode in {"mix_aic_1_2", "mix_d12_vnew", "mix_all_cube"} else
-                torch.empty((c, D, D), dtype=torch.float32, device=q.device)
-                if k2_mode == "cube_full_d4" else None)
-    kg_t = torch.empty((c, D, CHUNK), dtype=torch.bfloat16, device=q.device) if needs_kg_t else None
-    out_task = torch.empty((tasks, nt, CHUNK, BV), dtype=torch.bfloat16, device=q.device)
-    # Every K2 kernel of a chunk depends on the previous chunk's state update,
-    # so the chain stays one launch per (chunk, stage); each batch kernel is
-    # launched with nchunk=1 here.
-    mark("k2_start")
-    if needs_kg_t:
-        mark("kg_start")
-        _launch("kda_kg_transpose", (c + KGT_NCHUNK - 1) // KGT_NCHUNK,
-                _pack_ptrs([kg, kg_t]) + [_i(c)], stream)
-        finish("kg_transpose_ms", "kg_start")
-    for chunk in range(nt):
-        common = [_i(bh), _i(nt), _i(NV), _i(chunk)]
-        if k2_mode == "mix_all_cube":
-            _launch("kda_k2_mix_all_cube", bh,
-                    _pack_ptrs([U, W, qg, s16, aqk16, kg_t, decay,
-                                d1, d2, d3, d4_full, s32, out_task,
-                                vnew, vnew_t]) +
-                    common + [_i(1), _f(scale)], stream)
-            continue
-        if k2_mode == "mix_d12_vnew":
-            _launch("kda_k2_mix_d12_vnew", bh,
-                    _pack_ptrs([U, W, qg, s16, d1, d2, vnew, vnew_t]) + common,
-                    stream)
-        else:
-            d12_name = (
-                "kda_k2_d12_cube_kernel"
-                if k2_mode in {"cube_separated", "cube_d3_separated", "cube_full_d4", "mix_aic_1_2"}
-                else "kda_k2_d12_kernel"
-            )
-            _launch(d12_name, tasks, _pack_ptrs([W, qg, s16, d1, d2]) + common + [_i(1)], stream)
-            _launch("kda_k2_vnew_kernel", tasks, _pack_ptrs([U, d1, vnew, vnew_t]) + common + [_i(1)], stream)
-        if k2_mode in {"mix_aic_1_2", "mix_d12_vnew"}:
-            _launch("kda_k2_mix_d4_outstate", bh,
-                    _pack_ptrs([aqk16, vnew_t, kg_t, d2, d3, d4_full,
-                                s32, s16, decay, out_task]) +
-                    common + [_i(1), _f(scale)], stream)
-        elif k2_mode == "cube_full_d4":
-            _launch("kda_k2_d3_cube_bv64", tasks, _pack_ptrs([aqk16, vnew_t, d3]) + common, stream)
-            _launch("kda_k2_d4_full", bh, _pack_ptrs([vnew_t, kg_t, d4_full]) + common, stream)
-            _launch("kda_k2_outstate_full_kernel", tasks, _pack_ptrs([d2, d3, d4_full, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
-        elif k2_mode == "cube_d3_separated":
-            _launch("kda_k2_d3_cube_bv64", tasks, _pack_ptrs([aqk16, vnew_t, d3]) + common, stream)
-            _launch("kda_k2_d4_only_kernel", tasks, _pack_ptrs([vnew_t, kg_t, d4]) + common, stream)
-            _launch("kda_k2_outstate_kernel", tasks, _pack_ptrs([d2, d3, d4, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
-        else:
-            _launch("kda_k2_d34_kernel", tasks, _pack_ptrs([aqk16, vnew_t, kg_t, d3, d4]) + common + [_i(1)], stream)
-            _launch("kda_k2_outstate_kernel", tasks, _pack_ptrs([d2, d3, d4, s32, s16, decay, out_task]) + common + [_f(scale)], stream)
-
-    finish("k2_ms", "k2_start")
-    out_public = out_task.view(b, h, NV, nt, CHUNK, BV).permute(0, 3, 4, 1, 2, 5).contiguous().view(b, t, h, D)
-    final_state = None
-    if profile:
-        prof["total_ms"] = sum(v for k, v in prof.items() if k.endswith("_ms"))
-        _LAST_PROFILE = prof
-    if output_final_state:
-        final_state = s32.view(bh, NV, BV, D).reshape(b, h, D, D)
-    if not return_intermediates:
-        return out_public, final_state
-    debug = {
-        "Qn": qn, "Kn": kn, "Gate": gate, "Gc": gc, "Beta": beta_out,
-        "Decay": decay, "Rk": rk, "Rv": rv, "Qg": qg, "Kg": kg,
-        "Aqk32": aqk32, "Aqk": aqk16, "L": L[:c], "A32": a32[:c], "A16": a16[:c],
-        "W": W, "U": U, "d1": d1, "d2": d2, "Vnew": vnew, "VnewT": vnew_t,
-        "d3": d3, "d4": d4, "state_s32": s32,
-        "d4_full": d4_full,
-    }
-    return out_public, final_state, debug

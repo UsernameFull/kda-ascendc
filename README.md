@@ -107,11 +107,14 @@ README.md
 LICENSE
 aclab/launcher/build_launcher.sh   # builds the torch-extension launcher
 aclab/launcher/launcher.cpp        # aclrtLaunchKernel + rtc_compile (pybind11)
-kernels/v1/*.cpp                   # Ascend C kernel sources (RTC-compiled)
+kernels/v1/k1_pre_gram_mix.cpp     # stage 1: fused preprocess + Gram
+kernels/v1/k1_solve_wu_wide.cpp    # stage 2: AIV forward substitution
+kernels/v1/k1_solve_assemble.cpp   # stage 2: AIC coupling block
+kernels/v1/k1_solve_wu_cube.cpp    # stage 2: Cube W/U
+kernels/v1/k2_persistent_loop.cpp  # stage 3: persistent K2 loop
 python/kda_ascendc_v1/
     api.py                         # compile table, launch pipeline, public entry
     layout.py                      # pack/unpack helpers
-    experimental.py                # historical C=16-only K2 modes (oracles)
     __init__.py
 tools/bench_baseline.py            # single-process e2e + stage bench
 tools/compile_all_server.py        # precompile every kernel
@@ -123,5 +126,5 @@ tools/compile_all_server.py        # precompile every kernel
 - bf16 `q/k/v`, fp32 `g`/`beta`; `K = V = 128`; `T % KDA_CHUNK == 0`; MHA
   (`HV == H`); single device (no context parallel).
 - Ascend 910B only (`MIX_AIC_1_2`, Ascend C RTC).
-- The per-chunk K2 modes in `experimental.py` are C=16-only historical
-  kernels; the public entry serves the chunk-generic `persistent_loop` only.
+- The release ships the five production kernels; the public entry serves the
+  chunk-generic `persistent_loop` K2 only.
