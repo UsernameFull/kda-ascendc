@@ -98,7 +98,7 @@ def test_production_keeps_a16_resident(inputs):
     trailers = spy.trailers()
     for n, a16, load in trailers:
         assert a16 == 1, "production is not the resident form"
-    c_solve = -(-(B * H * (T // api.CHUNK)) // api.SOLVE_WIDE_NCH) * api.SOLVE_WIDE_NCH
+    c_solve = api._solve_padded_chunks(B * H * (T // api.CHUNK))
     assert sum(n for n, _, _ in trailers) == c_solve, trailers
     torch.npu.synchronize()
 

@@ -34,6 +34,7 @@ import os
 import struct
 import sys
 from pathlib import Path
+import math
 
 import pytest
 import torch
@@ -47,7 +48,13 @@ sys.path.insert(0, str(ROOT / "python"))
 import kda_ascendc_v1.api as api  # noqa: E402
 
 D = 128
-B, T, H = 1, 512, 16
+B, H = 1, 16
+# T is sized so the multislice test can see more than one slice at all: the
+# launcher caps the slice count at ngrp // 8 (docs 11.59), so only ngrp >= 16
+# yields two.  One wiring group per chunk-build unit: T = unit * CHUNK gives
+# c = H * unit chunks and ngrp = H = 16.  (T reads 768 at C=64, 512 at C=16/32.)
+UNIT = math.lcm(api.SOLVE_WIDE_NCH, api.ASM_NCHUNK, api.WU_NCHUNK)
+T = UNIT * api.CHUNK
 KW = dict(lower_bound=-1.0, output_final_state=True)
 KERNEL = "kda_solve_assemble"
 
@@ -134,7 +141,7 @@ def test_production_is_mode_5(inputs):
     trailers = spy.trailers()
     for n, mode in trailers:
         assert mode == 5, "production is not mode 5 on every slice"
-    c_solve = -(-(B * H * (T // api.CHUNK)) // api.SOLVE_WIDE_NCH) * api.SOLVE_WIDE_NCH
+    c_solve = api._solve_padded_chunks(B * H * (T // api.CHUNK))
     assert sum(n for n, _ in trailers) == c_solve, trailers
     torch.npu.synchronize()
 
@@ -144,14 +151,16 @@ def test_the_mode_is_read_per_call_not_frozen(inputs):
 
     Both arms have to reach *every* slice: a mode that only made the first
     launch would time a half-converted stage.
-    The test shape (128 chunks) is smaller than one AIV wave, so the default
-    whole-wave slice policy (docs 11.59) makes it a single slice; a fixed
-    32-chunk slice size (KDA_SOLVE_SLICE_CHUNKS) forces the multi-slice shape
-    this test exists to cover.
+    The default whole-wave slice policy (docs 11.59) reads a single slice at
+    any shape this file can afford, so the multislice schedule is forced with
+    KDA_SOLVE_SLICE_CHUNKS (read per call) one wiring group deep; the launcher
+    then clamps to ngrp // 8 = 2 slices.  (A fixed 32-chunk size no longer
+    does this: at NCHUNK = 12 the group count is not a multiple of the cap and
+    the clamp collapses the schedule back to one slice - docs 11.64.)
     """
     for mode in (0, 2, 4, 5, 1, 0):
         os.environ["KDA_ASM_LOADS"] = str(mode)
-        os.environ["KDA_SOLVE_SLICE_CHUNKS"] = "32"
+        os.environ["KDA_SOLVE_SLICE_CHUNKS"] = str(UNIT)
         try:
             assert api.asm_load_mode() == mode
             with _LaunchSpy() as spy:

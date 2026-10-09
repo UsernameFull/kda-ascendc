@@ -45,8 +45,14 @@ SOLVE_NCHUNK = 8
 # for CHUNK = 32.  The solve-Cube's L0C holds one slot per (pass, chunk) unit
 # (2 * NC * CHUNK * 128 fp32), which is why NC drops to 4 at CHUNK = 32 (the
 # whole 128 KB of L0C, 2.56 ms) and to 2 at CHUNK = 64 (also 128 KB).
+# At CHUNK = 64 the two-level path (SB = 2) shrinks every live tile to
+# [NC, M, M] with M = 32, so the wide kernel's own NC cap moves from 4 to 12
+# (178 of the 192 KB; NC = 16 would need 234).  8 -> 12 takes the per-chunk
+# instruction count 140 -> 93 and is bit-identical everywhere; it was left at
+# 8 while the cube was the solve's wall, and flipped when the wide half became
+# it: wide stream 1.52 -> 1.40 ms isolated, e2e -0.15 (docs 11.64).
 SOLVE_WIDE_NCHUNK = (int(os.environ.get("KDA_SOLVE_WIDE_NCHUNK", "0"))
-                     or (32 if CHUNK <= 16 else (16 if CHUNK <= 32 else 8)))
+                     or (32 if CHUNK <= 16 else (16 if CHUNK <= 32 else 12)))
 # Two-level solve (R1): the wide kernel runs the row recursion on M = CHUNK/SB
 # sub-blocks and the assemble kernel forms the coupling block on the Cube, so
 # the substitution's M^3/2 vector lanes per chunk drop with SB^2 (64 -> 16 -> 4
@@ -254,6 +260,22 @@ def _aiv_core_count(device) -> int:
                 n = 2 * _aic_core_count(device)
         _AIV_CORES[key] = n
     return n
+
+
+def _solve_padded_chunks(c: int) -> int:
+    """The chunk count the solve buffers and launches are padded to.
+
+    The two-level solve launches whole wiring-unit groups (the lcm of the
+    three kernels' chunks-per-block), so the padded count has to be a multiple
+    of that unit: rounding to SOLVE_WIDE_NCH alone leaves a trailing group
+    unsolved whenever the rounded count is not a multiple of the unit - at
+    CHUNK = 64 / NCHUNK = 12 (unit = lcm(6, 4, 2) = 12) that is every c with
+    ceil(c / 6) odd, e.g. 4 chunks launched no solve at all and 64 chunks lost
+    the last 4 (docs 11.64).  The single-level path's NCHUNK (32 / 16) already
+    divides this unit, so C = 16/32 builds pad exactly as before.
+    """
+    unit = math.lcm(SOLVE_WIDE_NCH, ASM_NCHUNK, WU_NCHUNK)
+    return (c + unit - 1) // unit * unit
 
 
 def _solve_slice_chunks(c_solve: int, unit: int, nch: int, aiv_cores: int,
@@ -882,7 +904,7 @@ def _kda_fwd_impl(
     # read, and never handed out below) may be whatever uninitialised device
     # memory holds.  The debug dict hands out narrowed views so the shapes stay
     # ``[c, 16, 16]``.
-    c_solve = (c + SOLVE_WIDE_NCH - 1) // SOLVE_WIDE_NCH * SOLVE_WIDE_NCH
+    c_solve = _solve_padded_chunks(c)
     L = torch.empty((c_solve, CHUNK, CHUNK), dtype=torch.float32, device=q.device)
     if c_solve != c:
         # The wide kernel is launched in whole SOLVE_WIDE_NCH-chunk blocks, so

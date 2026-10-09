@@ -4100,3 +4100,55 @@ solve 地板账仍是 AIC = asm + cube 1.53 的大头，可动项回到 cube（�
 **下一步**：solve 的墙回到 **wide（AIV，~1.9 ms）**与片结构开销（~0.13）；cube 侧若再被暴露，下一刀是 scalar/队列协议（0.94 us/块）与 fixpipe（0.90），MTE2 已不是第一项。K2（~3.1 ms）照旧在队列里。
 
 **复原**：采集 `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 KDA_MSOPP_CAPTURE=kda_solve_wu_cube_kernel KDA_MSOPP_ITERS=3 KDA_SOLVE_OVERLAP=0 msprof op --application="python3 tools/msop/run_msop_capture.py" --aic-metrics=PipeUtilization --kernel-name=kda_solve_wu_cube_kernel --launch-count=1 --output=<dir>`；隔离 `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 python3 -u tools/probe_solve_cube_knobs.py`；e2e `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 KDA_CUBE_ROUNDS=24 python3 -u tools/probe_cube_loads_e2e.py`。
+
+## 11.64. wide 轮：上板重账（墙 = vec 70.4% + 暴露的 ~5.7 us/块）+ NCHUNK 8→12 翻转（e2e −0.15）+ c_solve 单元取整修复 + dead cast 拆除（2026-10-08）
+
+**背景**：§11.63 断案——切片结构下 solve 舞台的墙换到 wide（AIV ~1.9 ms）与片结构开销（~0.13），cube/asm 的余量在其下隐藏。本轮三件事：wide 上板重账（承接 §11.51 旧账）、§11.52 遗留的 NCHUNK=12 重测（旧世界 AIC 绑，只值 −0.03）、§11.50 清单里的 dead cast。
+
+**上板重账**（`/data/models/Qwen3-4B/kda_msprof_20261008_wide/`，单发满网格 grid 3072，Task 1490.35 us，device 3）：
+
+| 每块 (us) | mean | 占比 |
+|---|---:|---:|
+| 块墙（aiv_time） | 19.268 | — |
+| **vec（递归）** | **13.556** | **70.4%** |
+| scalar | 4.322 | 22.4% |
+| mte3（导出） | 2.763 | 14.3% |
+| mte2（L/L21 gather） | 1.414 | 7.3% |
+| 四管和/墙 | 1.145 | — |
+
+- vec 的 min/max 只有 13.548/13.571（块间零抖动，确定性指令流），**vec 是硬地板**；`scalar_vector_stall` 12.321（scalar 64% 时间在等 vector 排空）——发射与排空基本串行。icache miss 0。
+- 流总量核对：3072 × 19.268 / 40 AIV = 1480 us ≈ Task 1490（+0.7%）。**单发满打包几乎无损**；生产切片口径的 1.85 与它的差额（~0.36 ms）是 20 片的片级 host pacing（~20 us/片，§11.59 记的"整波片"已排除量化）。
+- 与 §11.51（09-29，同 NCHUNK=8）对照：墙 19.87 → 19.27、mte3 3.32 → 2.76、scalar 4.56 → 4.32，vec 13.55 → 13.56 平、mte2 1.42 → 1.41 平——**−0.60 全部是 §11.53 的 export 合并。**
+
+**NCHUNK 8→12（翻转）**：
+
+- 隔离（`tools/probe_solve_wide_nchunk.py`，MIN of 5）：**1.519 → 1.396 ms**（grid 3072→2048，per-chunk 123.7 → 113.6 ns，**−8.1%**）；a16 / xb / lneg **逐位全等**，diag 块 vs fp64 9.764e-04、strict-upper 恰 0。
+- e2e（新 `tools/probe_wide_nchunk_e2e.py`；NCHUNK 是编译期常量，跨进程 8/12 交错两轮，每轮 MIN of 8 + 切片重放 MIN of 5）：
+
+| 口径 | 轮 1：8 → 12 | 轮 2：8 → 12 |
+|---|---|---|
+| wide 流和 | 1.961 → **1.796**（−0.165） | 1.944 → **1.793**（−0.151） |
+| 切片舞台回放 | 2.069 → **1.915** | 2.070 → **1.954** |
+| pipeline wall | 9.608 → **9.448** | 9.579 → **9.439**（−0.140） |
+| asm / cube 和 | 0.437/1.083 → 0.398/1.110 | 0.407/1.102 → 0.443/1.126（平） |
+
+- 判读：wide 是墙时这一刀**全额兑现**（流和 −0.16 ≈ wall −0.15/span −0.14），AIC 双腿（asm+cube ≈ 1.51）纹丝不动——旧世界只值 −0.03 的原因就是它当时被 AIC 2.0 顶住（§11.52）。NCHUNK=12 的代价只有 UB：翼面 178 KB / 192 KB（16 需要 234 KB，装不下，仍是天花板）。
+- 落地：`api.SOLVE_WIDE_NCHUNK` 在 CHUNK = 64 的默认 8 → **12**（`KDA_SOLVE_WIDE_NCHUNK` 仍可覆盖）；C=16/32 的 32/16 是早期扫描值，不动。
+
+**c_solve 单元取整修复（翻转带出的边界 bug，本轮必修）**：
+
+两级路径按接线单元 `unit = lcm(NCH=6, ASM=4, WU=2) = 12` 整组发射，而旧 `c_solve` 只按 NCH=6 取整——`ceil(c/6)` 为奇数时欠覆盖：实测（launcher spy，不执行 kernel，`kda_probe_20261008_wide_knobs/c_solve_coverage_demo.txt`）**c=4 → c_solve=6 → ngrp=0 → 零宽发射**；**c=64 → 66 → 只覆盖 60，丢最后 4 个真实 chunk**；c=128 → 132 恰好整除、无恙（这也解释了为什么既有测试没踩到——但 C=64 矩阵的 (1,2,2)/(1,32,2)/(1,2,8) 三个 shape 全踩）。修复 = 新 `api._solve_padded_chunks(c)`（按 unit 取整；L 尾部照旧零化，多出的是无害 padding），C=16/32 的 NCHUNK（32/16）整除 unit → 行为不变。修复后 spy 覆盖：c=4: 0→12、c=64: 60→72、c=128: 132→132。
+
+测试面：四处旧公式（`test_solve_a16_ablation` / `test_solve_assemble_loads` / `test_solve_cube_a16_resident` / `test_solve_cube_loads`）与 `tools/probe_workspace_pool.py` 一并改走 `_solve_padded_chunks`；新 `tests/test_solve_wide_nchunk.py` 钉住默认值、单元取整与逐 chunk 覆盖（spy 掉 launcher，不编 kernel）。另外两处"≥2 片"断言在本轮制度下失效并一并修好：`test_solve_a16_ablation`（**自 §11.59 整波切片起就已陈旧**——该 shape 纯算术只有 1 片：ngrp 32 → sgrp 32 → 1，24 片等分时代为 4 片；后面的轮次门禁只跑各自的测试文件所以没暴露）；`test_solve_assemble_loads`（旧的 `KDA_SOLVE_SLICE_CHUNKS=32` 强切片在 NCHUNK=12 下被 `ngrp//8` 片数上限折叠回 1 片）。两处都改为 fixture 随 CHUNK 取 `T = unit×CHUNK`（ngrp=16）+ `KDA_SOLVE_SLICE_CHUNKS=unit` 迫使 clamp 出 2 片（C<64 构建 skip，两级路径只在 C≥64 存在）。
+
+**dead cast 拆除**：`k1_solve_wu_wide.cpp` 的 bf16 回转 `Cast(af←ab)` 只为让 A32 debug 视图成为 A16 的舍入孪生；`debugStores=0`（生产）下 af 没有读者 = 死工作（`keepA32` 守卫，声明上移）。实测探针 1.408 → **1.403**（噪声内；单块 ~0.5% 级）且 a16/xb/lneg 逐位全等——按构造性死代码定案，不单列收益。`KDA_DEBUG_STORES=1` 路径语义不变（`test_dead_store.py` 覆盖）。
+
+**门禁**：`bash tools/run_chunk_matrix.sh`（`ASCEND_RT_VISIBLE_DEVICES=3`）C=16/32/64 全 PASS（C=64 腿含 c=4/16/64 边界 shape，直接踩修复面）；focused tests（`test_solve_wide_nchunk` / `test_dead_store` / `test_solve_a16_ablation` / `test_solve_assemble_loads` / `test_solve_cube_loads` / `test_solve_cube_a16_resident`）**17 passed**；`test_kda_bt16` 按设计 skip（本机无 fla）。**正典 bench：8.802 / 8.807 ms（p20 8.794 / p80 8.811，两次连跑）对前最佳 8.949 = −0.14**，与配对 e2e 的 −0.14~−0.16 一致。
+
+**片结构结案（同探针两批扩臂）**：更粗（wave 960/1440/2400 = 13/9/6 片）e2e 墙 **+0.22 / +0.28 / +0.39**；更细（wave/wavef 480 = 26 片）**+0.82 / +0.84**——两个方向都更差，默认（720 chunk / 18 片，全整波）在谷底。机制：粗片的 wide 和确实降（1.68 → 1.59），但 AIC 腿和 **+0.45**（cube 的 MTE2 被同片并行的 wide 流量挤慢：cube 和 0.99~1.12 → 1.57~1.62；默认时 cube 基本保持独立速度 0.88~0.99）；细片则 wide 和（1.67 → 1.80）与 cube 和（→1.60）双输。**"单发 1.49 vs 切片 1.67+"的差不是可按片数收回的固定税，是两腿重叠压内存的必然价格——片结构结案，默认即最优**（identity 五臂 out/state 全 0）。
+
+**剩余头寸**：① **mte3/export 形态**（2.76 us/块；若立项需先按 NCHUNK=12 重采上板账确认它还是第二位）；② AIC 侧在 wide 被削到 ~1.5 以下前不动。wide 流和 1.79 对 AIC 1.50——wide 仍领跑 ~0.29 ms。
+
+**归档**：`/data/models/Qwen3-4B/kda_msprof_20261008_wide/`（上板账 + SUMMARY/INDEX）、`/data/models/Qwen3-4B/kda_probe_20261008_wide_knobs/`（隔离/e2e/切片两批扫描日志、覆盖演示、门禁与 bench 日志）。
+
+**复原**：上板 `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 KDA_MSOPP_CAPTURE=kda_solve_wu_wide KDA_MSOPP_ITERS=3 KDA_SOLVE_OVERLAP=0 msprof op --application="python3 tools/msop/run_msop_capture.py" --aic-metrics=PipeUtilization --kernel-name=kda_solve_wu_wide --launch-count=1 --output=<dir>`；隔离 `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 python3 -u tools/probe_solve_wide_nchunk.py`；e2e `KDA_CHUNK=64 ASCEND_RT_VISIBLE_DEVICES=3 KDA_SOLVE_WIDE_NCHUNK=<8|12> python3 -u tools/probe_wide_nchunk_e2e.py`。

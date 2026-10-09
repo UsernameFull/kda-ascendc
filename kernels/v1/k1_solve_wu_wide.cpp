@@ -242,22 +242,27 @@ extern "C" __global__ __aicore__ void kda_solve_wu_wide(
         }
         PipeBarrier<PIPE_V>();
     }
+    // A32 has no device consumer at all (the Cube solve reads A16, W and U and
+    // the debug views are host-side), so production skips its stores - 201 MB
+    // per call at C=64 (docs 11.29).  The flag is declared here because the
+    // bf16 round trip below reads it: the fp32 refresh exists only so the A32
+    // view is the rounded twin of A16, and with no A32 reader it is dead work
+    // (docs 11.64).  It has to sit outside the SUBB > 1 block below: the
+    // second store it guards is the single-level path's, which is exactly the
+    // C=16/32 builds.
+    const bool keepA32 = (debugStores != 0);
     for (int32_t off = 0; off < CH; off += CM) {
         const int32_t n = (CH - off < CM) ? (CH - off) : CM;
         Cast(ab[off], af[off], RoundMode::CAST_RINT, n);
         PipeBarrier<PIPE_V>();
-        Cast(af[off], ab[off], RoundMode::CAST_NONE, n);
-        PipeBarrier<PIPE_V>();
+        if (keepA32) {
+            Cast(af[off], ab[off], RoundMode::CAST_NONE, n);
+            PipeBarrier<PIPE_V>();
+        }
     }
 
     SetFlag<HardEvent::V_MTE3>(e3);
     WaitFlag<HardEvent::V_MTE3>(e3);
-    // A32 has no device consumer at all (the Cube solve reads A16, W and U and
-    // the debug views are host-side), so production skips its stores - 201 MB
-    // per call at C=64 (docs 11.29).  The declaration has to sit outside the
-    // SUBB > 1 block below: the second store it guards is the single-level
-    // path's, which is exactly the C=16/32 builds.
-    const bool keepA32 = (debugStores != 0);
 #if KDA_SOLVE_WIDE_SUBB > 1
     // Both exports get the blank: the Cube solve reads A16, and A32 is the
     // fp32 twin the debug views hand out - leaving it uninitialised made the

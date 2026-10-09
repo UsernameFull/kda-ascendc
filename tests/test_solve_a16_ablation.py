@@ -23,6 +23,7 @@ import os
 import struct
 import sys
 from pathlib import Path
+import math
 
 import pytest
 import torch
@@ -36,7 +37,13 @@ sys.path.insert(0, str(ROOT / "python"))
 import kda_ascendc_v1.api as api  # noqa: E402
 
 D = 128
-B, T, H = 1, 512, 16
+B, H = 1, 16
+# T is sized so the multislice test can see more than one slice at all: the
+# launcher caps the slice count at ngrp // 8 (docs 11.59), so only ngrp >= 16
+# yields two.  One wiring group per chunk-build unit: T = unit * CHUNK gives
+# c = H * unit chunks and ngrp = H = 16.  (T reads 768 at C=64, 512 at C=16/32.)
+UNIT = math.lcm(api.SOLVE_WIDE_NCH, api.ASM_NCHUNK, api.WU_NCHUNK)
+T = UNIT * api.CHUNK
 KW = dict(lower_bound=-1.0, output_final_state=True)
 
 
@@ -103,7 +110,7 @@ def test_production_passes_mode_zero(inputs):
     with _LaunchSpy() as spy:
         _call(inputs)
     c_real = B * H * (T // api.CHUNK)
-    c_solve = -(-c_real // api.SOLVE_WIDE_NCH) * api.SOLVE_WIDE_NCH
+    c_solve = api._solve_padded_chunks(c_real)
     trailers = spy.wide_trailer()
     for _, mode, debug in trailers:
         assert mode == 0, "production is not the ablation's mode 0"
@@ -132,16 +139,24 @@ def test_every_slice_carries_the_mode_and_the_flag_keeps_the_last_slot(inputs):
 
     The wide half is launched once per slice, so a mode that only reached the
     first slice would leave the rest of the stage in production while the probe
-    reports the ablation's timings.
+    reports the ablation's timings.  The default slice policy reads a single
+    slice at any shape this file can afford (whole waves), so the multislice
+    schedule is forced with KDA_SOLVE_SLICE_CHUNKS (read per call) one wiring
+    group deep; the launcher then clamps to ngrp // 8 = 2 equal slices, which
+    is what the per-slice trailer check needs.
     """
+    if api.SOLVE_WIDE_SUBB != 2:
+        pytest.skip("the sliced two-level path only exists at CHUNK >= 64")
     os.environ["KDA_SOLVE_A16_MODE"] = "2"
     os.environ["KDA_DEBUG_STORES"] = "1"
+    os.environ["KDA_SOLVE_SLICE_CHUNKS"] = str(UNIT)
     try:
         with _LaunchSpy() as spy:
             _call(inputs)
     finally:
         os.environ.pop("KDA_SOLVE_A16_MODE", None)
         os.environ.pop("KDA_DEBUG_STORES", None)
+        os.environ.pop("KDA_SOLVE_SLICE_CHUNKS", None)
     trailers = spy.wide_trailer()
     assert len(trailers) >= 2, "the shape did not exercise more than one slice"
     for c, mode, debug in trailers:

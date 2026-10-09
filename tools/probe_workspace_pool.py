@@ -61,7 +61,7 @@ class WorkspacePool:
         bh = b * h
         c = bh * nt
         tasks = bh * NV
-        c_solve = (c + api.SOLVE_WIDE_NCH - 1) // api.SOLVE_WIDE_NCH * api.SOLVE_WIDE_NCH
+        c_solve = api._solve_padded_chunks(c)
         sub = chunk // api.SOLVE_WIDE_SUBB
         bf16, fp32 = torch.bfloat16, torch.float32
         spec = {
