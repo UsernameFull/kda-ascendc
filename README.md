@@ -64,6 +64,19 @@ precompile step is skipped (a few minutes).
 
 ## Run
 
+Unit tests that do not require an NPU:
+
+```bash
+python3 -m pytest tests/test_flashkda_reference.py tests/test_layout.py -q
+```
+
+NPU integration tests use a FlashKDA-compatible fp32/float64 reference. Run
+them once per build because `KDA_CHUNK` is read when `api.py` is imported:
+
+```bash
+KDA_CHUNK=64 python3 -m pytest tests/test_release_configuration.py tests/test_release_integration.py -q
+```
+
 ```python
 import sys
 sys.path.insert(0, "python")
